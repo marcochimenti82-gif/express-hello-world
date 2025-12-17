@@ -11,9 +11,7 @@ app.get("/healthz", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+const server = app.listen(port, () => console.log(`Example app listening on port ${port}!`));
 
 
 server.keepAliveTimeout = 120 * 1000;
