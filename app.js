@@ -25,6 +25,9 @@ app.post("/voice", (req, res) => {
 
   res.type("text/xml").send(twiml);
 });
+
+  res.type("text/xml").send(twiml);
+});
 <!DOCTYPE html>
 <html>
   <head>
