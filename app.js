@@ -1,23 +1,34 @@
 const express = require("express");
 const app = express();
 
-const port = process.env.PORT || 3001;
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
+// --- ENDPOINTS BASE ---
 app.get("/", (req, res) => {
-  res.send("AI TuttiBrilli backend attivo");
+  res.status(200).send("OK - TuttiBrilli server");
 });
 
+// Health check per Render / test rapido
 app.get("/healthz", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-const server = app.listen(port, () => console.log(`Example app listening on port ${port}!`));
-
-
-server.keepAliveTimeout = 120 * 1000;
-server.headersTimeout = 120 * 1000;
-
-const html = `
+// Endpoint per Twilio (voce) - risponde con TwiML
+app.post("/voice", (req, res) => {
+  res.set("Content-Type", "text/xml");
+  res.send(`
+    <Response>
+      <Say language="it-IT" voice="alice">
+        Ciao! Hai chiamato TuttiBrilli. Tra poco ti metto in contatto con l'assistente.
+      </Say>
+      <Pause length="1" />
+      <Say language="it-IT" voice="alice">
+        Al momento questo è un test.
+      </Say>
+    </Response>
+  `);
+});
 <!DOCTYPE html>
 <html>
   <head>
@@ -67,3 +78,8 @@ const html = `
   </body>
 </html>
 `
+const port = process.env.PORT || 3001;
+
+app.listen(port, () => {
+  console.log(Server running on port ${port});
+});
