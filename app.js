@@ -4,54 +4,31 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-const port = process.env.PORT || 3000;
-
-/**
- * ROOT
- */
+// Root
 app.get("/", (req, res) => {
-  res.send("AI Backoffice TuttiBrilli attivo");
+  res.send("AI TuttiBrilli backend attivo");
 });
 
-/**
- * HEALTH CHECK
- */
+// Health check
 app.get("/healthz", (req, res) => {
-  res.status(200).json({ status: "ok" });
+  res.json({ status: "ok" });
 });
 
-/**
- * TWILIO VOICE
- */
-app.post("/twilio/voice", (req, res) => {
-  res.type("text/xml");
-  res.send(`
-    <Response>
-      <Say voice="alice" language="it-IT">
-        Benvenuto da Tutti Brilli. A breve parlerai con il nostro assistente.
-      </Say>
-    </Response>
-  `);
+// ✅ VOICE ENDPOINT PER TWILIO
+app.post("/voice", (req, res) => {
+  res.status(200).type("text/xml").send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="it-IT" voice="alice">
+    Ciao! Hai chiamato TuttiBrilli.
+  </Say>
+  <Pause length="1"/>
+  <Say language="it-IT" voice="alice">
+    Il sistema è attivo e funzionante.
+  </Say>
+</Response>`);
 });
 
-/**
- * TWILIO SMS / WHATSAPP
- */
-app.post("/twilio/sms", (req, res) => {
-  const message = req.body.Body || "";
-
-  res.type("text/xml");
-  res.send(`
-    <Response>
-      <Message>
-        Ciao! Hai scritto: "${message}"
-        Dimmi giorno e numero di persone 🙂
-      </Message>
-    </Response>
-  `);
-});
-
+const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log("Server running on port", port);
 });
-Add Twilio endpoints
