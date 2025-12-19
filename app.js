@@ -14,20 +14,22 @@ app.get("/healthz", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-// Endpoint per Twilio (voce) - risponde con TwiML
-app.post("/voice", (req, res) => {
+// Endpoint per Twilio (voce) - GET + POST
+app.all("/voice", (req, res) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language="it-IT" voice="alice">Ciao! Hai chiamato TuttiBrilli.</Say>
-  <Pause length="1"/>
-  <Say language="it-IT" voice="alice">Al momento questo è un test.</Say>
+  <Say language="it-IT" voice="alice">
+    Ciao! Hai chiamato TuttiBrilli. Endpoint voice raggiunto correttamente.
+  </Say>
 </Response>`;
 
-  res.type("text/xml").send(twiml);
+  res.status(200).type("text/xml").send(twiml);
 });
 
   res.type("text/xml").send(twiml);
 });
+
+
 <!DOCTYPE html>
 <html>
   <head>
