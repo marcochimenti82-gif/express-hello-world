@@ -16,18 +16,14 @@ app.get("/healthz", (req, res) => {
 
 // Endpoint per Twilio (voce) - risponde con TwiML
 app.post("/voice", (req, res) => {
-  res.set("Content-Type", "text/xml");
-  res.send(`
-    <Response>
-      <Say language="it-IT" voice="alice">
-        Ciao! Hai chiamato TuttiBrilli. Tra poco ti metto in contatto con l'assistente.
-      </Say>
-      <Pause length="1" />
-      <Say language="it-IT" voice="alice">
-        Al momento questo è un test.
-      </Say>
-    </Response>
-  `);
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say language="it-IT" voice="alice">Ciao! Hai chiamato TuttiBrilli.</Say>
+  <Pause length="1"/>
+  <Say language="it-IT" voice="alice">Al momento questo è un test.</Say>
+</Response>`;
+
+  res.type("text/xml").send(twiml);
 });
 <!DOCTYPE html>
 <html>
