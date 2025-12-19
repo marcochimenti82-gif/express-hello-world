@@ -22,6 +22,22 @@ function twiml(res, xml) {
 app.get("/", (req, res) => res.status(200).send("OK - TuttiBrilli server"));
 app.get("/healthz", (req, res) => res.status(200).json({ status: "ok" }));
 
+// Memoria temporanea per chiamata (demo)
+const sessions = new Map();
+function getSession(req) {
+  const callSid = req.body.CallSid || "no-callsid";
+  if (!sessions.has(callSid)) sessions.set(callSid, {});
+  return sessions.get(callSid);
+}
+function twiml(res, xml) {
+  res.status(200).type("text/xml").send(xml);
+}
+function esc(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
 // 1) START
 app.post("/voice", (req, res) => {
   const s = getSession(req);
@@ -30,12 +46,10 @@ app.post("/voice", (req, res) => {
   twiml(res, `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="it-IT" voice="alice">
-    Ciao! Sei in TuttiBrilli. Per fare una prenotazione, dimmi per che giorno.
+    Ciao! Sei in TuttiBrilli. Per prenotare, dimmi per che giorno.
     Per esempio: domani, venerdì, oppure 21 dicembre.
   </Say>
-  <Gather input="speech dtmf" speechTimeout="auto" action="/voice/date" method="POST" language="it-IT" timeout="6">
-    <Say language="it-IT" voice="alice">Parla ora, oppure premi un tasto per riprovare.</Say>
-  </Gather>
+  <Gather input="speech" speechTimeout="auto" action="/voice/date" method="POST" language="it-IT" timeout="7"/>
   <Say language="it-IT" voice="alice">Non ho sentito. Riproviamo.</Say>
   <Redirect method="POST">/voice</Redirect>
 </Response>`);
@@ -44,19 +58,15 @@ app.post("/voice", (req, res) => {
 // 2) DATE
 app.post("/voice/date", (req, res) => {
   const s = getSession(req);
-  const spoken = (req.body.SpeechResult || "").trim();
-  s.date_raw = spoken;
+  s.date_raw = (req.body.SpeechResult || "").trim();
 
   twiml(res, `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="it-IT" voice="alice">
-    Perfetto. Per che ora?
+    Perfetto. A che ora?
     Per esempio: 20 e 30, oppure 21.
   </Say>
-  <Gather input="speech dtmf" speechTimeout="auto" action="/voice/time" method="POST" language="it-IT" timeout="6">
-    <Say language="it-IT" voice="alice">Dimmi l'orario.</Say>
-  </Gather>
-  <Say language="it-IT" voice="alice">Non ho sentito. Riproviamo.</Say>
+  <Gather input="speech" speechTimeout="auto" action="/voice/time" method="POST" language="it-IT" timeout="7"/>
   <Redirect method="POST">/voice</Redirect>
 </Response>`);
 });
@@ -64,18 +74,12 @@ app.post("/voice/date", (req, res) => {
 // 3) TIME
 app.post("/voice/time", (req, res) => {
   const s = getSession(req);
-  const spoken = (req.body.SpeechResult || "").trim();
-  s.time_raw = spoken;
+  s.time_raw = (req.body.SpeechResult || "").trim();
 
   twiml(res, `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language="it-IT" voice="alice">
-    Quante persone siete?
-  </Say>
-  <Gather input="speech dtmf" speechTimeout="auto" action="/voice/people" method="POST" language="it-IT" timeout="6">
-    <Say language="it-IT" voice="alice">Dimmi il numero di persone.</Say>
-  </Gather>
-  <Say language="it-IT" voice="alice">Non ho sentito. Riproviamo.</Say>
+  <Say language="it-IT" voice="alice">Quante persone siete?</Say>
+  <Gather input="speech" speechTimeout="auto" action="/voice/people" method="POST" language="it-IT" timeout="7"/>
   <Redirect method="POST">/voice</Redirect>
 </Response>`);
 });
@@ -83,18 +87,12 @@ app.post("/voice/time", (req, res) => {
 // 4) PEOPLE
 app.post("/voice/people", (req, res) => {
   const s = getSession(req);
-  const spoken = (req.body.SpeechResult || "").trim();
-  s.people_raw = spoken;
+  s.people_raw = (req.body.SpeechResult || "").trim();
 
   twiml(res, `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language="it-IT" voice="alice">
-    Perfetto. Mi dici nome e cognome per la prenotazione?
-  </Say>
-  <Gather input="speech" speechTimeout="auto" action="/voice/name" method="POST" language="it-IT" timeout="7">
-    <Say language="it-IT" voice="alice">Dimmi nome e cognome.</Say>
-  </Gather>
-  <Say language="it-IT" voice="alice">Non ho sentito. Riproviamo.</Say>
+  <Say language="it-IT" voice="alice">Perfetto. Mi dici nome e cognome?</Say>
+  <Gather input="speech" speechTimeout="auto" action="/voice/name" method="POST" language="it-IT" timeout="8"/>
   <Redirect method="POST">/voice</Redirect>
 </Response>`);
 });
@@ -102,22 +100,19 @@ app.post("/voice/people", (req, res) => {
 // 5) NAME + CONFIRM
 app.post("/voice/name", (req, res) => {
   const s = getSession(req);
-  const spoken = (req.body.SpeechResult || "").trim();
-  s.name_raw = spoken;
+  s.name_raw = (req.body.SpeechResult || "").trim();
 
   twiml(res, `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="it-IT" voice="alice">
-    Riepilogo: prenotazione per ${escapeXml(s.name_raw || "cliente")}.
-    Giorno: ${escapeXml(s.date_raw || "non indicato")}.
-    Ora: ${escapeXml(s.time_raw || "non indicato")}.
-    Persone: ${escapeXml(s.people_raw || "non indicato")}.
+    Riepilogo prenotazione.
+    Nome: ${esc(s.name_raw)}.
+    Giorno: ${esc(s.date_raw)}.
+    Ora: ${esc(s.time_raw)}.
+    Persone: ${esc(s.people_raw)}.
     Se va bene, premi 1 per confermare. Premi 2 per annullare.
   </Say>
-  <Gather input="dtmf" numDigits="1" action="/voice/confirm" method="POST" timeout="8">
-    <Say language="it-IT" voice="alice">Premi 1 per confermare, 2 per annullare.</Say>
-  </Gather>
-  <Say language="it-IT" voice="alice">Non ho ricevuto scelta. Ti saluto.</Say>
+  <Gather input="dtmf" numDigits="1" action="/voice/confirm" method="POST" timeout="8"/>
   <Hangup/>
 </Response>`);
 });
@@ -125,10 +120,10 @@ app.post("/voice/name", (req, res) => {
 // 6) CONFIRM
 app.post("/voice/confirm", (req, res) => {
   const s = getSession(req);
-  const digit = (req.body.Digits || "").trim();
+  const d = (req.body.Digits || "").trim();
 
-  if (digit === "1") {
-    // QUI: in mezzo metteremo controllo disponibilità + creazione evento Google Calendar
+  if (d === "1") {
+    // QUI aggiungeremo Google Calendar
     twiml(res, `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="it-IT" voice="alice">
@@ -139,21 +134,9 @@ app.post("/voice/confirm", (req, res) => {
   } else {
     twiml(res, `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language="it-IT" voice="alice">
-    Va bene, prenotazione annullata. A presto!
-  </Say>
+  <Say language="it-IT" voice="alice">Va bene, annullato. A presto!</Say>
   <Hangup/>
 </Response>`);
   }
 });
-
-function escapeXml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
 app.listen(port, () => console.log(Server listening on ${port}));
