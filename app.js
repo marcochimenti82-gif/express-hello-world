@@ -13,9 +13,9 @@ const BASE_URL = process.env.BASE_URL || ""; // es: https://ai-backoffice-tuttib
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || ""; // es: whatsapp:+14155238886 (sandbox) oppure whatsapp:+<tuo_sender_approvato>
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || ""; // es: whatsapp:+14155238886 (sandbox) oppure whatsapp:+<sender>
 
-// Client Twilio (solo se hai settato le env)
+// Client Twilio
 let twilioClient = null;
 if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
   const twilio = require("twilio");
@@ -25,81 +25,289 @@ if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
 // --------------------
 // Pagine base
 // --------------------
-app.get("/", (req, res) => {
-  res.status(200).send("AI TuttiBrilli backend attivo");
-});
-
-app.get("/healthz", (req, res) => {
-  res.status(200).json({ status: "ok" });
-});
-
-// Utile solo per test browser (Twilio usa POST)
-app.get("/voice", (req, res) => {
-  res.status(200).send("OK (Twilio usa POST su /voice)");
-});
+app.get("/", (req, res) => res.status(200).send("AI TuttiBrilli backend attivo"));
+app.get("/healthz", (req, res) => res.status(200).json({ status: "ok" }));
+app.get("/voice", (req, res) => res.status(200).send("OK (Twilio usa POST su /voice)"));
 
 // --------------------
 // Helpers TwiML
 // --------------------
+function xmlEscape(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
 function twiml(xmlInsideResponseTag) {
-  // xmlInsideResponseTag deve contenere solo i tag dentro <Response> ... </Response>
   return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n${xmlInsideResponseTag}\n</Response>`;
 }
 
+// Se vuoi provare voci diverse (se disponibili sul tuo account):
+// - voice="alice" (standard)
+// - voice="Polly.Bianca" / "Polly.Bianca-Neural" (se abilitato)
 function say(text) {
-  // XML escape minimo
-  const safe = String(text)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+  const safe = xmlEscape(text);
   return `<Say language="it-IT" voice="alice">${safe}</Say>`;
 }
 
-function gather({ action, method = "POST", input = "dtmf", numDigits, timeout = 8, finishOnKey = "#", prompt }) {
-  const nd = numDigits ? ` numDigits="${numDigits}"` : "";
-  const fok = numDigits ? "" : ` finishOnKey="${finishOnKey}"`; // se numDigits è definito, finishOnKey non serve
-  return `
-<Gather action="${action}" method="${method}" input="${input}" timeout="${timeout}"${nd}${fok}>
-  ${say(prompt)}
-</Gather>`;
+function pause(len = 1) {
+  return `<Pause length="${len}"/>`;
 }
 
 function redirect(url) {
-  return `<Redirect method="POST">${url}</Redirect>`;
+  return `<Redirect method="POST">${xmlEscape(url)}</Redirect>`;
 }
 
 function hangup() {
   return `<Hangup/>`;
 }
 
-// --------------------
-// “Sessioni” in memoria (test). Poi la spostiamo su DB/Google Calendar.
-// --------------------
-const sessions = new Map(); // key: CallSid -> { step, name, date, time, people, whatsapp }
-
-// Format utility
-function ddmmaaToHuman(ddmmaa) {
-  if (!ddmmaa || ddmmaa.length < 6) return ddmmaa || "";
-  const dd = ddmmaa.slice(0, 2);
-  const mm = ddmmaa.slice(2, 4);
-  const aa = ddmmaa.slice(4, 6);
-  return `${dd}/${mm}/20${aa}`;
+/**
+ * Gather speech-only.
+ * - timeout: secondi di attesa prima di "no input"
+ * - speechTimeout: "auto" o numero (sec) di silenzio per chiudere
+ * - hints: parole chiave (non obbligatorio)
+ */
+function gatherSpeech({
+  action,
+  method = "POST",
+  timeout = 6,
+  speechTimeout = "auto",
+  language = "it-IT",
+  prompt,
+  hints = "",
+}) {
+  const safeAction = xmlEscape(action);
+  const safeHints = hints ? ` hints="${xmlEscape(hints)}"` : "";
+  return `
+<Gather action="${safeAction}" method="${method}"
+        input="speech"
+        language="${language}"
+        timeout="${timeout}"
+        speechTimeout="${speechTimeout}"${safeHints}>
+  ${say(prompt)}
+</Gather>`;
 }
 
-function hhmmToHuman(hhmm) {
-  if (!hhmm || hhmm.length < 4) return hhmm || "";
-  return `${hhmm.slice(0, 2)}:${hhmm.slice(2, 4)}`;
+// --------------------
+// Sessioni in memoria (MVP). In produzione: Redis/DB.
+// --------------------
+/**
+ * session schema:
+ * {
+ *  step: number,
+ *  retries: number,
+ *  intent: "booking"|"info"|null,
+ *  name: string|null,
+ *  dateISO: "YYYY-MM-DD"|null,
+ *  time24: "HH:MM"|null,
+ *  people: number|null,
+ *  waTo: "whatsapp:+39..."|null,
+ *  fromCaller: "+39..."|null
+ * }
+ */
+const sessions = new Map(); // key: CallSid
+
+function getSession(callSid) {
+  const s = sessions.get(callSid);
+  if (s) return s;
+  const fresh = { step: 1, retries: 0, intent: null, name: null, dateISO: null, time24: null, people: null, waTo: null, fromCaller: null };
+  sessions.set(callSid, fresh);
+  return fresh;
 }
 
-function normalizeWhatsapp(digits) {
-  // ci aspettiamo input: 393xxxxxxxxx oppure 3xxxxxxxxx
-  const raw = String(digits || "").replace(/[^\d]/g, "");
+function resetRetries(session) {
+  session.retries = 0;
+}
+
+function incRetry(session) {
+  session.retries = (session.retries || 0) + 1;
+  return session.retries;
+}
+
+// --------------------
+// Parsing pragmatico (MVP)
+// --------------------
+function normalizeText(t) {
+  return String(t || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function looksLikeBooking(text) {
+  return /prenot|tavol|posti|riserv/.test(text);
+}
+
+function looksLikeInfo(text) {
+  return /info|orari|indirizz|dove|menu|menù|carta|vini|evento|serata/.test(text);
+}
+
+function nowRome() {
+  // Manteniamo semplice: usa timezone server. Per robustezza futura: luxon.
+  return new Date();
+}
+
+function toISODate(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function parseDateIT_MVP(speech) {
+  // Supporta: "oggi", "stasera" -> oggi; "domani" -> domani
+  // Supporta: "25/12/2025", "25-12-2025", "25/12", "2512", "25 12"
+  // Se manca anno -> anno corrente
+  const t = normalizeText(speech);
+  if (!t) return null;
+
+  const now = nowRome();
+
+  if (/\b(oggi|stasera)\b/.test(t)) return toISODate(now);
+  if (/\bdomani\b/.test(t)) {
+    const d = new Date(now.getTime());
+    d.setDate(d.getDate() + 1);
+    return toISODate(d);
+  }
+
+  // Estrai numeri
+  // formati tipo 25/12/2025 o 25-12-2025
+  let m = t.match(/\b(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?\b/);
+  if (m) {
+    let dd = parseInt(m[1], 10);
+    let mm = parseInt(m[2], 10);
+    let yy = m[3] ? parseInt(m[3], 10) : now.getFullYear();
+    if (yy < 100) yy = 2000 + yy;
+
+    if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
+      const d = new Date(yy, mm - 1, dd);
+      // Validazione semplice (evita 31/02)
+      if (d.getFullYear() === yy && d.getMonth() === mm - 1 && d.getDate() === dd) return toISODate(d);
+    }
+    return null;
+  }
+
+  // formati "2512" o "25 12" (senza anno)
+  const digits = t.replace(/[^\d]/g, "");
+  if (digits.length === 4) {
+    const dd = parseInt(digits.slice(0, 2), 10);
+    const mm = parseInt(digits.slice(2, 4), 10);
+    const yy = now.getFullYear();
+    if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
+      const d = new Date(yy, mm - 1, dd);
+      if (d.getMonth() === mm - 1 && d.getDate() === dd) return toISODate(d);
+    }
+  }
+
+  return null;
+}
+
+function parseTimeIT_MVP(speech) {
+  // Supporta: "20:30", "20 e 30", "20 30", "2030", "alle 20", "ore 20"
+  const t = normalizeText(speech);
+  if (!t) return null;
+
+  // 20:30
+  let m = t.match(/\b(\d{1,2})[:\.](\d{2})\b/);
+  if (m) {
+    const hh = parseInt(m[1], 10);
+    const mm = parseInt(m[2], 10);
+    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+      return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+    }
+    return null;
+  }
+
+  // "20 e 30"
+  m = t.match(/\b(\d{1,2})\s*(?:e|e\s+le)?\s*(\d{1,2})\b/);
+  if (m) {
+    const hh = parseInt(m[1], 10);
+    let mm = parseInt(m[2], 10);
+    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+      return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+    }
+  }
+
+  // digits "2030" oppure "830" (rischioso) -> gestiamo solo 3-4 cifre
+  const digits = t.replace(/[^\d]/g, "");
+  if (digits.length === 4) {
+    const hh = parseInt(digits.slice(0, 2), 10);
+    const mm = parseInt(digits.slice(2, 4), 10);
+    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+      return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+    }
+  }
+
+  // "alle 20" -> 20:00
+  m = t.match(/\b(\d{1,2})\b/);
+  if (m) {
+    const hh = parseInt(m[1], 10);
+    if (hh >= 0 && hh <= 23) return `${String(hh).padStart(2, "0")}:00`;
+  }
+
+  return null;
+}
+
+function parsePeopleIT_MVP(speech) {
+  // Cerca un numero nel testo (es. "siamo in quattro" -> 4 se dice "4")
+  // MVP: estrae cifre. (Estendibile con mapping "due, tre, quattro")
+  const t = normalizeText(speech);
+  if (!t) return null;
+
+  const m = t.match(/\b(\d{1,2})\b/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n >= 1 && n <= 20) return n;
+  }
+
+  // mapping minimo parole
+  const map = {
+    uno: 1, una: 1,
+    due: 2,
+    tre: 3,
+    quattro: 4,
+    cinque: 5,
+    sei: 6,
+    sette: 7,
+    otto: 8,
+    nove: 9,
+    dieci: 10
+  };
+  for (const [k, v] of Object.entries(map)) {
+    if (new RegExp(`\\b${k}\\b`).test(t)) return v;
+  }
+
+  return null;
+}
+
+function humanDateIT(iso) {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-");
+  return `${d}/${m}/${y}`;
+}
+
+function normalizeWhatsappFromVoice(speechOrDigits) {
+  // Per voce: spesso arriva "tre nove tre ..." ma Twilio restituisce testo.
+  // MVP: estraiamo tutte le cifre dal testo.
+  const raw = String(speechOrDigits || "").replace(/[^\d]/g, "");
   if (!raw) return "";
   if (raw.startsWith("39")) return `whatsapp:+${raw}`;
-  // se l’utente inserisce senza prefisso, assumiamo IT
   if (raw.startsWith("3")) return `whatsapp:+39${raw}`;
-  // fallback: comunque + davanti
+  if (raw.startsWith("0")) return ""; // numeri fissi/ambigui: richiedi di ripetere con +39
   return `whatsapp:+${raw}`;
+}
+
+function isLikelyItalianMobileE164(e164) {
+  // +39 + 3xxxxxxxxx (approssimazione)
+  return /^\+39\d{9,12}$/.test(e164 || "");
+}
+
+function hasValidWaAddress(wa) {
+  return /^whatsapp:\+\d{8,15}$/.test(wa || "");
 }
 
 // --------------------
@@ -107,19 +315,31 @@ function normalizeWhatsapp(digits) {
 // --------------------
 app.post("/voice", (req, res) => {
   const callSid = req.body.CallSid || `local-${Date.now()}`;
+  const from = req.body.From || ""; // caller id (può essere il numero del forwarder)
+  const session = getSession(callSid);
 
-  sessions.set(callSid, { step: 1 });
+  session.step = 1;
+  session.intent = null;
+  session.name = null;
+  session.dateISO = null;
+  session.time24 = null;
+  session.people = null;
+  session.waTo = null;
+  session.fromCaller = from;
+  resetRetries(session);
+  sessions.set(callSid, session);
 
   const action = `${BASE_URL}/voice/step`;
+
   const body = twiml(`
-${say("Ciao! Hai chiamato TuttiBrilli. Ti aiuto con la prenotazione.")}
-${gather({
+${say("Ciao! Hai chiamato TuttiBrilli Enoteca.")}
+${pause(1)}
+${gatherSpeech({
   action,
-  numDigits: 1,
-  timeout: 8,
-  prompt: "Premi 1 per prenotare. Premi 2 per informazioni."
+  prompt: "Vuoi prenotare un tavolo, oppure ti servono informazioni?",
+  hints: "prenotare, prenotazione, tavolo, posti, informazioni, orari, indirizzo",
 })}
-${say("Non ho ricevuto risposta. Riproviamo.")}
+${say("Scusami, non ti ho sentito. Riproviamo.")}
 ${redirect(`${BASE_URL}/voice`)}
   `);
 
@@ -128,231 +348,367 @@ ${redirect(`${BASE_URL}/voice`)}
 
 // STEP HANDLER
 app.post("/voice/step", async (req, res) => {
-  const callSid = req.body.CallSid;
-  const digits = (req.body.Digits || "").trim();
+  const callSid = req.body.CallSid || `local-${Date.now()}`;
+  const session = getSession(callSid);
 
-  const session = sessions.get(callSid) || { step: 1 };
+  const speechRaw = (req.body.SpeechResult || "").trim();
+  const speech = normalizeText(speechRaw);
+  const confidence = parseFloat(req.body.Confidence || "0");
+
+  const action = `${BASE_URL}/voice/step`;
+
+  function respond(xml) {
+    return res.type("text/xml").status(200).send(twiml(xml));
+  }
+
+  function failOrRetry({ prompt1, prompt2, exitPrompt }) {
+    const n = incRetry(session);
+
+    if (n === 1) {
+      return respond(`
+${gatherSpeech({ action, prompt: prompt1 })}
+${redirect(action)}
+      `);
+    }
+    if (n === 2) {
+      return respond(`
+${gatherSpeech({ action, prompt: prompt2 })}
+${redirect(action)}
+      `);
+    }
+
+    // 3°: uscita soft
+    sessions.delete(callSid);
+    return respond(`
+${say(exitPrompt)}
+${hangup()}
+    `);
+  }
 
   try {
-    const action = `${BASE_URL}/voice/step`;
+    // Se Twilio non ha captato niente (no speech)
+    if (!speech) {
+      // Retry generico basato sullo step
+      if (session.step === 1) {
+        return failOrRetry({
+          prompt1: "Dimmi pure: vuoi prenotare o informazioni?",
+          prompt2: "Puoi dire, per esempio: 'voglio prenotare un tavolo'.",
+          exitPrompt: "Non riesco a sentirti bene. Se vuoi, scrivici su WhatsApp. A presto!",
+        });
+      }
+      if (session.step === 2) {
+        return failOrRetry({
+          prompt1: "Come ti chiami?",
+          prompt2: "Dimmi il tuo nome, ad esempio: 'Mario Rossi'.",
+          exitPrompt: "Perfetto, ci sentiamo più tardi. Se vuoi, scrivici su WhatsApp. A presto!",
+        });
+      }
+      if (session.step === 3) {
+        return failOrRetry({
+          prompt1: "Per che giorno vuoi prenotare?",
+          prompt2: "Puoi dire 'domani' oppure '25 12'.",
+          exitPrompt: "Non riesco a prendere la data. Scrivici su WhatsApp e ti aiutiamo subito. A presto!",
+        });
+      }
+      if (session.step === 4) {
+        return failOrRetry({
+          prompt1: "A che ora preferisci?",
+          prompt2: "Puoi dire '20 e 30' oppure '21'.",
+          exitPrompt: "Non riesco a prendere l'orario. Scrivici su WhatsApp e ti aiutiamo subito. A presto!",
+        });
+      }
+      if (session.step === 5) {
+        return failOrRetry({
+          prompt1: "Per quante persone?",
+          prompt2: "Dimmi un numero, ad esempio 'quattro'.",
+          exitPrompt: "Ok. Scrivici su WhatsApp con numero persone e orario. A presto!",
+        });
+      }
+      if (session.step === 6) {
+        return failOrRetry({
+          prompt1: "A che numero WhatsApp vuoi ricevere la conferma? Dimmi il numero iniziando con più trentanove.",
+          prompt2: "Ripetilo lentamente, ad esempio: più trentanove, tre tre tre...",
+          exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
+        });
+      }
+    }
 
-    // STEP 1: scelta
+    // Confidence molto bassa: trattiamo come “non capito”
+    if (!Number.isNaN(confidence) && confidence > 0 && confidence < 0.35) {
+      // Non blocchiamo sempre, ma preferiamo ripetere
+      // (non facciamo overfitting: Twilio confidence non è sempre affidabile)
+    }
+
+    // ----------------
+    // STEP 1: Intento
+    // ----------------
     if (session.step === 1) {
-      if (digits === "1") {
+      if (looksLikeBooking(speech)) {
+        session.intent = "booking";
         session.step = 2;
+        resetRetries(session);
         sessions.set(callSid, session);
 
-        const body = twiml(`
-${say("Perfetto. Iniziamo.")}
-${gather({
-  action,
-  timeout: 10,
-  finishOnKey: "#",
-  prompt:
-    "Inserisci il tuo nome e cognome usando i tasti del telefono, poi premi cancelletto. " +
-    "Se non vuoi, premi subito cancelletto e andiamo avanti."
-})}
+        return respond(`
+${say("Perfetto. Ti faccio qualche domanda veloce.")}
+${pause(1)}
+${gatherSpeech({ action, prompt: "Come ti chiami?" })}
 ${redirect(action)}
         `);
-
-        return res.type("text/xml").status(200).send(body);
       }
 
-      if (digits === "2") {
-        const body = twiml(`
-${say("Per informazioni puoi scriverci su WhatsApp. Grazie!")}
+      if (looksLikeInfo(speech)) {
+        sessions.delete(callSid);
+        return respond(`
+${say("Certo. Per informazioni rapide, scrivici su WhatsApp. Se invece vuoi prenotare, dimmelo e ti aiuto subito.")}
 ${hangup()}
         `);
-        sessions.delete(callSid);
-        return res.type("text/xml").status(200).send(body);
       }
 
-      const body = twiml(`
-${say("Scelta non valida.")}
-${redirect(`${BASE_URL}/voice`)}
-      `);
-      return res.type("text/xml").status(200).send(body);
+      return failOrRetry({
+        prompt1: "Scusami, vuoi prenotare un tavolo o informazioni?",
+        prompt2: "Puoi dire: 'prenotare un tavolo' oppure 'informazioni'.",
+        exitPrompt: "Va bene. Scrivici su WhatsApp e ti rispondiamo appena possibile. A presto!",
+      });
     }
 
-    // STEP 2: nome (DTMF grezzo, ok per test)
+    // ----------------
+    // STEP 2: Nome
+    // ----------------
     if (session.step === 2) {
-      session.name = digits ? digits : "(nome da confermare)";
+      session.name = speechRaw || speech || "(nome da confermare)";
       session.step = 3;
+      resetRetries(session);
       sessions.set(callSid, session);
 
-      const body = twiml(`
-${gather({
-  action,
-  numDigits: 6,
-  timeout: 12,
-  prompt:
-    "Inserisci la data in formato G G M M A A. " +
-    "Esempio: 2 5 1 2 2 5 per 25 dicembre 2025."
-})}
-${say("Non ho ricevuto la data.")}
+      return respond(`
+${say(`Piacere, ${session.name}.`)}
+${pause(1)}
+${gatherSpeech({ action, prompt: "Per che giorno vuoi prenotare?" })}
 ${redirect(action)}
       `);
-
-      return res.type("text/xml").status(200).send(body);
     }
 
-    // STEP 3: data DDMMAA
+    // ----------------
+    // STEP 3: Data
+    // ----------------
     if (session.step === 3) {
-      if (!digits || digits.length !== 6) {
-        const body = twiml(`
-${say("Formato data non valido.")}
-${redirect(action)}
-        `);
-        return res.type("text/xml").status(200).send(body);
+      const dateISO = parseDateIT_MVP(speech);
+      if (!dateISO) {
+        return failOrRetry({
+          prompt1: "Non sono sicuro di aver capito la data. Per che giorno vuoi prenotare?",
+          prompt2: "Puoi dire 'domani' oppure '25 12'.",
+          exitPrompt: "Ok. Scrivici su WhatsApp con giorno e ora e ti confermiamo. A presto!",
+        });
       }
 
-      session.date = digits;
+      session.dateISO = dateISO;
       session.step = 4;
+      resetRetries(session);
       sessions.set(callSid, session);
 
-      const body = twiml(`
-${gather({
-  action,
-  numDigits: 4,
-  timeout: 12,
-  prompt:
-    "Inserisci l'orario in formato O O M M. " +
-    "Esempio: 2 0 3 0 per 20 e 30."
-})}
-${say("Non ho ricevuto l'orario.")}
+      return respond(`
+${say(`Ok, ${humanDateIT(session.dateISO)}.`)}
+${pause(1)}
+${gatherSpeech({ action, prompt: "A che ora preferisci?" })}
 ${redirect(action)}
       `);
-
-      return res.type("text/xml").status(200).send(body);
     }
 
-    // STEP 4: ora HHMM
+    // ----------------
+    // STEP 4: Orario
+    // ----------------
     if (session.step === 4) {
-      if (!digits || digits.length !== 4) {
-        const body = twiml(`
-${say("Formato orario non valido.")}
-${redirect(action)}
-        `);
-        return res.type("text/xml").status(200).send(body);
+      const time24 = parseTimeIT_MVP(speech);
+      if (!time24) {
+        return failOrRetry({
+          prompt1: "Non sono sicuro di aver capito l'orario. A che ora preferisci?",
+          prompt2: "Puoi dire '20 e 30' oppure '21'.",
+          exitPrompt: "Ok. Scrivici su WhatsApp con giorno e ora e ti confermiamo. A presto!",
+        });
       }
 
-      session.time = digits;
+      session.time24 = time24;
       session.step = 5;
+      resetRetries(session);
       sessions.set(callSid, session);
 
-      const body = twiml(`
-${gather({
-  action,
-  numDigits: 2,
-  timeout: 10,
-  prompt: "Quante persone? Inserisci 1 o 2 cifre."
-})}
-${say("Non ho ricevuto il numero di persone.")}
+      return respond(`
+${say(`Perfetto, alle ${session.time24}.`)}
+${pause(1)}
+${gatherSpeech({ action, prompt: "Per quante persone?" })}
 ${redirect(action)}
       `);
-
-      return res.type("text/xml").status(200).send(body);
     }
 
-    // STEP 5: persone
+    // ----------------
+    // STEP 5: Persone
+    // ----------------
     if (session.step === 5) {
-      if (!digits) {
-        const body = twiml(`
-${say("Numero di persone non valido.")}
-${redirect(action)}
-        `);
-        return res.type("text/xml").status(200).send(body);
+      const people = parsePeopleIT_MVP(speech);
+      if (!people) {
+        return failOrRetry({
+          prompt1: "Quante persone sarete?",
+          prompt2: "Dimmi un numero, ad esempio 'quattro'.",
+          exitPrompt: "Ok. Scrivici su WhatsApp con numero persone e orario. A presto!",
+        });
       }
 
-      session.people = digits;
+      session.people = people;
+
+      // STEP 6: WhatsApp (consenso/numero)
       session.step = 6;
+      resetRetries(session);
+
+      // Se From è un +39 mobile plausibile, chiediamo consenso e usiamo quello.
+      const from = String(session.fromCaller || "");
+      const fromE164 = from.startsWith("+") ? from : "";
+      const canUseCaller = isLikelyItalianMobileE164(fromE164);
+
       sessions.set(callSid, session);
 
-      const body = twiml(`
-${gather({
+      if (canUseCaller) {
+        // Step 6a: chiedi conferma sì/no sul numero chiamante
+        session.substep = "wa_confirm_caller";
+        sessions.set(callSid, session);
+
+        return respond(`
+${say(`Perfetto. Ricapitolo: ${humanDateIT(session.dateISO)} alle ${session.time24}, per ${session.people} persone.`)}
+${pause(1)}
+${gatherSpeech({
   action,
-  timeout: 15,
-  finishOnKey: "#",
-  prompt:
-    "Ora inserisci il tuo numero WhatsApp con prefisso. " +
-    "Esempio: 3 9 3 ... Poi premi cancelletto."
+  prompt: "Ti mando la conferma su WhatsApp a questo numero. Va bene?",
+  hints: "sì, si, va bene, ok, certo, no, cambia, un altro numero",
 })}
-${say("Non ho ricevuto il numero WhatsApp.")}
+${redirect(action)}
+        `);
+      }
+
+      // Caller non affidabile -> chiedi numero
+      session.substep = "wa_ask_number";
+      sessions.set(callSid, session);
+
+      return respond(`
+${say(`Perfetto. Ricapitolo: ${humanDateIT(session.dateISO)} alle ${session.time24}, per ${session.people} persone.`)}
+${pause(1)}
+${gatherSpeech({
+  action,
+  prompt: "A che numero WhatsApp vuoi ricevere la conferma? Dimmi il numero iniziando con più trentanove.",
+})}
 ${redirect(action)}
       `);
-
-      return res.type("text/xml").status(200).send(body);
     }
 
-    // STEP 6: whatsapp + invio WA
+    // ----------------
+    // STEP 6: gestione WhatsApp (consenso o numero) + invio
+    // ----------------
     if (session.step === 6) {
-      const waTo = normalizeWhatsapp(digits);
+      const sub = session.substep || "wa_ask_number";
 
-      // Controlli minimi
-      if (!waTo || waTo.length < 14) {
-        const body = twiml(`
-${say("Numero WhatsApp non valido. Riproviamo.")}
+      // 6a: conferma numero chiamante
+      if (sub === "wa_confirm_caller") {
+        const yes = /\b(si|sì|ok|va bene|certo|confermo)\b/.test(speech);
+        const no = /\b(no|non va bene|cambia|altro numero)\b/.test(speech);
+
+        if (yes && !no) {
+          session.waTo = `whatsapp:${session.fromCaller}`; // fromCaller già +39...
+          session.substep = null;
+          session.step = 7;
+          resetRetries(session);
+          sessions.set(callSid, session);
+          // vai a invio
+        } else if (no && !yes) {
+          session.substep = "wa_ask_number";
+          resetRetries(session);
+          sessions.set(callSid, session);
+
+          return respond(`
+${gatherSpeech({
+  action,
+  prompt: "Ok. Dimmi il numero WhatsApp, iniziando con più trentanove.",
+})}
 ${redirect(action)}
-        `);
-        return res.type("text/xml").status(200).send(body);
+          `);
+        } else {
+          return failOrRetry({
+            prompt1: "Scusami, ti va bene che invii il WhatsApp a questo numero? Puoi dire sì o no.",
+            prompt2: "Dimmi solo: sì, va bene. Oppure: no, un altro numero.",
+            exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
+          });
+        }
       }
 
-      session.whatsapp = waTo;
-      session.step = 7;
-      sessions.set(callSid, session);
+      // 6b: acquisizione numero WhatsApp a voce
+      if (sub === "wa_ask_number") {
+        const waTo = normalizeWhatsappFromVoice(speechRaw || speech);
+        if (!waTo || !hasValidWaAddress(waTo)) {
+          return failOrRetry({
+            prompt1: "Non sono sicuro di aver capito il numero. Me lo ripeti iniziando con più trentanove?",
+            prompt2: "Ripetilo lentamente, ad esempio: più trentanove, tre tre tre...",
+            exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
+          });
+        }
 
-      // Costruisci riepilogo
-      const humanDate = ddmmaaToHuman(session.date);
-      const humanTime = hhmmToHuman(session.time);
+        session.waTo = waTo;
+        session.substep = null;
+        session.step = 7;
+        resetRetries(session);
+        sessions.set(callSid, session);
+        // vai a invio
+      }
+    }
 
-      const message =
-`✅ *Richiesta prenotazione ricevuta*
-Nome: ${session.name}
-Data: ${humanDate}
-Ora: ${humanTime}
+    // ----------------
+    // STEP 7: invio WhatsApp + chiusura
+    // ----------------
+    if (session.step === 7) {
+      const waTo = session.waTo;
+
+      const summary =
+`✅ Richiesta prenotazione ricevuta
+Nome: ${session.name || "-"}
+Data: ${humanDateIT(session.dateISO)}
+Ora: ${session.time24}
 Persone: ${session.people}
 
-Rispondi a questo WhatsApp per *confermare* o *modificare*.`;
+Rispondi qui se devi modificare o annullare.`;
 
-      // Invia WhatsApp (se configurato)
       if (!twilioClient) {
         console.error("Twilio client non configurato: mancano TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
       } else if (!TWILIO_WHATSAPP_FROM) {
         console.error("Manca TWILIO_WHATSAPP_FROM (es. whatsapp:+14155238886)");
+      } else if (!waTo || !hasValidWaAddress(waTo)) {
+        console.error("waTo non valido:", waTo);
       } else {
         await twilioClient.messages.create({
           from: TWILIO_WHATSAPP_FROM,
           to: waTo,
-          body: message,
+          body: summary,
         });
       }
 
-      const body = twiml(`
-${say("Perfetto. Ti ho inviato un messaggio WhatsApp con il riepilogo. Grazie!")}
+      sessions.delete(callSid);
+      return respond(`
+${say("Perfetto! Ho preso la richiesta. Ti ho inviato un WhatsApp con il riepilogo. A presto da TuttiBrilli!")}
 ${hangup()}
       `);
-
-      sessions.delete(callSid);
-      return res.type("text/xml").status(200).send(body);
     }
 
-    // fallback
+    // fallback finale
     sessions.delete(callSid);
-    const body = twiml(`
+    return respond(`
 ${say("Ripartiamo da capo.")}
 ${redirect(`${BASE_URL}/voice`)}
     `);
-    return res.type("text/xml").status(200).send(body);
   } catch (err) {
     console.error("VOICE FLOW ERROR:", err);
-
-    const body = twiml(`
+    sessions.delete(callSid);
+    return res.type("text/xml").status(200).send(
+      twiml(`
 ${say("C'è stato un problema tecnico. Riprova tra poco.")}
 ${hangup()}
-    `);
-
-    sessions.delete(callSid);
-    return res.type("text/xml").status(200).send(body);
+      `)
+    );
   }
 });
 
