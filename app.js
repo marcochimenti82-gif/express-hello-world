@@ -13,13 +13,35 @@ const BASE_URL = process.env.BASE_URL || ""; // es: https://ai-backoffice-tuttib
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || ""; // es: whatsapp:+14155238886 (sandbox) oppure whatsapp:+<sender>
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || ""; // es: whatsapp:+14155238886 (sandbox) oppure whatsapp:+<sender approvato>
 
-// Client Twilio
+const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
+const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || ""; // es: ...@group.calendar.google.com
+const DEFAULT_EVENT_DURATION_MINUTES = parseInt(process.env.DEFAULT_EVENT_DURATION_MINUTES || "120", 10);
+
+// Twilio client
 let twilioClient = null;
 if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
   const twilio = require("twilio");
   twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+}
+
+// Google Calendar client (Service Account)
+const { google } = require("googleapis");
+
+function getCalendarClient() {
+  if (!GOOGLE_SERVICE_ACCOUNT_JSON) return null;
+  if (!GOOGLE_CALENDAR_ID) return null;
+
+  const creds = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
+
+  const auth = new google.auth.JWT({
+    email: creds.client_email,
+    key: creds.private_key,
+    scopes: ["https://www.googleapis.com/auth/calendar"],
+  });
+
+  return google.calendar({ version: "v3", auth });
 }
 
 // --------------------
@@ -45,9 +67,6 @@ function twiml(xmlInsideResponseTag) {
   return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n${xmlInsideResponseTag}\n</Response>`;
 }
 
-// Se vuoi provare voci diverse (se disponibili sul tuo account):
-// - voice="alice" (standard)
-// - voice="Polly.Bianca" / "Polly.Bianca-Neural" (se abilitato)
 function say(text) {
   const safe = xmlEscape(text);
   return `<Say language="it-IT" voice="alice">${safe}</Say>`;
@@ -65,12 +84,6 @@ function hangup() {
   return `<Hangup/>`;
 }
 
-/**
- * Gather speech-only.
- * - timeout: secondi di attesa prima di "no input"
- * - speechTimeout: "auto" o numero (sec) di silenzio per chiudere
- * - hints: parole chiave (non obbligatorio)
- */
 function gatherSpeech({
   action,
   method = "POST",
@@ -99,6 +112,7 @@ function gatherSpeech({
  * session schema:
  * {
  *  step: number,
+ *  substep?: string|null,
  *  retries: number,
  *  intent: "booking"|"info"|null,
  *  name: string|null,
@@ -114,7 +128,18 @@ const sessions = new Map(); // key: CallSid
 function getSession(callSid) {
   const s = sessions.get(callSid);
   if (s) return s;
-  const fresh = { step: 1, retries: 0, intent: null, name: null, dateISO: null, time24: null, people: null, waTo: null, fromCaller: null };
+  const fresh = {
+    step: 1,
+    substep: null,
+    retries: 0,
+    intent: null,
+    name: null,
+    dateISO: null,
+    time24: null,
+    people: null,
+    waTo: null,
+    fromCaller: null,
+  };
   sessions.set(callSid, fresh);
   return fresh;
 }
@@ -146,8 +171,7 @@ function looksLikeInfo(text) {
   return /info|orari|indirizz|dove|menu|menù|carta|vini|evento|serata/.test(text);
 }
 
-function nowRome() {
-  // Manteniamo semplice: usa timezone server. Per robustezza futura: luxon.
+function nowLocal() {
   return new Date();
 }
 
@@ -159,13 +183,10 @@ function toISODate(d) {
 }
 
 function parseDateIT_MVP(speech) {
-  // Supporta: "oggi", "stasera" -> oggi; "domani" -> domani
-  // Supporta: "25/12/2025", "25-12-2025", "25/12", "2512", "25 12"
-  // Se manca anno -> anno corrente
   const t = normalizeText(speech);
   if (!t) return null;
 
-  const now = nowRome();
+  const now = nowLocal();
 
   if (/\b(oggi|stasera)\b/.test(t)) return toISODate(now);
   if (/\bdomani\b/.test(t)) {
@@ -174,7 +195,6 @@ function parseDateIT_MVP(speech) {
     return toISODate(d);
   }
 
-  // Estrai numeri
   // formati tipo 25/12/2025 o 25-12-2025
   let m = t.match(/\b(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?\b/);
   if (m) {
@@ -185,13 +205,12 @@ function parseDateIT_MVP(speech) {
 
     if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
       const d = new Date(yy, mm - 1, dd);
-      // Validazione semplice (evita 31/02)
       if (d.getFullYear() === yy && d.getMonth() === mm - 1 && d.getDate() === dd) return toISODate(d);
     }
     return null;
   }
 
-  // formati "2512" o "25 12" (senza anno)
+  // "2512" o "25 12"
   const digits = t.replace(/[^\d]/g, "");
   if (digits.length === 4) {
     const dd = parseInt(digits.slice(0, 2), 10);
@@ -207,7 +226,6 @@ function parseDateIT_MVP(speech) {
 }
 
 function parseTimeIT_MVP(speech) {
-  // Supporta: "20:30", "20 e 30", "20 30", "2030", "alle 20", "ore 20"
   const t = normalizeText(speech);
   if (!t) return null;
 
@@ -222,17 +240,17 @@ function parseTimeIT_MVP(speech) {
     return null;
   }
 
-  // "20 e 30"
-  m = t.match(/\b(\d{1,2})\s*(?:e|e\s+le)?\s*(\d{1,2})\b/);
+  // "20 e 30" / "20 30"
+  m = t.match(/\b(\d{1,2})\s*(?:e)?\s*(\d{1,2})\b/);
   if (m) {
     const hh = parseInt(m[1], 10);
-    let mm = parseInt(m[2], 10);
+    const mm = parseInt(m[2], 10);
     if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
       return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
     }
   }
 
-  // digits "2030" oppure "830" (rischioso) -> gestiamo solo 3-4 cifre
+  // digits "2030"
   const digits = t.replace(/[^\d]/g, "");
   if (digits.length === 4) {
     const hh = parseInt(digits.slice(0, 2), 10);
@@ -253,8 +271,6 @@ function parseTimeIT_MVP(speech) {
 }
 
 function parsePeopleIT_MVP(speech) {
-  // Cerca un numero nel testo (es. "siamo in quattro" -> 4 se dice "4")
-  // MVP: estrae cifre. (Estendibile con mapping "due, tre, quattro")
   const t = normalizeText(speech);
   if (!t) return null;
 
@@ -264,7 +280,6 @@ function parsePeopleIT_MVP(speech) {
     if (n >= 1 && n <= 20) return n;
   }
 
-  // mapping minimo parole
   const map = {
     uno: 1, una: 1,
     due: 2,
@@ -275,7 +290,7 @@ function parsePeopleIT_MVP(speech) {
     sette: 7,
     otto: 8,
     nove: 9,
-    dieci: 10
+    dieci: 10,
   };
   for (const [k, v] of Object.entries(map)) {
     if (new RegExp(`\\b${k}\\b`).test(t)) return v;
@@ -291,18 +306,14 @@ function humanDateIT(iso) {
 }
 
 function normalizeWhatsappFromVoice(speechOrDigits) {
-  // Per voce: spesso arriva "tre nove tre ..." ma Twilio restituisce testo.
-  // MVP: estraiamo tutte le cifre dal testo.
   const raw = String(speechOrDigits || "").replace(/[^\d]/g, "");
   if (!raw) return "";
   if (raw.startsWith("39")) return `whatsapp:+${raw}`;
   if (raw.startsWith("3")) return `whatsapp:+39${raw}`;
-  if (raw.startsWith("0")) return ""; // numeri fissi/ambigui: richiedi di ripetere con +39
   return `whatsapp:+${raw}`;
 }
 
 function isLikelyItalianMobileE164(e164) {
-  // +39 + 3xxxxxxxxx (approssimazione)
   return /^\+39\d{9,12}$/.test(e164 || "");
 }
 
@@ -311,14 +322,89 @@ function hasValidWaAddress(wa) {
 }
 
 // --------------------
+// Google Calendar: crea evento prenotazione (con idempotenza su CallSid)
+// --------------------
+function addMinutes(date, minutes) {
+  return new Date(date.getTime() + minutes * 60 * 1000);
+}
+
+function toLocalDateTimeParts(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  return { date: `${y}-${m}-${d}`, time: `${hh}:${mm}` };
+}
+
+async function createBookingEvent({
+  callSid,
+  name,
+  dateISO,
+  time24,
+  people,
+  phone,
+  waTo,
+}) {
+  const calendar = getCalendarClient();
+  if (!calendar) throw new Error("Google Calendar non configurato (manca JSON o CALENDAR_ID).");
+
+  const privateKey = `callsid:${callSid}`;
+
+  // Idempotenza: cerca se esiste già un evento con callsid:<CallSid> nella description
+  const existing = await calendar.events.list({
+    calendarId: GOOGLE_CALENDAR_ID,
+    q: privateKey,
+    // limitiamo ricerca alla giornata per velocità
+    timeMin: `${dateISO}T00:00:00Z`,
+    timeMax: `${dateISO}T23:59:59Z`,
+    singleEvents: true,
+    maxResults: 5,
+  });
+
+  const found = (existing.data.items || []).find((ev) => (ev.description || "").includes(privateKey));
+  if (found) {
+    return { eventId: found.id, htmlLink: found.htmlLink, reused: true };
+  }
+
+  const startDateTime = `${dateISO}T${time24}:00`;
+  const start = new Date(`${dateISO}T${time24}:00`);
+  const end = addMinutes(start, DEFAULT_EVENT_DURATION_MINUTES);
+  const endParts = toLocalDateTimeParts(end);
+  const endDateTime = `${endParts.date}T${endParts.time}:00`;
+
+  const requestBody = {
+    summary: `TuttiBrilli – ${name} – ${people} pax`,
+    description:
+      `Prenotazione\n` +
+      `Nome: ${name}\n` +
+      `Persone: ${people}\n` +
+      `Telefono: ${phone || "-"}\n` +
+      `WhatsApp: ${waTo || "-"}\n` +
+      `${privateKey}\n`,
+    start: { dateTime: startDateTime, timeZone: "Europe/Rome" },
+    end: { dateTime: endDateTime, timeZone: "Europe/Rome" },
+  };
+
+  const resp = await calendar.events.insert({
+    calendarId: GOOGLE_CALENDAR_ID,
+    requestBody,
+  });
+
+  return { eventId: resp.data.id, htmlLink: resp.data.htmlLink, reused: false };
+}
+
+// --------------------
 // TWILIO VOICE - START
 // --------------------
 app.post("/voice", (req, res) => {
   const callSid = req.body.CallSid || `local-${Date.now()}`;
-  const from = req.body.From || ""; // caller id (può essere il numero del forwarder)
+  const from = req.body.From || ""; // caller id (può essere forwarder)
   const session = getSession(callSid);
 
   session.step = 1;
+  session.substep = null;
+  session.retries = 0;
   session.intent = null;
   session.name = null;
   session.dateISO = null;
@@ -326,7 +412,6 @@ app.post("/voice", (req, res) => {
   session.people = null;
   session.waTo = null;
   session.fromCaller = from;
-  resetRetries(session);
   sessions.set(callSid, session);
 
   const action = `${BASE_URL}/voice/step`;
@@ -365,19 +450,20 @@ app.post("/voice/step", async (req, res) => {
     const n = incRetry(session);
 
     if (n === 1) {
+      sessions.set(callSid, session);
       return respond(`
 ${gatherSpeech({ action, prompt: prompt1 })}
 ${redirect(action)}
       `);
     }
     if (n === 2) {
+      sessions.set(callSid, session);
       return respond(`
 ${gatherSpeech({ action, prompt: prompt2 })}
 ${redirect(action)}
       `);
     }
 
-    // 3°: uscita soft
     sessions.delete(callSid);
     return respond(`
 ${say(exitPrompt)}
@@ -386,9 +472,8 @@ ${hangup()}
   }
 
   try {
-    // Se Twilio non ha captato niente (no speech)
+    // No input / no speech
     if (!speech) {
-      // Retry generico basato sullo step
       if (session.step === 1) {
         return failOrRetry({
           prompt1: "Dimmi pure: vuoi prenotare o informazioni?",
@@ -400,7 +485,7 @@ ${hangup()}
         return failOrRetry({
           prompt1: "Come ti chiami?",
           prompt2: "Dimmi il tuo nome, ad esempio: 'Mario Rossi'.",
-          exitPrompt: "Perfetto, ci sentiamo più tardi. Se vuoi, scrivici su WhatsApp. A presto!",
+          exitPrompt: "Ok. Se vuoi, scrivici su WhatsApp. A presto!",
         });
       }
       if (session.step === 3) {
@@ -433,15 +518,7 @@ ${hangup()}
       }
     }
 
-    // Confidence molto bassa: trattiamo come “non capito”
-    if (!Number.isNaN(confidence) && confidence > 0 && confidence < 0.35) {
-      // Non blocchiamo sempre, ma preferiamo ripetere
-      // (non facciamo overfitting: Twilio confidence non è sempre affidabile)
-    }
-
-    // ----------------
     // STEP 1: Intento
-    // ----------------
     if (session.step === 1) {
       if (looksLikeBooking(speech)) {
         session.intent = "booking";
@@ -460,7 +537,7 @@ ${redirect(action)}
       if (looksLikeInfo(speech)) {
         sessions.delete(callSid);
         return respond(`
-${say("Certo. Per informazioni rapide, scrivici su WhatsApp. Se invece vuoi prenotare, dimmelo e ti aiuto subito.")}
+${say("Certo. Per informazioni rapide puoi scriverci su WhatsApp. Se invece vuoi prenotare, dimmelo e ti aiuto subito.")}
 ${hangup()}
         `);
       }
@@ -472,11 +549,9 @@ ${hangup()}
       });
     }
 
-    // ----------------
     // STEP 2: Nome
-    // ----------------
     if (session.step === 2) {
-      session.name = speechRaw || speech || "(nome da confermare)";
+      session.name = speechRaw || "(nome da confermare)";
       session.step = 3;
       resetRetries(session);
       sessions.set(callSid, session);
@@ -489,9 +564,7 @@ ${redirect(action)}
       `);
     }
 
-    // ----------------
     // STEP 3: Data
-    // ----------------
     if (session.step === 3) {
       const dateISO = parseDateIT_MVP(speech);
       if (!dateISO) {
@@ -515,9 +588,7 @@ ${redirect(action)}
       `);
     }
 
-    // ----------------
     // STEP 4: Orario
-    // ----------------
     if (session.step === 4) {
       const time24 = parseTimeIT_MVP(speech);
       if (!time24) {
@@ -541,9 +612,7 @@ ${redirect(action)}
       `);
     }
 
-    // ----------------
     // STEP 5: Persone
-    // ----------------
     if (session.step === 5) {
       const people = parsePeopleIT_MVP(speech);
       if (!people) {
@@ -555,20 +624,16 @@ ${redirect(action)}
       }
 
       session.people = people;
-
-      // STEP 6: WhatsApp (consenso/numero)
       session.step = 6;
+      session.substep = null;
       resetRetries(session);
+      sessions.set(callSid, session);
 
-      // Se From è un +39 mobile plausibile, chiediamo consenso e usiamo quello.
       const from = String(session.fromCaller || "");
       const fromE164 = from.startsWith("+") ? from : "";
       const canUseCaller = isLikelyItalianMobileE164(fromE164);
 
-      sessions.set(callSid, session);
-
       if (canUseCaller) {
-        // Step 6a: chiedi conferma sì/no sul numero chiamante
         session.substep = "wa_confirm_caller";
         sessions.set(callSid, session);
 
@@ -584,7 +649,6 @@ ${redirect(action)}
         `);
       }
 
-      // Caller non affidabile -> chiedi numero
       session.substep = "wa_ask_number";
       sessions.set(callSid, session);
 
@@ -599,34 +663,27 @@ ${redirect(action)}
       `);
     }
 
-    // ----------------
-    // STEP 6: gestione WhatsApp (consenso o numero) + invio
-    // ----------------
+    // STEP 6: WhatsApp (consenso o numero)
     if (session.step === 6) {
       const sub = session.substep || "wa_ask_number";
 
-      // 6a: conferma numero chiamante
       if (sub === "wa_confirm_caller") {
         const yes = /\b(si|sì|ok|va bene|certo|confermo)\b/.test(speech);
         const no = /\b(no|non va bene|cambia|altro numero)\b/.test(speech);
 
         if (yes && !no) {
           session.waTo = `whatsapp:${session.fromCaller}`; // fromCaller già +39...
-          session.substep = null;
           session.step = 7;
+          session.substep = null;
           resetRetries(session);
           sessions.set(callSid, session);
-          // vai a invio
+          // continua a STEP 7 sotto
         } else if (no && !yes) {
           session.substep = "wa_ask_number";
           resetRetries(session);
           sessions.set(callSid, session);
-
           return respond(`
-${gatherSpeech({
-  action,
-  prompt: "Ok. Dimmi il numero WhatsApp, iniziando con più trentanove.",
-})}
+${gatherSpeech({ action, prompt: "Ok. Dimmi il numero WhatsApp, iniziando con più trentanove." })}
 ${redirect(action)}
           `);
         } else {
@@ -638,7 +695,6 @@ ${redirect(action)}
         }
       }
 
-      // 6b: acquisizione numero WhatsApp a voce
       if (sub === "wa_ask_number") {
         const waTo = normalizeWhatsappFromVoice(speechRaw || speech);
         if (!waTo || !hasValidWaAddress(waTo)) {
@@ -650,28 +706,38 @@ ${redirect(action)}
         }
 
         session.waTo = waTo;
-        session.substep = null;
         session.step = 7;
+        session.substep = null;
         resetRetries(session);
         sessions.set(callSid, session);
-        // vai a invio
+        // continua a STEP 7 sotto
       }
     }
 
-    // ----------------
-    // STEP 7: invio WhatsApp + chiusura
-    // ----------------
+    // STEP 7: crea evento su Calendar + invia WhatsApp
     if (session.step === 7) {
+      // 1) Google Calendar
+      let calendarResult = null;
+      try {
+        calendarResult = await createBookingEvent({
+          callSid,
+          name: session.name,
+          dateISO: session.dateISO,
+          time24: session.time24,
+          people: session.people,
+          phone: (session.fromCaller || "").startsWith("+") ? session.fromCaller : "",
+          waTo: session.waTo,
+        });
+      } catch (e) {
+        console.error("Google Calendar insert failed:", e);
+      }
+
+      // 2) WhatsApp
       const waTo = session.waTo;
 
-      const summary =
-`✅ Richiesta prenotazione ricevuta
-Nome: ${session.name || "-"}
-Data: ${humanDateIT(session.dateISO)}
-Ora: ${session.time24}
-Persone: ${session.people}
-
-Rispondi qui se devi modificare o annullare.`;
+      const waBody = calendarResult
+        ? `✅ Prenotazione registrata\nNome: ${session.name}\nData: ${humanDateIT(session.dateISO)}\nOra: ${session.time24}\nPersone: ${session.people}\n\nSe devi modificare o annullare, rispondi a questo messaggio.`
+        : `✅ Richiesta ricevuta\nNome: ${session.name}\nData: ${humanDateIT(session.dateISO)}\nOra: ${session.time24}\nPersone: ${session.people}\n\nTi confermiamo a breve.`;
 
       if (!twilioClient) {
         console.error("Twilio client non configurato: mancano TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
@@ -683,13 +749,13 @@ Rispondi qui se devi modificare o annullare.`;
         await twilioClient.messages.create({
           from: TWILIO_WHATSAPP_FROM,
           to: waTo,
-          body: summary,
+          body: waBody,
         });
       }
 
       sessions.delete(callSid);
       return respond(`
-${say("Perfetto! Ho preso la richiesta. Ti ho inviato un WhatsApp con il riepilogo. A presto da TuttiBrilli!")}
+${say("Perfetto! Ho registrato la prenotazione e ti ho inviato un WhatsApp di conferma. A presto da TuttiBrilli!")}
 ${hangup()}
       `);
     }
@@ -718,4 +784,6 @@ ${hangup()}
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`BASE_URL: ${BASE_URL || "(non impostato)"}`);
+  console.log(`Calendar configured: ${Boolean(GOOGLE_SERVICE_ACCOUNT_JSON && GOOGLE_CALENDAR_ID)}`);
+  console.log(`Twilio configured: ${Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN)}`);
 });
