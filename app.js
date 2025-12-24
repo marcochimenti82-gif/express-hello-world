@@ -19,6 +19,11 @@ const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || ""; // es: ...@group.calendar.google.com
 const DEFAULT_EVENT_DURATION_MINUTES = parseInt(process.env.DEFAULT_EVENT_DURATION_MINUTES || "120", 10);
 
+// >>> INOLTRO A OPERATORE (NUOVO)
+const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || ""; // es: +393331112222
+const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "true").toLowerCase() === "true";
+const LOW_CONFIDENCE_THRESHOLD = parseFloat(process.env.LOW_CONFIDENCE_THRESHOLD || "0.45"); // regola a piacere
+
 // Twilio client
 let twilioClient = null;
 if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
@@ -103,6 +108,44 @@ function gatherSpeech({
         speechTimeout="${speechTimeout}"${safeHints}>
   ${say(prompt)}
 </Gather>`;
+}
+
+// >>> DIAL/INOLTRO (NUOVO)
+function dialNumber(numberE164, { callerId = null, timeout = 20 } = {}) {
+  // callerId: opzionale, ma spesso conviene lasciare quello di Twilio
+  const attrs = [
+    timeout ? `timeout="${Number(timeout)}"` : "",
+    callerId ? `callerId="${xmlEscape(callerId)}"` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return `<Dial ${attrs}>${xmlEscape(numberE164)}</Dial>`;
+}
+
+function wantsHuman(text) {
+  const t = String(text || "").toLowerCase();
+  return /\b(operatore|umano|persona|collega|parlare con qualcuno|assistenza)\b/.test(t);
+}
+
+function canForwardToHuman() {
+  return ENABLE_FORWARDING && Boolean(HUMAN_FORWARD_TO) && /^\+\d{8,15}$/.test(HUMAN_FORWARD_TO);
+}
+
+function forwardToHumanTwiml(reason = "richiesta assistenza") {
+  if (!canForwardToHuman()) {
+    // se non configurato, chiudiamo in modo elegante
+    return `
+${say("Va bene. Al momento non riesco a trasferire la chiamata. Ti invito a scriverci su WhatsApp. A presto!")}
+${hangup()}
+    `;
+  }
+  return `
+${say("Perfetto, ti passo subito un operatore.")}
+${pause(1)}
+${dialNumber(HUMAN_FORWARD_TO, { timeout: 25 })}
+${say("Non sono riuscito a metterti in contatto. Se vuoi, scrivici su WhatsApp. A presto!")}
+${hangup()}
+  `;
 }
 
 // --------------------
@@ -195,7 +238,6 @@ function parseDateIT_MVP(speech) {
     return toISODate(d);
   }
 
-  // formati tipo 25/12/2025 o 25-12-2025
   let m = t.match(/\b(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?\b/);
   if (m) {
     let dd = parseInt(m[1], 10);
@@ -210,7 +252,6 @@ function parseDateIT_MVP(speech) {
     return null;
   }
 
-  // "2512" o "25 12"
   const digits = t.replace(/[^\d]/g, "");
   if (digits.length === 4) {
     const dd = parseInt(digits.slice(0, 2), 10);
@@ -229,7 +270,6 @@ function parseTimeIT_MVP(speech) {
   const t = normalizeText(speech);
   if (!t) return null;
 
-  // 20:30
   let m = t.match(/\b(\d{1,2})[:\.](\d{2})\b/);
   if (m) {
     const hh = parseInt(m[1], 10);
@@ -240,7 +280,6 @@ function parseTimeIT_MVP(speech) {
     return null;
   }
 
-  // "20 e 30" / "20 30"
   m = t.match(/\b(\d{1,2})\s*(?:e)?\s*(\d{1,2})\b/);
   if (m) {
     const hh = parseInt(m[1], 10);
@@ -250,7 +289,6 @@ function parseTimeIT_MVP(speech) {
     }
   }
 
-  // digits "2030"
   const digits = t.replace(/[^\d]/g, "");
   if (digits.length === 4) {
     const hh = parseInt(digits.slice(0, 2), 10);
@@ -260,7 +298,6 @@ function parseTimeIT_MVP(speech) {
     }
   }
 
-  // "alle 20" -> 20:00
   m = t.match(/\b(\d{1,2})\b/);
   if (m) {
     const hh = parseInt(m[1], 10);
@@ -351,11 +388,9 @@ async function createBookingEvent({
 
   const privateKey = `callsid:${callSid}`;
 
-  // Idempotenza: cerca se esiste già un evento con callsid:<CallSid> nella description
   const existing = await calendar.events.list({
     calendarId: GOOGLE_CALENDAR_ID,
     q: privateKey,
-    // limitiamo ricerca alla giornata per velocità
     timeMin: `${dateISO}T00:00:00Z`,
     timeMax: `${dateISO}T23:59:59Z`,
     singleEvents: true,
@@ -421,8 +456,8 @@ ${say("Ciao! Hai chiamato TuttiBrilli Enoteca.")}
 ${pause(1)}
 ${gatherSpeech({
   action,
-  prompt: "Vuoi prenotare un tavolo, oppure ti servono informazioni?",
-  hints: "prenotare, prenotazione, tavolo, posti, informazioni, orari, indirizzo",
+  prompt: "Vuoi prenotare un tavolo, oppure ti servono informazioni? Se vuoi un operatore, dimmi: operatore.",
+  hints: "prenotare, prenotazione, tavolo, posti, informazioni, orari, indirizzo, operatore, umano",
 })}
 ${say("Scusami, non ti ho sentito. Riproviamo.")}
 ${redirect(`${BASE_URL}/voice`)}
@@ -446,7 +481,8 @@ app.post("/voice/step", async (req, res) => {
     return res.type("text/xml").status(200).send(twiml(xml));
   }
 
-  function failOrRetry({ prompt1, prompt2, exitPrompt }) {
+  // >>> Fallback/Retry aggiornato: se finisco i tentativi => inoltro a operatore (se configurato)
+  function failOrRetry({ prompt1, prompt2, exitPrompt, forwardOnFail = true }) {
     const n = incRetry(session);
 
     if (n === 1) {
@@ -464,6 +500,13 @@ ${redirect(action)}
       `);
     }
 
+    // tentativi finiti: inoltro oppure chiudo
+    sessions.set(callSid, session);
+    if (forwardOnFail && canForwardToHuman()) {
+      sessions.delete(callSid);
+      return respond(forwardToHumanTwiml("fallback_troppi_tentativi"));
+    }
+
     sessions.delete(callSid);
     return respond(`
 ${say(exitPrompt)}
@@ -472,13 +515,24 @@ ${hangup()}
   }
 
   try {
+    // >>> Se chiede operatore in qualunque momento => inoltro immediato
+    if (speech && wantsHuman(speech)) {
+      sessions.delete(callSid);
+      return respond(forwardToHumanTwiml("richiesta_utente"));
+    }
+
+    // >>> Confidenza bassa: se preferisci, puoi inoltrare SOLO dopo 1 retry.
+    // Qui lo gestiamo in modo soft: aumenta la probabilità di fallback.
+    const lowConfidence = Number.isFinite(confidence) && confidence > 0 && confidence < LOW_CONFIDENCE_THRESHOLD;
+
     // No input / no speech
     if (!speech) {
       if (session.step === 1) {
         return failOrRetry({
-          prompt1: "Dimmi pure: vuoi prenotare o informazioni?",
-          prompt2: "Puoi dire, per esempio: 'voglio prenotare un tavolo'.",
+          prompt1: "Dimmi pure: vuoi prenotare o informazioni? Oppure di' operatore.",
+          prompt2: "Puoi dire, per esempio: 'voglio prenotare un tavolo'. Oppure: 'operatore'.",
           exitPrompt: "Non riesco a sentirti bene. Se vuoi, scrivici su WhatsApp. A presto!",
+          forwardOnFail: true,
         });
       }
       if (session.step === 2) {
@@ -486,6 +540,7 @@ ${hangup()}
           prompt1: "Come ti chiami?",
           prompt2: "Dimmi il tuo nome, ad esempio: 'Mario Rossi'.",
           exitPrompt: "Ok. Se vuoi, scrivici su WhatsApp. A presto!",
+          forwardOnFail: true,
         });
       }
       if (session.step === 3) {
@@ -493,6 +548,7 @@ ${hangup()}
           prompt1: "Per che giorno vuoi prenotare?",
           prompt2: "Puoi dire 'domani' oppure '25 12'.",
           exitPrompt: "Non riesco a prendere la data. Scrivici su WhatsApp e ti aiutiamo subito. A presto!",
+          forwardOnFail: true,
         });
       }
       if (session.step === 4) {
@@ -500,6 +556,7 @@ ${hangup()}
           prompt1: "A che ora preferisci?",
           prompt2: "Puoi dire '20 e 30' oppure '21'.",
           exitPrompt: "Non riesco a prendere l'orario. Scrivici su WhatsApp e ti aiutiamo subito. A presto!",
+          forwardOnFail: true,
         });
       }
       if (session.step === 5) {
@@ -507,6 +564,7 @@ ${hangup()}
           prompt1: "Per quante persone?",
           prompt2: "Dimmi un numero, ad esempio 'quattro'.",
           exitPrompt: "Ok. Scrivici su WhatsApp con numero persone e orario. A presto!",
+          forwardOnFail: true,
         });
       }
       if (session.step === 6) {
@@ -514,8 +572,15 @@ ${hangup()}
           prompt1: "A che numero WhatsApp vuoi ricevere la conferma? Dimmi il numero iniziando con più trentanove.",
           prompt2: "Ripetilo lentamente, ad esempio: più trentanove, tre tre tre...",
           exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
+          forwardOnFail: true,
         });
       }
+    }
+
+    // >>> Se confidenza è bassa e siamo già in retry, puoi inoltrare più velocemente
+    if (lowConfidence && session.retries >= 1 && canForwardToHuman()) {
+      sessions.delete(callSid);
+      return respond(forwardToHumanTwiml("bassa_confidenza_stt"));
     }
 
     // STEP 1: Intento
@@ -543,9 +608,10 @@ ${hangup()}
       }
 
       return failOrRetry({
-        prompt1: "Scusami, vuoi prenotare un tavolo o informazioni?",
-        prompt2: "Puoi dire: 'prenotare un tavolo' oppure 'informazioni'.",
+        prompt1: "Scusami, vuoi prenotare un tavolo o informazioni? Oppure di' operatore.",
+        prompt2: "Puoi dire: 'prenotare un tavolo' oppure 'informazioni'. Oppure: 'operatore'.",
         exitPrompt: "Va bene. Scrivici su WhatsApp e ti rispondiamo appena possibile. A presto!",
+        forwardOnFail: true,
       });
     }
 
@@ -572,6 +638,7 @@ ${redirect(action)}
           prompt1: "Non sono sicuro di aver capito la data. Per che giorno vuoi prenotare?",
           prompt2: "Puoi dire 'domani' oppure '25 12'.",
           exitPrompt: "Ok. Scrivici su WhatsApp con giorno e ora e ti confermiamo. A presto!",
+          forwardOnFail: true,
         });
       }
 
@@ -596,6 +663,7 @@ ${redirect(action)}
           prompt1: "Non sono sicuro di aver capito l'orario. A che ora preferisci?",
           prompt2: "Puoi dire '20 e 30' oppure '21'.",
           exitPrompt: "Ok. Scrivici su WhatsApp con giorno e ora e ti confermiamo. A presto!",
+          forwardOnFail: true,
         });
       }
 
@@ -620,6 +688,7 @@ ${redirect(action)}
           prompt1: "Quante persone sarete?",
           prompt2: "Dimmi un numero, ad esempio 'quattro'.",
           exitPrompt: "Ok. Scrivici su WhatsApp con numero persone e orario. A presto!",
+          forwardOnFail: true,
         });
       }
 
@@ -642,8 +711,8 @@ ${say(`Perfetto. Ricapitolo: ${humanDateIT(session.dateISO)} alle ${session.time
 ${pause(1)}
 ${gatherSpeech({
   action,
-  prompt: "Ti mando la conferma su WhatsApp a questo numero. Va bene?",
-  hints: "sì, si, va bene, ok, certo, no, cambia, un altro numero",
+  prompt: "Ti mando la conferma su WhatsApp a questo numero. Va bene? Se vuoi un operatore, dimmi operatore.",
+  hints: "sì, si, va bene, ok, certo, no, cambia, un altro numero, operatore, umano",
 })}
 ${redirect(action)}
         `);
@@ -672,7 +741,7 @@ ${redirect(action)}
         const no = /\b(no|non va bene|cambia|altro numero)\b/.test(speech);
 
         if (yes && !no) {
-          session.waTo = `whatsapp:${session.fromCaller}`; // fromCaller già +39...
+          session.waTo = `whatsapp:${session.fromCaller}`;
           session.step = 7;
           session.substep = null;
           resetRetries(session);
@@ -688,9 +757,10 @@ ${redirect(action)}
           `);
         } else {
           return failOrRetry({
-            prompt1: "Scusami, ti va bene che invii il WhatsApp a questo numero? Puoi dire sì o no.",
-            prompt2: "Dimmi solo: sì, va bene. Oppure: no, un altro numero.",
+            prompt1: "Scusami, ti va bene che invii il WhatsApp a questo numero? Puoi dire sì o no. Oppure: operatore.",
+            prompt2: "Dimmi solo: sì, va bene. Oppure: no, un altro numero. Oppure: operatore.",
             exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
+            forwardOnFail: true,
           });
         }
       }
@@ -702,6 +772,7 @@ ${redirect(action)}
             prompt1: "Non sono sicuro di aver capito il numero. Me lo ripeti iniziando con più trentanove?",
             prompt2: "Ripetilo lentamente, ad esempio: più trentanove, tre tre tre...",
             exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
+            forwardOnFail: true,
           });
         }
 
@@ -769,6 +840,12 @@ ${redirect(`${BASE_URL}/voice`)}
   } catch (err) {
     console.error("VOICE FLOW ERROR:", err);
     sessions.delete(callSid);
+
+    // Se vuoi: anche sull'errore tecnico puoi inoltrare all'operatore
+    if (canForwardToHuman()) {
+      return res.type("text/xml").status(200).send(twiml(forwardToHumanTwiml("errore_tecnico")));
+    }
+
     return res.type("text/xml").status(200).send(
       twiml(`
 ${say("C'è stato un problema tecnico. Riprova tra poco.")}
@@ -786,4 +863,5 @@ app.listen(PORT, () => {
   console.log(`BASE_URL: ${BASE_URL || "(non impostato)"}`);
   console.log(`Calendar configured: ${Boolean(GOOGLE_SERVICE_ACCOUNT_JSON && GOOGLE_CALENDAR_ID)}`);
   console.log(`Twilio configured: ${Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN)}`);
+  console.log(`Forwarding enabled: ${ENABLE_FORWARDING} | HUMAN_FORWARD_TO: ${HUMAN_FORWARD_TO || "(non impostato)"}`);
 });
