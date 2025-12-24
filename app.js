@@ -785,75 +785,81 @@ ${redirect(action)}
       }
     }
 
-    // STEP 7: crea evento su Calendar + invia WhatsApp
-    if (session.step === 7) {
-      // 1) Google Calendar
-      let calendarResult = null;
-      try {
-        calendarResult = await createBookingEvent({
-          callSid,
-          name: session.name,
-          dateISO: session.dateISO,
-          time24: session.time24,
-          people: session.people,
-          phone: (session.fromCaller || "").startsWith("+") ? session.fromCaller : "",
-          waTo: session.waTo,
-        });
-      } catch (e) {
-        console.error("Google Calendar insert failed:", e);
-      }
+// STEP 7: crea evento su Calendar + invia WhatsApp (SOLO SE CALENDAR OK)
+if (session.step === 7) {
+  // 1) Google Calendar (DEVE andare a buon fine)
+  let calendarResult = null;
 
-      // 2) WhatsApp
-      const waTo = session.waTo;
+  try {
+    calendarResult = await createBookingEvent({
+      callSid,
+      name: session.name,
+      dateISO: session.dateISO,
+      time24: session.time24,
+      people: session.people,
+      phone: (session.fromCaller || "").startsWith("+") ? session.fromCaller : "",
+      waTo: session.waTo,
+    });
+  } catch (e) {
+    console.error("Google Calendar insert failed:", e);
 
-      const waBody = calendarResult
-        ? `✅ Prenotazione registrata\nNome: ${session.name}\nData: ${humanDateIT(session.dateISO)}\nOra: ${session.time24}\nPersone: ${session.people}\n\nSe devi modificare o annullare, rispondi a questo messaggio.`
-        : `✅ Richiesta ricevuta\nNome: ${session.name}\nData: ${humanDateIT(session.dateISO)}\nOra: ${session.time24}\nPersone: ${session.people}\n\nTi confermiamo a breve.`;
-
-      if (!twilioClient) {
-        console.error("Twilio client non configurato: mancano TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
-      } else if (!TWILIO_WHATSAPP_FROM) {
-        console.error("Manca TWILIO_WHATSAPP_FROM (es. whatsapp:+14155238886)");
-      } else if (!waTo || !hasValidWaAddress(waTo)) {
-        console.error("waTo non valido:", waTo);
-      } else {
-        await twilioClient.messages.create({
-          from: TWILIO_WHATSAPP_FROM,
-          to: waTo,
-          body: waBody,
-        });
-      }
-
-      sessions.delete(callSid);
-      return respond(`
-${say("Perfetto! Ho registrato la prenotazione e ti ho inviato un WhatsApp di conferma. A presto da TuttiBrilli!")}
-${hangup()}
-      `);
-    }
-
-    // fallback finale
+    // Se Calendar fallisce: NON inviare WhatsApp, chiudi con messaggio
     sessions.delete(callSid);
     return respond(`
-${say("Ripartiamo da capo.")}
-${redirect(`${BASE_URL}/voice`)}
-    `);
-  } catch (err) {
-    console.error("VOICE FLOW ERROR:", err);
-    sessions.delete(callSid);
-
-    // Se vuoi: anche sull'errore tecnico puoi inoltrare all'operatore
-    if (canForwardToHuman()) {
-      return res.type("text/xml").status(200).send(twiml(forwardToHumanTwiml("errore_tecnico")));
-    }
-
-    return res.type("text/xml").status(200).send(
-      twiml(`
-${say("C'è stato un problema tecnico. Riprova tra poco.")}
+${say("Ho avuto un problema tecnico nel registrare la prenotazione in calendario. Riprova tra poco oppure scrivici su WhatsApp.")}
 ${hangup()}
-      `)
-    );
+    `);
   }
-});
+
+  // Se per qualunque motivo calendarResult è nullo, trattalo come fallimento
+  if (!calendarResult) {
+    console.error("Google Calendar insert failed: calendarResult is null/undefined");
+
+    sessions.delete(callSid);
+    return respond(`
+${say("Non sono riuscito a registrare la prenotazione in calendario. Riprova tra poco oppure scrivici su WhatsApp.")}
+${hangup()}
+    `);
+  }
+
+  // 2) WhatsApp (SOLO DOPO Calendar OK)
+  const waTo = session.waTo;
+
+  const waBody =
+    `✅ Prenotazione confermata\n` +
+    `Nome: ${session.name}\n` +
+    `Data: ${humanDateIT(session.dateISO)}\n` +
+    `Ora: ${session.time24}\n` +
+    `Persone: ${session.people}\n\n` +
+    `Se devi modificare o annullare, rispondi a questo messaggio.`;
+
+  try {
+    if (!twilioClient) {
+      console.error("Twilio client non configurato: mancano TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
+    } else if (!TWILIO_WHATSAPP_FROM) {
+      console.error("Manca TWILIO_WHATSAPP_FROM (es. whatsapp:+1415...)");
+    } else if (!waTo || !hasValidWaAddress(waTo)) {
+      console.error("waTo non valido:", waTo);
+    } else {
+      await twilioClient.messages.create({
+        from: TWILIO_WHATSAPP_FROM,
+        to: waTo,
+        body: waBody,
+      });
+    }
+  } catch (e) {
+    console.error("WhatsApp send failed:", e);
+    // Nota: qui NON blocchiamo la prenotazione, perché è già su Calendar.
+  }
+
+  // Fine flusso
+  sessions.delete(callSid);
+  return respond(`
+${say("Perfetto! Ho registrato la prenotazione e ti ho inviato un WhatsApp di conferma. A presto da TuttiBrilli!")}
+${hangup()}
+  `);
+}
+
 
 // --------------------
 // START SERVER
