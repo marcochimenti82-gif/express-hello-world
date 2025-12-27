@@ -16,7 +16,7 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || ""; // es: whatsapp:+14155238886 (sandbox) oppure whatsapp:+<sender approvato>
 
 // (OPZIONALE ma consigliato) per evitare problemi di JSON spezzato nelle ENV
-// Metti qui il JSON del service account in Base64, se vuoi
+// Metti qui il JSON del service account in Base64
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
 
@@ -24,27 +24,32 @@ const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || ""; // es: ...@grou
 const DEFAULT_EVENT_DURATION_MINUTES = parseInt(process.env.DEFAULT_EVENT_DURATION_MINUTES || "120", 10);
 
 // Inoltro chiamata a operatore (opzionale)
-const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "true").toLowerCase() === "true";
-const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || ""; // es: +393425169640
-const LOW_CONFIDENCE_THRESHOLD = parseFloat(process.env.LOW_CONFIDENCE_THRESHOLD || "0.45");
+const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "false").toLowerCase() === "true";
+const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || ""; // es: +39333...
 
-// Twilio client
-let twilioClient = null;
-if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
-  const twilio = require("twilio");
-  twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-}
+// OpenAI key presente nel tuo progetto ma qui non è usata direttamente
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
-// Google Calendar client (Service Account)
+// Lib
+const twilio = require("twilio");
 const { google } = require("googleapis");
 
+// Clients
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
+
+// --------------------
+// Google Calendar helpers
+// --------------------
 function getServiceAccountJsonRaw() {
   // preferisci B64 se presente
   if (GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
     try {
       return Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
     } catch (e) {
-      console.error("GOOGLE_SERVICE_ACCOUNT_JSON_B64 decode failed:", e);
+      console.error("GOOGLE_SERVICE_ACCOUNT_JSON_B64 decode failed:", e?.message || e);
       return "";
     }
   }
@@ -52,12 +57,32 @@ function getServiceAccountJsonRaw() {
 }
 
 function getCalendarClient() {
-  if (!GOOGLE_CALENDAR_ID) return null;
+  if (!GOOGLE_CALENDAR_ID) {
+    console.error("[CALENDAR] Missing GOOGLE_CALENDAR_ID");
+    return null;
+  }
 
   const raw = getServiceAccountJsonRaw();
-  if (!raw) return null;
+  if (!raw) {
+    console.error(
+      "[CALENDAR] Missing service account JSON (GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64)"
+    );
+    return null;
+  }
 
-  const creds = JSON.parse(raw);
+  let creds;
+  try {
+    creds = JSON.parse(raw);
+  } catch (e) {
+    console.error("[CALENDAR] Service account JSON parse failed:", e?.message || e);
+    console.error("[CALENDAR] raw length:", raw.length);
+    return null;
+  }
+
+  if (!creds?.client_email || !creds?.private_key) {
+    console.error("[CALENDAR] Invalid service account JSON: missing client_email/private_key");
+    return null;
+  }
 
   const auth = new google.auth.JWT({
     email: creds.client_email,
@@ -88,7 +113,7 @@ function xmlEscape(s) {
 }
 
 function twiml(xmlInsideResponseTag) {
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n${xmlInsideResponseTag}\n</Response>`;
+  return `<?xml version="1.0" encoding="UTF-8"?><Response>${xmlInsideResponseTag}</Response>`;
 }
 
 function say(text) {
@@ -118,45 +143,14 @@ function gatherSpeech({
   hints = "",
 }) {
   const safeAction = xmlEscape(action);
-  const safeHints = hints ? ` hints="${xmlEscape(hints)}"` : "";
+  const safePrompt = xmlEscape(prompt || "");
+  const safeHints = xmlEscape(hints || "");
+
   return `
-<Gather action="${safeAction}" method="${method}"
-        input="speech"
-        language="${language}"
-        timeout="${timeout}"
-        speechTimeout="${speechTimeout}"${safeHints}>
-  ${say(prompt)}
-</Gather>`;
-}
-
-// Dial / forwarding
-function dialNumber(numberE164, { timeout = 25 } = {}) {
-  return `<Dial timeout="${Number(timeout)}">${xmlEscape(numberE164)}</Dial>`;
-}
-
-function wantsHuman(text) {
-  const t = String(text || "").toLowerCase();
-  return /\b(operatore|umano|persona|collega|assistenza|parlare con qualcuno)\b/.test(t);
-}
-
-function canForwardToHuman() {
-  return ENABLE_FORWARDING && /^\+\d{8,15}$/.test(HUMAN_FORWARD_TO || "");
-}
-
-function forwardToHumanTwiml() {
-  if (!canForwardToHuman()) {
-    return `
-${say("Va bene. Al momento non riesco a trasferire la chiamata. Ti invito a scriverci su WhatsApp. A presto!")}
-${hangup()}
-    `;
-  }
-  return `
-${say("Perfetto, ti passo subito un operatore.")}
-${pause(1)}
-${dialNumber(HUMAN_FORWARD_TO, { timeout: 25 })}
-${say("Non sono riuscito a metterti in contatto. Se vuoi, scrivici su WhatsApp. A presto!")}
-${hangup()}
-  `;
+<Gather input="speech" action="${safeAction}" method="${method}" timeout="${timeout}" speechTimeout="${speechTimeout}" language="${language}" hints="${safeHints}">
+  <Say language="it-IT" voice="alice">${safePrompt}</Say>
+</Gather>
+`;
 }
 
 // --------------------
@@ -174,55 +168,43 @@ ${hangup()}
  *  time24: "HH:MM"|null,
  *  people: number|null,
  *  waTo: "whatsapp:+39..."|null,
- *  fromCaller: "+39..."|null
+ *  phone: string|null,
  * }
  */
-const sessions = new Map(); // key: CallSid
+const sessions = new Map();
 
 function getSession(callSid) {
-  const s = sessions.get(callSid);
-  if (s) return s;
-  const fresh = {
-    step: 1,
-    substep: null,
-    retries: 0,
-    intent: null,
-    name: null,
-    dateISO: null,
-    time24: null,
-    people: null,
-    waTo: null,
-    fromCaller: null,
-  };
-  sessions.set(callSid, fresh);
-  return fresh;
+  if (!sessions.has(callSid)) {
+    sessions.set(callSid, {
+      step: 1,
+      substep: null,
+      retries: 0,
+      intent: null,
+      name: null,
+      dateISO: null,
+      time24: null,
+      people: null,
+      waTo: null,
+      phone: null,
+    });
+  }
+  return sessions.get(callSid);
 }
 
 function resetRetries(session) {
   session.retries = 0;
 }
 
-function incRetry(session) {
+function incRetries(session) {
   session.retries = (session.retries || 0) + 1;
   return session.retries;
 }
 
-// --------------------
-// Parsing pragmatico (MVP)
-// --------------------
-function normalizeText(t) {
-  return String(t || "")
+function normalizeText(s) {
+  return String(s || "")
     .trim()
     .toLowerCase()
     .replace(/\s+/g, " ");
-}
-
-function looksLikeBooking(text) {
-  return /prenot|tavol|posti|riserv/.test(text);
-}
-
-function looksLikeInfo(text) {
-  return /info|orari|indirizz|dove|menu|menù|carta|vini|evento|serata/.test(text);
 }
 
 function nowLocal() {
@@ -237,88 +219,47 @@ function toISODate(d) {
 }
 
 function parseDateIT_MVP(speech) {
+  // MVP: accetta "oggi", "domani" o "YYYY-MM-DD" o "27 dicembre" etc.
   const t = normalizeText(speech);
-  if (!t) return null;
 
-  const now = nowLocal();
-
-  if (/\b(oggi|stasera)\b/.test(t)) return toISODate(now);
-  if (/\bdomani\b/.test(t)) {
-    const d = new Date(now.getTime());
-    d.setDate(d.getDate() + 1);
+  const today = nowLocal();
+  if (t.includes("oggi")) return toISODate(today);
+  if (t.includes("domani")) {
+    const d = new Date(today.getTime() + 24 * 60 * 60 * 1000);
     return toISODate(d);
   }
 
-  // formati tipo 25/12/2025 o 25-12-2025
-  let m = t.match(/\b(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?\b/);
-  if (m) {
-    let dd = parseInt(m[1], 10);
-    let mm = parseInt(m[2], 10);
-    let yy = m[3] ? parseInt(m[3], 10) : now.getFullYear();
-    if (yy < 100) yy = 2000 + yy;
+  // match YYYY-MM-DD
+  const iso = t.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
 
-    if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
-      const d = new Date(yy, mm - 1, dd);
-      if (d.getFullYear() === yy && d.getMonth() === mm - 1 && d.getDate() === dd) return toISODate(d);
-    }
-    return null;
-  }
-
-  // "2512" o "25 12"
-  const digits = t.replace(/[^\d]/g, "");
-  if (digits.length === 4) {
-    const dd = parseInt(digits.slice(0, 2), 10);
-    const mm = parseInt(digits.slice(2, 4), 10);
-    const yy = now.getFullYear();
-    if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
-      const d = new Date(yy, mm - 1, dd);
-      if (d.getMonth() === mm - 1 && d.getDate() === dd) return toISODate(d);
-    }
+  // match dd/mm/yyyy
+  const dmY = t.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+  if (dmY) {
+    const dd = String(dmY[1]).padStart(2, "0");
+    const mm = String(dmY[2]).padStart(2, "0");
+    const yyyy = dmY[3];
+    return `${yyyy}-${mm}-${dd}`;
   }
 
   return null;
 }
 
 function parseTimeIT_MVP(speech) {
+  // MVP: accetta "20 30", "20:30", "alle 8 e mezza"
   const t = normalizeText(speech);
-  if (!t) return null;
 
-  // 20:30
-  let m = t.match(/\b(\d{1,2})[:\.](\d{2})\b/);
-  if (m) {
-    const hh = parseInt(m[1], 10);
-    const mm = parseInt(m[2], 10);
-    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
-      return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
-    }
-    return null;
+  const hm = t.match(/(\d{1,2})[:\s](\d{2})/);
+  if (hm) {
+    const hh = String(hm[1]).padStart(2, "0");
+    const mm = String(hm[2]).padStart(2, "0");
+    return `${hh}:${mm}`;
   }
 
-  // "20 e 30" / "20 30"
-  m = t.match(/\b(\d{1,2})\s*(?:e)?\s*(\d{1,2})\b/);
-  if (m) {
-    const hh = parseInt(m[1], 10);
-    const mm = parseInt(m[2], 10);
-    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
-      return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
-    }
-  }
-
-  // digits "2030"
-  const digits = t.replace(/[^\d]/g, "");
-  if (digits.length === 4) {
-    const hh = parseInt(digits.slice(0, 2), 10);
-    const mm = parseInt(digits.slice(2, 4), 10);
-    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
-      return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
-    }
-  }
-
-  // "alle 20" -> 20:00
-  m = t.match(/\b(\d{1,2})\b/);
-  if (m) {
-    const hh = parseInt(m[1], 10);
-    if (hh >= 0 && hh <= 23) return `${String(hh).padStart(2, "0")}:00`;
+  const onlyH = t.match(/\b(\d{1,2})\b/);
+  if (onlyH) {
+    const hh = String(onlyH[1]).padStart(2, "0");
+    return `${hh}:00`;
   }
 
   return null;
@@ -326,71 +267,39 @@ function parseTimeIT_MVP(speech) {
 
 function parsePeopleIT_MVP(speech) {
   const t = normalizeText(speech);
-  if (!t) return null;
-
   const m = t.match(/\b(\d{1,2})\b/);
-  if (m) {
-    const n = parseInt(m[1], 10);
-    if (n >= 1 && n <= 20) return n;
-  }
-
-  const map = {
-    uno: 1, una: 1,
-    due: 2,
-    tre: 3,
-    quattro: 4,
-    cinque: 5,
-    sei: 6,
-    sette: 7,
-    otto: 8,
-    nove: 9,
-    dieci: 10,
-  };
-  for (const [k, v] of Object.entries(map)) {
-    if (new RegExp(`\\b${k}\\b`).test(t)) return v;
-  }
-
-  return null;
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
 }
 
-function humanDateIT(iso) {
-  if (!iso) return "";
-  const [y, m, d] = iso.split("-");
-  return `${d}/${m}/${y}`;
+function hasValidWaAddress(s) {
+  return /^whatsapp:\+\d{8,15}$/.test(String(s || "").trim());
 }
 
-function normalizeWhatsappFromVoice(speechOrDigits) {
-  const raw = String(speechOrDigits || "").replace(/[^\d]/g, "");
-  if (!raw) return "";
-  if (raw.startsWith("39")) return `whatsapp:+${raw}`;
-  if (raw.startsWith("3")) return `whatsapp:+39${raw}`;
-  return `whatsapp:+${raw}`;
+function isValidPhoneE164(s) {
+  return /^\+\d{8,15}$/.test(String(s || "").trim());
 }
 
-function isLikelyItalianMobileE164(e164) {
-  return /^\+39\d{9,12}$/.test(e164 || "");
-}
-
-function hasValidWaAddress(wa) {
-  return /^whatsapp:\+\d{8,15}$/.test(wa || "");
-}
-
-// --------------------
-// Google Calendar: crea evento prenotazione (con idempotenza su CallSid)
-// --------------------
 function addMinutes(date, minutes) {
   return new Date(date.getTime() + minutes * 60 * 1000);
 }
 
-function toLocalDateTimeParts(date) {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  const hh = String(date.getHours()).padStart(2, "0");
-  const mm = String(date.getMinutes()).padStart(2, "0");
-  return { date: `${y}-${m}-${d}`, time: `${hh}:${mm}` };
+function canForwardToHuman() {
+  return ENABLE_FORWARDING && Boolean(HUMAN_FORWARD_TO) && isValidPhoneE164(HUMAN_FORWARD_TO);
 }
 
+function forwardToHumanTwiml() {
+  return `
+  ${say("Ti metto in contatto con un operatore.")}
+  <Dial>${xmlEscape(HUMAN_FORWARD_TO)}</Dial>
+  `;
+}
+
+// --------------------
+// Google Calendar booking
+// --------------------
 async function createBookingEvent({
   callSid,
   name,
@@ -399,52 +308,65 @@ async function createBookingEvent({
   people,
   phone,
   waTo,
-}) {
-    // ============================
-  // NORMALIZZAZIONE INPUT + GUARDRAILS (ANTI 400)
-  // ============================
-  // Il debug endpoint a volte passa nomi diversi (partySize/timeHHMM).
-  // Qui li normalizziamo in "people" e "time24" per evitare undefined.
-  if (people == null && typeof partySize !== "undefined") people = partySize;
-  if (!time24 && typeof timeHHMM !== "undefined") time24 = timeHHMM;
 
-  // Validazioni minime (fallisci presto con errore chiaro)
+  // accettiamo anche i nomi del debug endpoint
+  timeHHMM,
+  partySize,
+  notes, // opzionale
+}) {
+  // ============================
+  // NORMALIZZAZIONE INPUT + GUARDRAILS
+  // ============================
+  if (people == null && partySize != null) people = partySize;
+  if (!time24 && timeHHMM) time24 = timeHHMM;
+
   if (!name) throw new Error("createBookingEvent: name mancante");
   if (!dateISO || !/^\d{4}-\d{2}-\d{2}$/.test(dateISO)) {
     throw new Error(`createBookingEvent: dateISO non valido: ${dateISO}`);
   }
   if (!time24 || !/^\d{2}:\d{2}$/.test(time24)) {
     throw new Error(`createBookingEvent: time24 non valido: ${time24}`);
-   // ============================
-  // FINE NORMALIZZAZIONE INPUT
-  // ============================
+  }
+
+  const peopleNum = Number(people);
+  if (!Number.isFinite(peopleNum) || peopleNum <= 0) {
+    throw new Error(`createBookingEvent: people non valido: ${people}`);
+  }
+
   const calendar = getCalendarClient();
-  if (!calendar) throw new Error("Google Calendar non configurato (manca JSON/JSON_B64 o CALENDAR_ID).");
+  if (!calendar) {
+    throw new Error("Google Calendar non configurato (manca JSON/JSON_B64 o CALENDAR_ID).");
+  }
 
-  const privateKey = `callsid:${callSid}`;
+  const privateKey = `callsid:${callSid || "no-callsid"}`;
 
-  // Idempotenza: cerca se esiste già un evento con callsid:<CallSid> nella description
+  // ============================
+  // IDEMPOTENZA: evita doppioni su retry Twilio
+  // ============================
   const existing = await calendar.events.list({
     calendarId: GOOGLE_CALENDAR_ID,
     q: privateKey,
     timeMin: `${dateISO}T00:00:00Z`,
     timeMax: `${dateISO}T23:59:59Z`,
     singleEvents: true,
-    maxResults: 5,
+    maxResults: 10,
   });
 
-  const found = (existing.data.items || []).find((ev) => (ev.description || "").includes(privateKey));
+  const found = (existing.data.items || []).find((ev) =>
+    String(ev.description || "").includes(privateKey)
+  );
+
   if (found) {
     return { eventId: found.id, htmlLink: found.htmlLink, reused: true };
   }
 
-    // ============================
+  // ============================
   // START/END RFC3339 ROBUSTI (anti 400)
   // ============================
   const tz = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
 
-  // Costruisci Date in modo sicuro e poi usa toISOString (RFC3339 valido)
-  const start = new Date(`${dateISO}T${time24}:00`);
+  // NOTA: aggiungiamo "Z" per evitare ambiguità timezone sul server (Render)
+  const start = new Date(`${dateISO}T${time24}:00Z`);
   if (Number.isNaN(start.getTime())) {
     throw new Error(`createBookingEvent: start invalido: ${dateISO} ${time24}`);
   }
@@ -454,7 +376,6 @@ async function createBookingEvent({
     throw new Error(`createBookingEvent: end invalido da start: ${start.toISOString()}`);
   }
 
-  const peopleNum = Number(people);
   const requestBody = {
     summary: `TuttiBrilli - ${name} - ${peopleNum} pax`,
     description: [
@@ -463,227 +384,103 @@ async function createBookingEvent({
       `Persone: ${peopleNum}`,
       `Telefono: ${phone || "-"}`,
       `WhatsApp: ${waTo || "-"}`,
-      `callSid:${callSid || "-"}`,
-    ].join("\n"),
+      notes ? `Note: ${notes}` : null,
+      privateKey,
+    ]
+      .filter(Boolean)
+      .join("\n"),
     start: { dateTime: start.toISOString(), timeZone: tz },
     end: { dateTime: end.toISOString(), timeZone: tz },
   };
 
   console.log("[CALENDAR] requestBody:", JSON.stringify(requestBody, null, 2));
-  // ============================
-  // FINE START/END ROBUSTI
-  // ============================
-  };
 
-  const resp = await calendar.events.insert({
-    calendarId: GOOGLE_CALENDAR_ID,
-    requestBody,
-  });
+  try {
+    const resp = await calendar.events.insert({
+      calendarId: GOOGLE_CALENDAR_ID,
+      requestBody,
+    });
 
-  return { eventId: resp.data.id, htmlLink: resp.data.htmlLink, reused: false };
+    return { eventId: resp.data.id, htmlLink: resp.data.htmlLink, reused: false };
+  } catch (err) {
+    console.error("[CALENDAR] insert failed", {
+      status: err?.code || err?.response?.status,
+      message: err?.message,
+      data: err?.response?.data,
+    });
+    throw err;
+  }
 }
 
 // --------------------
-// TWILIO VOICE - START
+// Twilio Voice - START
 // --------------------
-app.post("/voice", (req, res) => {
-  const callSid = req.body.CallSid || `local-${Date.now()}`;
-  const from = req.body.From || ""; // caller id (può essere forwarder)
-  const session = getSession(callSid);
-
-  session.step = 1;
-  session.substep = null;
-  session.retries = 0;
-  session.intent = null;
-  session.name = null;
-  session.dateISO = null;
-  session.time24 = null;
-  session.people = null;
-  session.waTo = null;
-  session.fromCaller = from;
-  sessions.set(callSid, session);
-
-  const action = `${BASE_URL}/voice/step`;
-
-  const body = twiml(`
-${say("Ciao! Hai chiamato TuttiBrilli Enoteca.")}
-${pause(1)}
-${gatherSpeech({
-  action,
-  prompt: "Vuoi prenotare un tavolo, oppure ti servono informazioni? Se vuoi un operatore, dimmi: operatore.",
-  hints: "prenotare, prenotazione, tavolo, posti, informazioni, orari, indirizzo, operatore, umano",
-})}
-${say("Scusami, non ti ho sentito. Riproviamo.")}
-${redirect(`${BASE_URL}/voice`)}
-  `);
-
-  res.type("text/xml").status(200).send(body);
-});
-
-// STEP HANDLER
-app.post("/voice/step", async (req, res) => {
-  const callSid = req.body.CallSid || `local-${Date.now()}`;
-  const session = getSession(callSid);
-
-  const speechRaw = (req.body.SpeechResult || "").trim();
-  const speech = normalizeText(speechRaw);
-  const confidence = parseFloat(req.body.Confidence || "0");
-
-  const action = `${BASE_URL}/voice/step`;
-
-  function respond(xml) {
-    return res.type("text/xml").status(200).send(twiml(xml));
-  }
-
-  function failOrRetry({ prompt1, prompt2, exitPrompt, forwardOnFail = true }) {
-    const n = incRetry(session);
-
-    if (n === 1) {
-      sessions.set(callSid, session);
-      return respond(`
-${gatherSpeech({ action, prompt: prompt1 })}
-${redirect(action)}
-      `);
-    }
-    if (n === 2) {
-      sessions.set(callSid, session);
-      return respond(`
-${gatherSpeech({ action, prompt: prompt2 })}
-${redirect(action)}
-      `);
-    }
-
-    sessions.set(callSid, session);
-
-    if (forwardOnFail && canForwardToHuman()) {
-      sessions.delete(callSid);
-      return respond(forwardToHumanTwiml());
-    }
-
-    sessions.delete(callSid);
-    return respond(`
-${say(exitPrompt)}
-${hangup()}
-    `);
-  }
+app.post("/voice", async (req, res) => {
+  const respond = (xml) => res.type("text/xml").status(200).send(twiml(xml));
 
   try {
-    // Inoltro a umano se richiesto
-    if (speech && wantsHuman(speech)) {
-      sessions.delete(callSid);
-      return respond(forwardToHumanTwiml());
+    const callSid = req.body.CallSid || `local-${Date.now()}`;
+    const from = req.body.From || ""; // caller id (può essere forwarder)
+
+    const session = getSession(callSid);
+
+    // Twilio speech input
+    const speech = req.body.SpeechResult || "";
+    const step = session.step || 1;
+
+    // STEP 1: greeting + ask name
+    if (step === 1) {
+      session.step = 2;
+      sessions.set(callSid, session);
+
+      return respond(`
+${say("Ciao! Sono l'assistente di TuttiBrilli Enoteca. Per prenotare, dimmi il tuo nome e cognome.")}
+${gatherSpeech({ action: `${BASE_URL}/voice`, prompt: "Dimmi nome e cognome." })}
+${say("Non ho sentito nulla. Riprova.")}
+${redirect(`${BASE_URL}/voice`)}
+`);
     }
 
-    const lowConfidence =
-      Number.isFinite(confidence) && confidence > 0 && confidence < LOW_CONFIDENCE_THRESHOLD;
-
-    // Se bassa confidenza e già in retry, possiamo inoltrare
-    if (lowConfidence && session.retries >= 1 && canForwardToHuman()) {
-      sessions.delete(callSid);
-      return respond(forwardToHumanTwiml());
-    }
-
-    // No input / no speech
-    if (!speech) {
-      if (session.step === 1) {
-        return failOrRetry({
-          prompt1: "Dimmi pure: vuoi prenotare o informazioni? Oppure di' operatore.",
-          prompt2: "Puoi dire, per esempio: 'voglio prenotare un tavolo'. Oppure: 'operatore'.",
-          exitPrompt: "Non riesco a sentirti bene. Se vuoi, scrivici su WhatsApp. A presto!",
-        });
-      }
-      if (session.step === 2) {
-        return failOrRetry({
-          prompt1: "Come ti chiami?",
-          prompt2: "Dimmi il tuo nome, ad esempio: 'Mario Rossi'.",
-          exitPrompt: "Ok. Se vuoi, scrivici su WhatsApp. A presto!",
-        });
-      }
-      if (session.step === 3) {
-        return failOrRetry({
-          prompt1: "Per che giorno vuoi prenotare?",
-          prompt2: "Puoi dire 'domani' oppure '25 12'.",
-          exitPrompt: "Non riesco a prendere la data. Scrivici su WhatsApp e ti aiutiamo subito. A presto!",
-        });
-      }
-      if (session.step === 4) {
-        return failOrRetry({
-          prompt1: "A che ora preferisci?",
-          prompt2: "Puoi dire '20 e 30' oppure '21'.",
-          exitPrompt: "Non riesco a prendere l'orario. Scrivici su WhatsApp e ti aiutiamo subito. A presto!",
-        });
-      }
-      if (session.step === 5) {
-        return failOrRetry({
-          prompt1: "Per quante persone?",
-          prompt2: "Dimmi un numero, ad esempio 'quattro'.",
-          exitPrompt: "Ok. Scrivici su WhatsApp con numero persone e orario. A presto!",
-        });
-      }
-      if (session.step === 6) {
-        return failOrRetry({
-          prompt1: "A che numero WhatsApp vuoi ricevere la conferma? Dimmi il numero iniziando con più trentanove.",
-          prompt2: "Ripetilo lentamente, ad esempio: più trentanove, tre tre tre...",
-          exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
-        });
-      }
-    }
-
-    // STEP 1: Intento
-    if (session.step === 1) {
-      if (looksLikeBooking(speech)) {
-        session.intent = "booking";
-        session.step = 2;
-        resetRetries(session);
+    // STEP 2: collect name
+    if (step === 2) {
+      if (!speech) {
+        incRetries(session);
+        if (session.retries >= 2) {
+          sessions.delete(callSid);
+          return respond(`${say("Non riesco a sentirti bene. Riprova più tardi.")}${hangup()}`);
+        }
         sessions.set(callSid, session);
-
         return respond(`
-${say("Perfetto. Ti faccio qualche domanda veloce.")}
-${pause(1)}
-${gatherSpeech({ action, prompt: "Come ti chiami?" })}
-${redirect(action)}
-        `);
+${say("Non ho capito. Dimmi nome e cognome.")}
+${gatherSpeech({ action: `${BASE_URL}/voice`, prompt: "Dimmi nome e cognome." })}
+`);
       }
 
-      if (looksLikeInfo(speech)) {
-        sessions.delete(callSid);
-        return respond(`
-${say("Certo. Per informazioni rapide puoi scriverci su WhatsApp. Se invece vuoi prenotare, dimmelo e ti aiuto subito.")}
-${hangup()}
-        `);
-      }
-
-      return failOrRetry({
-        prompt1: "Scusami, vuoi prenotare un tavolo o informazioni? Oppure di' operatore.",
-        prompt2: "Puoi dire: 'prenotare un tavolo' oppure 'informazioni'. Oppure: 'operatore'.",
-        exitPrompt: "Va bene. Scrivici su WhatsApp e ti rispondiamo appena possibile. A presto!",
-      });
-    }
-
-    // STEP 2: Nome
-    if (session.step === 2) {
-      session.name = speechRaw || "(nome da confermare)";
+      session.name = speech.trim();
       session.step = 3;
       resetRetries(session);
       sessions.set(callSid, session);
 
       return respond(`
-${say(`Piacere, ${session.name}.`)}
-${pause(1)}
-${gatherSpeech({ action, prompt: "Per che giorno vuoi prenotare?" })}
-${redirect(action)}
-      `);
+${say(`Perfetto ${session.name}. Per quale giorno vuoi prenotare? Puoi dire oggi, domani, oppure una data.`)}
+${gatherSpeech({ action: `${BASE_URL}/voice`, prompt: "Dimmi la data della prenotazione." })}
+`);
     }
 
-    // STEP 3: Data
-    if (session.step === 3) {
+    // STEP 3: date
+    if (step === 3) {
       const dateISO = parseDateIT_MVP(speech);
       if (!dateISO) {
-        return failOrRetry({
-          prompt1: "Non sono sicuro di aver capito la data. Per che giorno vuoi prenotare?",
-          prompt2: "Puoi dire 'domani' oppure '25 12'.",
-          exitPrompt: "Ok. Scrivici su WhatsApp con giorno e ora e ti confermiamo. A presto!",
-        });
+        incRetries(session);
+        if (session.retries >= 2) {
+          sessions.delete(callSid);
+          return respond(`${say("Non sono riuscito a capire la data. Riprova più tardi.")}${hangup()}`);
+        }
+        sessions.set(callSid, session);
+        return respond(`
+${say("Non ho capito la data. Puoi dire per esempio: domani, oppure 27 12 2025.")}
+${gatherSpeech({ action: `${BASE_URL}/voice`, prompt: "Dimmi la data." })}
+`);
       }
 
       session.dateISO = dateISO;
@@ -692,22 +489,25 @@ ${redirect(action)}
       sessions.set(callSid, session);
 
       return respond(`
-${say(`Ok, ${humanDateIT(session.dateISO)}.`)}
-${pause(1)}
-${gatherSpeech({ action, prompt: "A che ora preferisci?" })}
-${redirect(action)}
-      `);
+${say("A che ora? Dimmi un orario, per esempio venti e trenta.")}
+${gatherSpeech({ action: `${BASE_URL}/voice`, prompt: "Dimmi l'orario." })}
+`);
     }
 
-    // STEP 4: Orario
-    if (session.step === 4) {
+    // STEP 4: time
+    if (step === 4) {
       const time24 = parseTimeIT_MVP(speech);
       if (!time24) {
-        return failOrRetry({
-          prompt1: "Non sono sicuro di aver capito l'orario. A che ora preferisci?",
-          prompt2: "Puoi dire '20 e 30' oppure '21'.",
-          exitPrompt: "Ok. Scrivici su WhatsApp con giorno e ora e ti confermiamo. A presto!",
-        });
+        incRetries(session);
+        if (session.retries >= 2) {
+          sessions.delete(callSid);
+          return respond(`${say("Non sono riuscito a capire l'orario. Riprova più tardi.")}${hangup()}`);
+        }
+        sessions.set(callSid, session);
+        return respond(`
+${say("Non ho capito l'orario. Puoi dire per esempio: venti e trenta.")}
+${gatherSpeech({ action: `${BASE_URL}/voice`, prompt: "Dimmi l'orario." })}
+`);
       }
 
       session.time24 = time24;
@@ -716,113 +516,71 @@ ${redirect(action)}
       sessions.set(callSid, session);
 
       return respond(`
-${say(`Perfetto, alle ${session.time24}.`)}
-${pause(1)}
-${gatherSpeech({ action, prompt: "Per quante persone?" })}
-${redirect(action)}
-      `);
+${say("Per quante persone?")}
+${gatherSpeech({ action: `${BASE_URL}/voice`, prompt: "Dimmi il numero di persone." })}
+`);
     }
 
-    // STEP 5: Persone
-    if (session.step === 5) {
-      const people = parsePeopleIT_MVP(speech);
-      if (!people) {
-        return failOrRetry({
-          prompt1: "Quante persone sarete?",
-          prompt2: "Dimmi un numero, ad esempio 'quattro'.",
-          exitPrompt: "Ok. Scrivici su WhatsApp con numero persone e orario. A presto!",
-        });
+    // STEP 5: people
+    if (step === 5) {
+      const ppl = parsePeopleIT_MVP(speech);
+      if (!ppl) {
+        incRetries(session);
+        if (session.retries >= 2) {
+          sessions.delete(callSid);
+          return respond(`${say("Non sono riuscito a capire il numero di persone. Riprova più tardi.")}${hangup()}`);
+        }
+        sessions.set(callSid, session);
+        return respond(`
+${say("Non ho capito. Dimmi il numero di persone, per esempio due o quattro.")}
+${gatherSpeech({ action: `${BASE_URL}/voice`, prompt: "Dimmi il numero di persone." })}
+`);
       }
 
-      session.people = people;
+      session.people = ppl;
       session.step = 6;
-      session.substep = null;
       resetRetries(session);
       sessions.set(callSid, session);
 
-      const from = String(session.fromCaller || "");
-      const fromE164 = from.startsWith("+") ? from : "";
-      const canUseCaller = isLikelyItalianMobileE164(fromE164);
+      return respond(`
+${say("Perfetto. Dimmi il tuo numero di telefono, così possiamo confermare su WhatsApp.")}
+${gatherSpeech({ action: `${BASE_URL}/voice`, prompt: "Dimmi il numero di telefono." })}
+`);
+    }
 
-      if (canUseCaller) {
-        session.substep = "wa_confirm_caller";
-        sessions.set(callSid, session);
-
-        return respond(`
-${say(`Perfetto. Ricapitolo: ${humanDateIT(session.dateISO)} alle ${session.time24}, per ${session.people} persone.`)}
-${pause(1)}
-${gatherSpeech({
-  action,
-  prompt: "Ti mando la conferma su WhatsApp a questo numero. Va bene? Se vuoi un operatore, dimmi operatore.",
-  hints: "sì, si, va bene, ok, certo, no, cambia, un altro numero, operatore, umano",
-})}
-${redirect(action)}
-        `);
+    // STEP 6: phone / whatsapp
+    if (step === 6) {
+      // MVP: estrai un numero tipo +39...
+      let phone = String(speech || "").replace(/[^\d+]/g, "");
+      if (phone && !phone.startsWith("+")) {
+        // se l'utente dice 331..., aggiungi +39 (italia)
+        if (phone.length >= 9 && phone.length <= 11) phone = `+39${phone}`;
       }
 
-      session.substep = "wa_ask_number";
+      if (!isValidPhoneE164(phone)) {
+        incRetries(session);
+        if (session.retries >= 2) {
+          sessions.delete(callSid);
+          return respond(`${say("Non sono riuscito a capire il numero. Riprova più tardi.")}${hangup()}`);
+        }
+        sessions.set(callSid, session);
+        return respond(`
+${say("Non ho capito il numero. Puoi dirlo lentamente, oppure includere il prefisso, per esempio più trentanove...")}
+${gatherSpeech({ action: `${BASE_URL}/voice`, prompt: "Dimmi il numero di telefono." })}
+`);
+      }
+
+      session.phone = phone;
+      session.waTo = `whatsapp:${phone}`;
+      session.step = 7;
+      resetRetries(session);
       sessions.set(callSid, session);
 
       return respond(`
-${say(`Perfetto. Ricapitolo: ${humanDateIT(session.dateISO)} alle ${session.time24}, per ${session.people} persone.`)}
+${say("Perfetto. Sto registrando la prenotazione.")}
 ${pause(1)}
-${gatherSpeech({
-  action,
-  prompt: "A che numero WhatsApp vuoi ricevere la conferma? Dimmi il numero iniziando con più trentanove.",
-})}
-${redirect(action)}
-      `);
-    }
-
-    // STEP 6: WhatsApp (consenso o numero)
-    if (session.step === 6) {
-      const sub = session.substep || "wa_ask_number";
-
-      if (sub === "wa_confirm_caller") {
-        const yes = /\b(si|sì|ok|va bene|certo|confermo)\b/.test(speech);
-        const no = /\b(no|non va bene|cambia|altro numero)\b/.test(speech);
-
-        if (yes && !no) {
-          session.waTo = `whatsapp:${session.fromCaller}`;
-          session.step = 7;
-          session.substep = null;
-          resetRetries(session);
-          sessions.set(callSid, session);
-          // continua a STEP 7 sotto
-        } else if (no && !yes) {
-          session.substep = "wa_ask_number";
-          resetRetries(session);
-          sessions.set(callSid, session);
-          return respond(`
-${gatherSpeech({ action, prompt: "Ok. Dimmi il numero WhatsApp, iniziando con più trentanove." })}
-${redirect(action)}
-          `);
-        } else {
-          return failOrRetry({
-            prompt1: "Scusami, ti va bene che invii il WhatsApp a questo numero? Puoi dire sì o no. Oppure: operatore.",
-            prompt2: "Dimmi solo: sì, va bene. Oppure: no, un altro numero. Oppure: operatore.",
-            exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
-          });
-        }
-      }
-
-      if (sub === "wa_ask_number") {
-        const waTo = normalizeWhatsappFromVoice(speechRaw || speech);
-        if (!waTo || !hasValidWaAddress(waTo)) {
-          return failOrRetry({
-            prompt1: "Non sono sicuro di aver capito il numero. Me lo ripeti iniziando con più trentanove?",
-            prompt2: "Ripetilo lentamente, ad esempio: più trentanove, tre tre tre...",
-            exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
-          });
-        }
-
-        session.waTo = waTo;
-        session.step = 7;
-        session.substep = null;
-        resetRetries(session);
-        sessions.set(callSid, session);
-        // continua a STEP 7 sotto
-      }
+${redirect(`${BASE_URL}/voice`)}
+`);
     }
 
     // STEP 7: crea evento su Calendar + invia WhatsApp (SOLO SE CALENDAR OK)
@@ -837,18 +595,15 @@ ${redirect(action)}
           dateISO: session.dateISO,
           time24: session.time24,
           people: session.people,
-          phone: (session.fromCaller || "").startsWith("+") ? session.fromCaller : "",
+          phone: session.phone,
           waTo: session.waTo,
         });
-
-        // Log utile per debug
-        console.log("CALENDAR OK:", {
-          reused: calendarResult.reused,
-          eventId: calendarResult.eventId,
-          htmlLink: calendarResult.htmlLink,
-        });
       } catch (e) {
-        console.error("Google Calendar insert failed:", e);
+        console.error("[VOICE] createBookingEvent failed:", {
+          message: e?.message,
+          status: e?.code || e?.response?.status,
+          data: e?.response?.data,
+        });
 
         sessions.delete(callSid);
         return respond(`
@@ -868,20 +623,14 @@ ${hangup()}
       }
 
       // 2) WhatsApp (SOLO DOPO Calendar OK)
-      const waTo = session.waTo;
-      const waBody =
-        `✅ Prenotazione confermata\n` +
-        `Nome: ${session.name}\n` +
-        `Data: ${humanDateIT(session.dateISO)}\n` +
-        `Ora: ${session.time24}\n` +
-        `Persone: ${session.people}\n\n` +
-        `Se devi modificare o annullare, rispondi a questo messaggio.`;
-
       try {
+        const waTo = session.waTo;
+        const waBody = `Ciao ${session.name}! Prenotazione registrata ✅\nData: ${session.dateISO}\nOra: ${session.time24}\nPersone: ${session.people}\nA presto da TuttiBrilli!`;
+
         if (!twilioClient) {
-          console.error("Twilio client non configurato: mancano TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
-        } else if (!TWILIO_WHATSAPP_FROM || !/^whatsapp:\+\d{8,15}$/.test(TWILIO_WHATSAPP_FROM)) {
-          console.error("TWILIO_WHATSAPP_FROM non valido:", TWILIO_WHATSAPP_FROM);
+          console.error("Twilio client non configurato: manca TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
+        } else if (!TWILIO_WHATSAPP_FROM) {
+          console.error("TWILIO_WHATSAPP_FROM non valido/mancante:", TWILIO_WHATSAPP_FROM);
         } else if (!waTo || !hasValidWaAddress(waTo)) {
           console.error("waTo non valido:", waTo);
         } else {
@@ -893,7 +642,7 @@ ${hangup()}
         }
       } catch (e) {
         console.error("WhatsApp send failed:", e);
-        // Non blocchiamo: l'evento è già su Calendar
+        // Non blocchiamo: evento già creato
       }
 
       sessions.delete(callSid);
@@ -903,17 +652,16 @@ ${hangup()}
       `);
     }
 
-    // fallback finale
+    // fallback
     sessions.delete(callSid);
     return respond(`
 ${say("Ripartiamo da capo.")}
 ${redirect(`${BASE_URL}/voice`)}
-    `);
+`);
+
   } catch (err) {
     console.error("VOICE FLOW ERROR:", err);
-    sessions.delete(callSid);
 
-    // Se vuoi, su errore tecnico inoltra a operatore (se configurato)
     if (canForwardToHuman()) {
       return res.type("text/xml").status(200).send(twiml(forwardToHumanTwiml()));
     }
@@ -922,42 +670,45 @@ ${redirect(`${BASE_URL}/voice`)}
       twiml(`
 ${say("C'è stato un problema tecnico. Riprova tra poco.")}
 ${hangup()}
-      `)
+`)
     );
   }
 });
-// ====================
+
+// --------------------
 // DEBUG CALENDAR TEST
-// ====================
+// --------------------
 app.get("/debug/calendar-test", async (req, res) => {
   try {
     console.log("[DEBUG] calendar-test called");
 
-    const dateISO = req.query.dateISO || new Date().toISOString().slice(0, 10);
-    const timeHHMM = req.query.timeHHMM || "20:30";
+    const dateISO = String(req.query.dateISO || new Date().toISOString().slice(0, 10));
+    const timeHHMM = String(req.query.timeHHMM || "20:30");
 
     const result = await createBookingEvent({
+      callSid: "DEBUG-CALLSID",
       name: "TEST TuttiBrilli",
       phone: "+391234567890",
       dateISO,
-      timeHHMM,
-      partySize: 2,
+      timeHHMM,     // verrà mappato su time24
+      partySize: 2, // verrà mappato su people
+      waTo: "whatsapp:+391234567890",
       notes: "Evento di test creato da /debug/calendar-test",
     });
 
-    if (result.ok) {
-      return res.json({ ok: true, eventId: result.eventId });
-    }
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("[DEBUG] calendar-test error:", {
+      message: err?.message,
+      status: err?.code || err?.response?.status,
+      data: err?.response?.data,
+    });
 
     return res.status(500).json({
       ok: false,
-      error: result.error || "Calendar insert failed",
-    });
-  } catch (err) {
-    console.error("[DEBUG] calendar-test error:", err);
-    return res.status(500).json({
-      ok: false,
-      message: err.message,
+      message: err?.message,
+      status: err?.code || err?.response?.status,
+      data: err?.response?.data,
     });
   }
 });
