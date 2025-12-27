@@ -469,23 +469,41 @@ async function createBookingEvent({
     return { eventId: found.id, htmlLink: found.htmlLink, reused: true };
   }
 
-  const startDateTime = `${dateISO}T${time24}:00`;
-  const start = new Date(`${dateISO}T${time24}:00`);
-  const end = addMinutes(start, DEFAULT_EVENT_DURATION_MINUTES);
-  const endParts = toLocalDateTimeParts(end);
-  const endDateTime = `${endParts.date}T${endParts.time}:00`;
+    // ============================
+  // START/END RFC3339 ROBUSTI (anti 400)
+  // ============================
+  const tz = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
 
+  // Costruisci Date in modo sicuro e poi usa toISOString (RFC3339 valido)
+  const start = new Date(`${dateISO}T${time24}:00`);
+  if (Number.isNaN(start.getTime())) {
+    throw new Error(`createBookingEvent: start invalido: ${dateISO} ${time24}`);
+  }
+
+  const end = addMinutes(start, DEFAULT_EVENT_DURATION_MINUTES);
+  if (Number.isNaN(end.getTime())) {
+    throw new Error(`createBookingEvent: end invalido da start: ${start.toISOString()}`);
+  }
+
+  const peopleNum = Number(people);
   const requestBody = {
-    summary: `TuttiBrilli – ${name} – ${people} pax`,
-    description:
-      `Prenotazione\n` +
-      `Nome: ${name}\n` +
-      `Persone: ${people}\n` +
-      `Telefono: ${phone || "-"}\n` +
-      `WhatsApp: ${waTo || "-"}\n` +
-      `${privateKey}\n`,
-    start: { dateTime: startDateTime, timeZone: "Europe/Rome" },
-    end: { dateTime: endDateTime, timeZone: "Europe/Rome" },
+    summary: `TuttiBrilli - ${name} - ${peopleNum} pax`,
+    description: [
+      "Prenotazione",
+      `Nome: ${name}`,
+      `Persone: ${peopleNum}`,
+      `Telefono: ${phone || "-"}`,
+      `WhatsApp: ${waTo || "-"}`,
+      `callSid:${callSid || "-"}`,
+    ].join("\n"),
+    start: { dateTime: start.toISOString(), timeZone: tz },
+    end: { dateTime: end.toISOString(), timeZone: tz },
+  };
+
+  console.log("[CALENDAR] requestBody:", JSON.stringify(requestBody, null, 2));
+  // ============================
+  // FINE START/END ROBUSTI
+  // ============================
   };
 
   const resp = await calendar.events.insert({
