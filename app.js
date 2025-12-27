@@ -15,14 +15,18 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || ""; // es: whatsapp:+14155238886 (sandbox) oppure whatsapp:+<sender approvato>
 
+// (OPZIONALE ma consigliato) per evitare problemi di JSON spezzato nelle ENV
+// Metti qui il JSON del service account in Base64, se vuoi
+const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
+
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || ""; // es: ...@group.calendar.google.com
 const DEFAULT_EVENT_DURATION_MINUTES = parseInt(process.env.DEFAULT_EVENT_DURATION_MINUTES || "120", 10);
 
-// >>> INOLTRO A OPERATORE (NUOVO)
-const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || ""; // es: +393331112222
+// Inoltro chiamata a operatore (opzionale)
 const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "true").toLowerCase() === "true";
-const LOW_CONFIDENCE_THRESHOLD = parseFloat(process.env.LOW_CONFIDENCE_THRESHOLD || "0.45"); // regola a piacere
+const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || ""; // es: +393425169640
+const LOW_CONFIDENCE_THRESHOLD = parseFloat(process.env.LOW_CONFIDENCE_THRESHOLD || "0.45");
 
 // Twilio client
 let twilioClient = null;
@@ -34,11 +38,26 @@ if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
 // Google Calendar client (Service Account)
 const { google } = require("googleapis");
 
+function getServiceAccountJsonRaw() {
+  // preferisci B64 se presente
+  if (GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
+    try {
+      return Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
+    } catch (e) {
+      console.error("GOOGLE_SERVICE_ACCOUNT_JSON_B64 decode failed:", e);
+      return "";
+    }
+  }
+  return GOOGLE_SERVICE_ACCOUNT_JSON;
+}
+
 function getCalendarClient() {
-  if (!GOOGLE_SERVICE_ACCOUNT_JSON) return null;
   if (!GOOGLE_CALENDAR_ID) return null;
 
-  const creds = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
+  const raw = getServiceAccountJsonRaw();
+  if (!raw) return null;
+
+  const creds = JSON.parse(raw);
 
   const auth = new google.auth.JWT({
     email: creds.client_email,
@@ -110,30 +129,22 @@ function gatherSpeech({
 </Gather>`;
 }
 
-// >>> DIAL/INOLTRO (NUOVO)
-function dialNumber(numberE164, { callerId = null, timeout = 20 } = {}) {
-  // callerId: opzionale, ma spesso conviene lasciare quello di Twilio
-  const attrs = [
-    timeout ? `timeout="${Number(timeout)}"` : "",
-    callerId ? `callerId="${xmlEscape(callerId)}"` : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
-  return `<Dial ${attrs}>${xmlEscape(numberE164)}</Dial>`;
+// Dial / forwarding
+function dialNumber(numberE164, { timeout = 25 } = {}) {
+  return `<Dial timeout="${Number(timeout)}">${xmlEscape(numberE164)}</Dial>`;
 }
 
 function wantsHuman(text) {
   const t = String(text || "").toLowerCase();
-  return /\b(operatore|umano|persona|collega|parlare con qualcuno|assistenza)\b/.test(t);
+  return /\b(operatore|umano|persona|collega|assistenza|parlare con qualcuno)\b/.test(t);
 }
 
 function canForwardToHuman() {
-  return ENABLE_FORWARDING && Boolean(HUMAN_FORWARD_TO) && /^\+\d{8,15}$/.test(HUMAN_FORWARD_TO);
+  return ENABLE_FORWARDING && /^\+\d{8,15}$/.test(HUMAN_FORWARD_TO || "");
 }
 
-function forwardToHumanTwiml(reason = "richiesta assistenza") {
+function forwardToHumanTwiml() {
   if (!canForwardToHuman()) {
-    // se non configurato, chiudiamo in modo elegante
     return `
 ${say("Va bene. Al momento non riesco a trasferire la chiamata. Ti invito a scriverci su WhatsApp. A presto!")}
 ${hangup()}
@@ -238,6 +249,7 @@ function parseDateIT_MVP(speech) {
     return toISODate(d);
   }
 
+  // formati tipo 25/12/2025 o 25-12-2025
   let m = t.match(/\b(\d{1,2})[\/\-\.](\d{1,2})(?:[\/\-\.](\d{2,4}))?\b/);
   if (m) {
     let dd = parseInt(m[1], 10);
@@ -252,6 +264,7 @@ function parseDateIT_MVP(speech) {
     return null;
   }
 
+  // "2512" o "25 12"
   const digits = t.replace(/[^\d]/g, "");
   if (digits.length === 4) {
     const dd = parseInt(digits.slice(0, 2), 10);
@@ -270,6 +283,7 @@ function parseTimeIT_MVP(speech) {
   const t = normalizeText(speech);
   if (!t) return null;
 
+  // 20:30
   let m = t.match(/\b(\d{1,2})[:\.](\d{2})\b/);
   if (m) {
     const hh = parseInt(m[1], 10);
@@ -280,6 +294,7 @@ function parseTimeIT_MVP(speech) {
     return null;
   }
 
+  // "20 e 30" / "20 30"
   m = t.match(/\b(\d{1,2})\s*(?:e)?\s*(\d{1,2})\b/);
   if (m) {
     const hh = parseInt(m[1], 10);
@@ -289,6 +304,7 @@ function parseTimeIT_MVP(speech) {
     }
   }
 
+  // digits "2030"
   const digits = t.replace(/[^\d]/g, "");
   if (digits.length === 4) {
     const hh = parseInt(digits.slice(0, 2), 10);
@@ -298,6 +314,7 @@ function parseTimeIT_MVP(speech) {
     }
   }
 
+  // "alle 20" -> 20:00
   m = t.match(/\b(\d{1,2})\b/);
   if (m) {
     const hh = parseInt(m[1], 10);
@@ -384,10 +401,11 @@ async function createBookingEvent({
   waTo,
 }) {
   const calendar = getCalendarClient();
-  if (!calendar) throw new Error("Google Calendar non configurato (manca JSON o CALENDAR_ID).");
+  if (!calendar) throw new Error("Google Calendar non configurato (manca JSON/JSON_B64 o CALENDAR_ID).");
 
   const privateKey = `callsid:${callSid}`;
 
+  // Idempotenza: cerca se esiste già un evento con callsid:<CallSid> nella description
   const existing = await calendar.events.list({
     calendarId: GOOGLE_CALENDAR_ID,
     q: privateKey,
@@ -481,7 +499,6 @@ app.post("/voice/step", async (req, res) => {
     return res.type("text/xml").status(200).send(twiml(xml));
   }
 
-  // >>> Fallback/Retry aggiornato: se finisco i tentativi => inoltro a operatore (se configurato)
   function failOrRetry({ prompt1, prompt2, exitPrompt, forwardOnFail = true }) {
     const n = incRetry(session);
 
@@ -500,11 +517,11 @@ ${redirect(action)}
       `);
     }
 
-    // tentativi finiti: inoltro oppure chiudo
     sessions.set(callSid, session);
+
     if (forwardOnFail && canForwardToHuman()) {
       sessions.delete(callSid);
-      return respond(forwardToHumanTwiml("fallback_troppi_tentativi"));
+      return respond(forwardToHumanTwiml());
     }
 
     sessions.delete(callSid);
@@ -515,15 +532,20 @@ ${hangup()}
   }
 
   try {
-    // >>> Se chiede operatore in qualunque momento => inoltro immediato
+    // Inoltro a umano se richiesto
     if (speech && wantsHuman(speech)) {
       sessions.delete(callSid);
-      return respond(forwardToHumanTwiml("richiesta_utente"));
+      return respond(forwardToHumanTwiml());
     }
 
-    // >>> Confidenza bassa: se preferisci, puoi inoltrare SOLO dopo 1 retry.
-    // Qui lo gestiamo in modo soft: aumenta la probabilità di fallback.
-    const lowConfidence = Number.isFinite(confidence) && confidence > 0 && confidence < LOW_CONFIDENCE_THRESHOLD;
+    const lowConfidence =
+      Number.isFinite(confidence) && confidence > 0 && confidence < LOW_CONFIDENCE_THRESHOLD;
+
+    // Se bassa confidenza e già in retry, possiamo inoltrare
+    if (lowConfidence && session.retries >= 1 && canForwardToHuman()) {
+      sessions.delete(callSid);
+      return respond(forwardToHumanTwiml());
+    }
 
     // No input / no speech
     if (!speech) {
@@ -532,7 +554,6 @@ ${hangup()}
           prompt1: "Dimmi pure: vuoi prenotare o informazioni? Oppure di' operatore.",
           prompt2: "Puoi dire, per esempio: 'voglio prenotare un tavolo'. Oppure: 'operatore'.",
           exitPrompt: "Non riesco a sentirti bene. Se vuoi, scrivici su WhatsApp. A presto!",
-          forwardOnFail: true,
         });
       }
       if (session.step === 2) {
@@ -540,7 +561,6 @@ ${hangup()}
           prompt1: "Come ti chiami?",
           prompt2: "Dimmi il tuo nome, ad esempio: 'Mario Rossi'.",
           exitPrompt: "Ok. Se vuoi, scrivici su WhatsApp. A presto!",
-          forwardOnFail: true,
         });
       }
       if (session.step === 3) {
@@ -548,7 +568,6 @@ ${hangup()}
           prompt1: "Per che giorno vuoi prenotare?",
           prompt2: "Puoi dire 'domani' oppure '25 12'.",
           exitPrompt: "Non riesco a prendere la data. Scrivici su WhatsApp e ti aiutiamo subito. A presto!",
-          forwardOnFail: true,
         });
       }
       if (session.step === 4) {
@@ -556,7 +575,6 @@ ${hangup()}
           prompt1: "A che ora preferisci?",
           prompt2: "Puoi dire '20 e 30' oppure '21'.",
           exitPrompt: "Non riesco a prendere l'orario. Scrivici su WhatsApp e ti aiutiamo subito. A presto!",
-          forwardOnFail: true,
         });
       }
       if (session.step === 5) {
@@ -564,7 +582,6 @@ ${hangup()}
           prompt1: "Per quante persone?",
           prompt2: "Dimmi un numero, ad esempio 'quattro'.",
           exitPrompt: "Ok. Scrivici su WhatsApp con numero persone e orario. A presto!",
-          forwardOnFail: true,
         });
       }
       if (session.step === 6) {
@@ -572,15 +589,8 @@ ${hangup()}
           prompt1: "A che numero WhatsApp vuoi ricevere la conferma? Dimmi il numero iniziando con più trentanove.",
           prompt2: "Ripetilo lentamente, ad esempio: più trentanove, tre tre tre...",
           exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
-          forwardOnFail: true,
         });
       }
-    }
-
-    // >>> Se confidenza è bassa e siamo già in retry, puoi inoltrare più velocemente
-    if (lowConfidence && session.retries >= 1 && canForwardToHuman()) {
-      sessions.delete(callSid);
-      return respond(forwardToHumanTwiml("bassa_confidenza_stt"));
     }
 
     // STEP 1: Intento
@@ -611,7 +621,6 @@ ${hangup()}
         prompt1: "Scusami, vuoi prenotare un tavolo o informazioni? Oppure di' operatore.",
         prompt2: "Puoi dire: 'prenotare un tavolo' oppure 'informazioni'. Oppure: 'operatore'.",
         exitPrompt: "Va bene. Scrivici su WhatsApp e ti rispondiamo appena possibile. A presto!",
-        forwardOnFail: true,
       });
     }
 
@@ -638,7 +647,6 @@ ${redirect(action)}
           prompt1: "Non sono sicuro di aver capito la data. Per che giorno vuoi prenotare?",
           prompt2: "Puoi dire 'domani' oppure '25 12'.",
           exitPrompt: "Ok. Scrivici su WhatsApp con giorno e ora e ti confermiamo. A presto!",
-          forwardOnFail: true,
         });
       }
 
@@ -663,7 +671,6 @@ ${redirect(action)}
           prompt1: "Non sono sicuro di aver capito l'orario. A che ora preferisci?",
           prompt2: "Puoi dire '20 e 30' oppure '21'.",
           exitPrompt: "Ok. Scrivici su WhatsApp con giorno e ora e ti confermiamo. A presto!",
-          forwardOnFail: true,
         });
       }
 
@@ -688,7 +695,6 @@ ${redirect(action)}
           prompt1: "Quante persone sarete?",
           prompt2: "Dimmi un numero, ad esempio 'quattro'.",
           exitPrompt: "Ok. Scrivici su WhatsApp con numero persone e orario. A presto!",
-          forwardOnFail: true,
         });
       }
 
@@ -760,7 +766,6 @@ ${redirect(action)}
             prompt1: "Scusami, ti va bene che invii il WhatsApp a questo numero? Puoi dire sì o no. Oppure: operatore.",
             prompt2: "Dimmi solo: sì, va bene. Oppure: no, un altro numero. Oppure: operatore.",
             exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
-            forwardOnFail: true,
           });
         }
       }
@@ -772,7 +777,6 @@ ${redirect(action)}
             prompt1: "Non sono sicuro di aver capito il numero. Me lo ripeti iniziando con più trentanove?",
             prompt2: "Ripetilo lentamente, ad esempio: più trentanove, tre tre tre...",
             exitPrompt: "Ok. Scrivici tu su WhatsApp e ti confermiamo lì. A presto!",
-            forwardOnFail: true,
           });
         }
 
@@ -785,81 +789,107 @@ ${redirect(action)}
       }
     }
 
-// STEP 7: crea evento su Calendar + invia WhatsApp (SOLO SE CALENDAR OK)
-if (session.step === 7) {
-  // 1) Google Calendar (DEVE andare a buon fine)
-  let calendarResult = null;
+    // STEP 7: crea evento su Calendar + invia WhatsApp (SOLO SE CALENDAR OK)
+    if (session.step === 7) {
+      // 1) Google Calendar (DEVE andare a buon fine)
+      let calendarResult = null;
 
-  try {
-    calendarResult = await createBookingEvent({
-      callSid,
-      name: session.name,
-      dateISO: session.dateISO,
-      time24: session.time24,
-      people: session.people,
-      phone: (session.fromCaller || "").startsWith("+") ? session.fromCaller : "",
-      waTo: session.waTo,
-    });
-  } catch (e) {
-    console.error("Google Calendar insert failed:", e);
+      try {
+        calendarResult = await createBookingEvent({
+          callSid,
+          name: session.name,
+          dateISO: session.dateISO,
+          time24: session.time24,
+          people: session.people,
+          phone: (session.fromCaller || "").startsWith("+") ? session.fromCaller : "",
+          waTo: session.waTo,
+        });
 
-    // Se Calendar fallisce: NON inviare WhatsApp, chiudi con messaggio
-    sessions.delete(callSid);
-    return respond(`
+        // Log utile per debug
+        console.log("CALENDAR OK:", {
+          reused: calendarResult.reused,
+          eventId: calendarResult.eventId,
+          htmlLink: calendarResult.htmlLink,
+        });
+      } catch (e) {
+        console.error("Google Calendar insert failed:", e);
+
+        sessions.delete(callSid);
+        return respond(`
 ${say("Ho avuto un problema tecnico nel registrare la prenotazione in calendario. Riprova tra poco oppure scrivici su WhatsApp.")}
 ${hangup()}
-    `);
-  }
+        `);
+      }
 
-  // Se per qualunque motivo calendarResult è nullo, trattalo come fallimento
-  if (!calendarResult) {
-    console.error("Google Calendar insert failed: calendarResult is null/undefined");
+      if (!calendarResult) {
+        console.error("Google Calendar insert failed: calendarResult is null/undefined");
 
-    sessions.delete(callSid);
-    return respond(`
+        sessions.delete(callSid);
+        return respond(`
 ${say("Non sono riuscito a registrare la prenotazione in calendario. Riprova tra poco oppure scrivici su WhatsApp.")}
 ${hangup()}
-    `);
-  }
+        `);
+      }
 
-  // 2) WhatsApp (SOLO DOPO Calendar OK)
-  const waTo = session.waTo;
+      // 2) WhatsApp (SOLO DOPO Calendar OK)
+      const waTo = session.waTo;
+      const waBody =
+        `✅ Prenotazione confermata\n` +
+        `Nome: ${session.name}\n` +
+        `Data: ${humanDateIT(session.dateISO)}\n` +
+        `Ora: ${session.time24}\n` +
+        `Persone: ${session.people}\n\n` +
+        `Se devi modificare o annullare, rispondi a questo messaggio.`;
 
-  const waBody =
-    `✅ Prenotazione confermata\n` +
-    `Nome: ${session.name}\n` +
-    `Data: ${humanDateIT(session.dateISO)}\n` +
-    `Ora: ${session.time24}\n` +
-    `Persone: ${session.people}\n\n` +
-    `Se devi modificare o annullare, rispondi a questo messaggio.`;
+      try {
+        if (!twilioClient) {
+          console.error("Twilio client non configurato: mancano TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
+        } else if (!TWILIO_WHATSAPP_FROM || !/^whatsapp:\+\d{8,15}$/.test(TWILIO_WHATSAPP_FROM)) {
+          console.error("TWILIO_WHATSAPP_FROM non valido:", TWILIO_WHATSAPP_FROM);
+        } else if (!waTo || !hasValidWaAddress(waTo)) {
+          console.error("waTo non valido:", waTo);
+        } else {
+          await twilioClient.messages.create({
+            from: TWILIO_WHATSAPP_FROM,
+            to: waTo,
+            body: waBody,
+          });
+        }
+      } catch (e) {
+        console.error("WhatsApp send failed:", e);
+        // Non blocchiamo: l'evento è già su Calendar
+      }
 
-  try {
-    if (!twilioClient) {
-      console.error("Twilio client non configurato: mancano TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
-    } else if (!TWILIO_WHATSAPP_FROM) {
-      console.error("Manca TWILIO_WHATSAPP_FROM (es. whatsapp:+1415...)");
-    } else if (!waTo || !hasValidWaAddress(waTo)) {
-      console.error("waTo non valido:", waTo);
-    } else {
-      await twilioClient.messages.create({
-        from: TWILIO_WHATSAPP_FROM,
-        to: waTo,
-        body: waBody,
-      });
-    }
-  } catch (e) {
-    console.error("WhatsApp send failed:", e);
-    // Nota: qui NON blocchiamo la prenotazione, perché è già su Calendar.
-  }
-
-  // Fine flusso
-  sessions.delete(callSid);
-  return respond(`
+      sessions.delete(callSid);
+      return respond(`
 ${say("Perfetto! Ho registrato la prenotazione e ti ho inviato un WhatsApp di conferma. A presto da TuttiBrilli!")}
 ${hangup()}
-  `);
-}
+      `);
+    }
 
+    // fallback finale
+    sessions.delete(callSid);
+    return respond(`
+${say("Ripartiamo da capo.")}
+${redirect(`${BASE_URL}/voice`)}
+    `);
+  } catch (err) {
+    console.error("VOICE FLOW ERROR:", err);
+    sessions.delete(callSid);
+
+    // Se vuoi, su errore tecnico inoltra a operatore (se configurato)
+    if (canForwardToHuman()) {
+      return res.type("text/xml").status(200).send(twiml(forwardToHumanTwiml()));
+    }
+
+    return res.type("text/xml").status(200).send(
+      twiml(`
+${say("C'è stato un problema tecnico. Riprova tra poco.")}
+${hangup()}
+      `)
+    );
+  }
+});
 
 // --------------------
 // START SERVER
@@ -867,7 +897,19 @@ ${hangup()}
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`BASE_URL: ${BASE_URL || "(non impostato)"}`);
-  console.log(`Calendar configured: ${Boolean(GOOGLE_SERVICE_ACCOUNT_JSON && GOOGLE_CALENDAR_ID)}`);
+
+  const raw = getServiceAccountJsonRaw();
+  console.log(`Calendar configured: ${Boolean(raw && GOOGLE_CALENDAR_ID)}`);
   console.log(`Twilio configured: ${Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN)}`);
-  console.log(`Forwarding enabled: ${ENABLE_FORWARDING} | HUMAN_FORWARD_TO: ${HUMAN_FORWARD_TO || "(non impostato)"}`);
+
+  console.log(
+    `Forwarding enabled: ${ENABLE_FORWARDING} | HUMAN_FORWARD_TO: ${HUMAN_FORWARD_TO || "(non impostato)"}`
+  );
+
+  if (raw && !GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
+    console.log(`GOOGLE_SERVICE_ACCOUNT_JSON length: ${(GOOGLE_SERVICE_ACCOUNT_JSON || "").length}`);
+  }
+  if (GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
+    console.log(`GOOGLE_SERVICE_ACCOUNT_JSON_B64 length: ${GOOGLE_SERVICE_ACCOUNT_JSON_B64.length}`);
+  }
 });
