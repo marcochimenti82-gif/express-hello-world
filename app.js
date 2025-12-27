@@ -890,6 +890,41 @@ ${hangup()}
     );
   }
 });
+// ====================
+// DEBUG CALENDAR TEST
+// ====================
+app.get("/debug/calendar-test", async (req, res) => {
+  try {
+    console.log("[DEBUG] calendar-test called");
+
+    const dateISO = req.query.dateISO || new Date().toISOString().slice(0, 10);
+    const timeHHMM = req.query.timeHHMM || "20:30";
+
+    const result = await createBookingEvent({
+      name: "TEST TuttiBrilli",
+      phone: "+391234567890",
+      dateISO,
+      timeHHMM,
+      partySize: 2,
+      notes: "Evento di test creato da /debug/calendar-test",
+    });
+
+    if (result.ok) {
+      return res.json({ ok: true, eventId: result.eventId });
+    }
+
+    return res.status(500).json({
+      ok: false,
+      error: result.error || "Calendar insert failed",
+    });
+  } catch (err) {
+    console.error("[DEBUG] calendar-test error:", err);
+    return res.status(500).json({
+      ok: false,
+      message: err.message,
+    });
+  }
+});
 
 // --------------------
 // START SERVER
