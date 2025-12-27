@@ -400,6 +400,55 @@ async function createBookingEvent({
   phone,
   waTo,
 }) {
+    // ============================
+  // NORMALIZZAZIONE INPUT + GUARDRAILS (ANTI 400)
+  // ============================
+  // Il debug endpoint a volte passa nomi diversi (partySize/timeHHMM).
+  // Qui li normalizziamo in "people" e "time24" per evitare undefined.
+  if (people == null && typeof partySize !== "undefined") people = partySize;
+  if (!time24 && typeof timeHHMM !== "undefined") time24 = timeHHMM;
+
+  // Validazioni minime (fallisci presto con errore chiaro)
+  if (!name) throw new Error("createBookingEvent: name mancante");
+  if (!dateISO || !/^\d{4}-\d{2}-\d{2}$/.test(dateISO)) {
+    throw new Error(`createBookingEvent: dateISO non valido: ${dateISO}`);
+  }
+  if (!time24 || !/^\d{2}:\d{2}$/.test(time24)) {
+    throw new Error(`createBookingEvent: time24 non valido: ${time24}`);
+  }
+  const peopleNum = Number(people);
+  if (!Number.isFinite(peopleNum) || peopleNum <= 0) {
+    throw new Error(`createBookingEvent: people non valido: ${people}`);
+  }
+
+  const tz = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
+
+  // Costruzione start/end robusta
+  const startDate = new Date(`${dateISO}T${time24}:00`);
+  if (Number.isNaN(startDate.getTime())) {
+    throw new Error(`createBookingEvent: startDate invalida: ${dateISO} ${time24}`);
+  }
+  const endDate = new Date(startDate.getTime() + 90 * 60 * 1000);
+
+  // Event payload (Google Calendar RFC3339 via toISOString)
+  const event = {
+    summary: `TuttiBrilli - ${name} - ${peopleNum} pax`,
+    description: [
+      "Prenotazione",
+      `Nome: ${name}`,
+      `Persone: ${peopleNum}`,
+      `Telefono: ${phone || "-"}`,
+      `WhatsApp: ${waTo || "-"}`,
+      `callSid:${callSid || "-"}`,
+    ].join("\n"),
+    start: { dateTime: startDate.toISOString(), timeZone: tz },
+    end: { dateTime: endDate.toISOString(), timeZone: tz },
+  };
+
+  console.log("[CALENDAR] event payload:", JSON.stringify(event, null, 2));
+  // ============================
+  // FINE NORMALIZZAZIONE INPUT
+  // ============================
   const calendar = getCalendarClient();
   if (!calendar) throw new Error("Google Calendar non configurato (manca JSON/JSON_B64 o CALENDAR_ID).");
 
