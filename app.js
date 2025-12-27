@@ -415,38 +415,7 @@ async function createBookingEvent({
   }
   if (!time24 || !/^\d{2}:\d{2}$/.test(time24)) {
     throw new Error(`createBookingEvent: time24 non valido: ${time24}`);
-  }
-  const peopleNum = Number(people);
-  if (!Number.isFinite(peopleNum) || peopleNum <= 0) {
-    throw new Error(`createBookingEvent: people non valido: ${people}`);
-  }
-
-  const tz = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
-
-  // Costruzione start/end robusta
-  const startDate = new Date(`${dateISO}T${time24}:00`);
-  if (Number.isNaN(startDate.getTime())) {
-    throw new Error(`createBookingEvent: startDate invalida: ${dateISO} ${time24}`);
-  }
-  const endDate = new Date(startDate.getTime() + 90 * 60 * 1000);
-
-  // Event payload (Google Calendar RFC3339 via toISOString)
-  const event = {
-    summary: `TuttiBrilli - ${name} - ${peopleNum} pax`,
-    description: [
-      "Prenotazione",
-      `Nome: ${name}`,
-      `Persone: ${peopleNum}`,
-      `Telefono: ${phone || "-"}`,
-      `WhatsApp: ${waTo || "-"}`,
-      `callSid:${callSid || "-"}`,
-    ].join("\n"),
-    start: { dateTime: startDate.toISOString(), timeZone: tz },
-    end: { dateTime: endDate.toISOString(), timeZone: tz },
-  };
-
-  console.log("[CALENDAR] event payload:", JSON.stringify(event, null, 2));
-  // ============================
+   // ============================
   // FINE NORMALIZZAZIONE INPUT
   // ============================
   const calendar = getCalendarClient();
