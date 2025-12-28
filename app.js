@@ -2,23 +2,42 @@
 
 /**
  * TuttiBrilli Enoteca - Voice Booking Assistant (Single file, copy/paste)
+ *
+ * STACK:
  * - Twilio Voice (Speech Gather) -> Node/Express
- * - Google Calendar (service account) for booking events
+ * - Google Calendar API (service account) for booking events
  * - Twilio WhatsApp confirmation ONLY after calendar success
  *
- * NEW FEATURES:
- * - Block bookings if Calendar has an event containing "locale chiuso" (summary/description) on that date
- * - Preorder structured menu options:
- *   - cena
- *   - apericena
- *   - dopocena (only after 22:30)
- *   - Piatto Apericena (25€)
- *   - Piatto Apericena Promo (eligible only if: Tue-Sun, NOT Fri, NOT holidays, and no "no promo" marker on calendar date)
- * - Always record allergies/intolerances/special requests in Calendar + WhatsApp
+ * IMPORTANT FIX (vs previous version):
+ * ✅ NO Google Calendar calls during early steps (name/date/time/etc.)
+ *    Calendar is called ONLY at the final step (after phone) to:
+ *      - block "locale chiuso"
+ *      - detect "no promo"
+ *      - lock tables (avoid double-booking)
+ *      - create the booking event
+ *      - send WhatsApp (only if Calendar succeeded and autoConfirm=true)
+ *
+ * FEATURES:
+ * - Opening hours rules (restaurant/drinks/operator on Mondays)
+ * - Table durations (+30min Wed/Fri music nights for <=8 pax)
+ * - Table map (inside/outside) + combinations/unions
+ * - Always ask inside/outside; if outside => warn + recommend inside + confirm
+ * - Menu preorder (fixed options):
+ *    - cena
+ *    - apericena
+ *    - dopocena (only after 22:30)
+ *    - Piatto Apericena (25€)
+ *    - Piatto Apericena in promo (eligibility rules + "no promo" marker)
+ * - Promo rules:
+ *    - Eligible Tue-Sun excluding Fri
+ *    - Exclude holidays listed in ENV HOLIDAYS_YYYY_MM_DD
+ *    - Exclude if Calendar has marker "no promo" on that date
+ * - Block all bookings if Calendar has marker "locale chiuso" on that date
+ * - Store allergies/intolerances/special requests in Calendar + WhatsApp
  *
  * ENV REQUIRED:
  *  PORT
- *  BASE_URL  (e.g. https://your-service.onrender.com)  <-- IMPORTANT for Twilio action URL
+ *  BASE_URL  (e.g. https://your-service.onrender.com)  <-- required for Twilio gather action URL
  *
  *  TWILIO_ACCOUNT_SID
  *  TWILIO_AUTH_TOKEN
@@ -32,7 +51,7 @@
  *  ENABLE_FORWARDING=true/false
  *  HUMAN_FORWARD_TO=+39...
  *
- *  HOLIDAYS_YYYY_MM_DD="2025-01-01,2025-04-20,2025-12-25"  // for promo exclusion on holidays
+ *  HOLIDAYS_YYYY_MM_DD="2025-01-01,2025-04-20,2025-12-25"  // promo exclusion on holidays
  */
 
 const express = require("express");
@@ -60,7 +79,6 @@ const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "false").toLowerCase
 const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || "";
 
 const HOLIDAYS_YYYY_MM_DD = process.env.HOLIDAYS_YYYY_MM_DD || "";
-
 const HOLIDAYS_SET = new Set(
   HOLIDAYS_YYYY_MM_DD
     .split(",")
@@ -87,12 +105,12 @@ const OPENING = {
 const PREORDER_OPTIONS = [
   { key: "cena", label: "Cena", priceEUR: null, constraints: {} },
   { key: "apericena", label: "Apericena", priceEUR: null, constraints: {} },
-  { key: "dopocena", label: "Dopocena", priceEUR: null, constraints: { minTime: "22:30" } }, // After 22:30
+  { key: "dopocena", label: "Dopocena (dopo le 22:30)", priceEUR: null, constraints: { minTime: "22:30" } },
   { key: "piatto_apericena", label: "Piatto Apericena", priceEUR: 25, constraints: {} },
   {
     key: "piatto_apericena_promo",
     label: "Piatto Apericena in promo (previa registrazione)",
-    priceEUR: null, // promo price not specified
+    priceEUR: null,
     constraints: { promoOnly: true },
   },
 ];
@@ -159,11 +177,8 @@ function getSession(callSid) {
 
       specialRequestsRaw: null,
 
-      preorderOptIn: null,
       preorderChoiceKey: null,
       preorderLabel: null,
-
-      promoEligible: null, // computed from calendar/day rules
 
       // area
       area: null, // inside/outside
@@ -179,8 +194,11 @@ function getSession(callSid) {
 
       // derived
       durationMinutes: null,
-      bookingType: "restaurant", // or drinks/operator
+      bookingType: "restaurant", // restaurant/drinks/operator
       autoConfirm: true,
+
+      // computed only at final step (after Calendar checks)
+      promoEligible: null,
     });
   }
   return sessions.get(callSid);
@@ -196,10 +214,7 @@ function resetRetries(session) {
 
 // ======================= TEXT / PARSERS =======================
 function normalizeText(s) {
-  return String(s || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
+  return String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function toISODate(d) {
@@ -256,9 +271,7 @@ function parseTimeIT(speech) {
   const onlyH = t.match(/\b(\d{1,2})\b/);
   if (onlyH) {
     const hh = Number(onlyH[1]);
-    if (hh >= 0 && hh <= 23) {
-      return `${String(hh).padStart(2, "0")}:00`;
-    }
+    if (hh >= 0 && hh <= 23) return `${String(hh).padStart(2, "0")}:00`;
   }
 
   return null;
@@ -273,18 +286,35 @@ function parsePeopleIT(speech) {
   return n;
 }
 
-function parseYesNoIT(speech) {
-  const t = normalizeText(speech);
-  if (!t) return null;
-  if (t.includes("si") || t.includes("sì") || t.includes("certo") || t.includes("ok") || t.includes("va bene")) return true;
-  if (t.includes("no") || t.includes("non") || t.includes("niente") || t.includes("nessun")) return false;
-  return null;
-}
-
 function parseAreaIT(speech) {
   const t = normalizeText(speech);
   if (t.includes("intern") || t.includes("dentro") || t.includes("sala")) return "inside";
   if (t.includes("estern") || t.includes("fuori") || t.includes("terraz") || t.includes("giardino")) return "outside";
+  return null;
+}
+
+function parsePreorderChoiceKey(speech) {
+  const t = normalizeText(speech);
+
+  if (t.includes("promo")) return "piatto_apericena_promo";
+  if (t.includes("piatto") && t.includes("apericena")) return "piatto_apericena";
+  if (t.includes("dopocena") || t.includes("dopo cena") || t.includes("dopo")) return "dopocena";
+  if (t.includes("apericena")) return "apericena";
+  if (t.includes("cena")) return "cena";
+  if (t.includes("nessuno") || t.includes("nessuna") || t.includes("no")) return null;
+
+  return "unknown";
+}
+
+function getPreorderOptionByKey(key) {
+  return PREORDER_OPTIONS.find((o) => o.key === key) || null;
+}
+
+function parseYesNoIT(speech) {
+  const t = normalizeText(speech);
+  if (!t) return null;
+  if (t.includes("si") || t.includes("sì") || t.includes("certo") || t.includes("ok") || t.includes("va bene")) return true;
+  if (t === "no" || t.includes("no") || t.includes("non") || t.includes("niente") || t.includes("nessun")) return false;
   return null;
 }
 
@@ -304,25 +334,7 @@ function extractPhoneFromSpeech(speech) {
   return null;
 }
 
-// Preorder parsing: understand fixed options by keywords
-function parsePreorderChoiceKey(speech) {
-  const t = normalizeText(speech);
-
-  // Strong matches first
-  if (t.includes("promo")) return "piatto_apericena_promo";
-  if (t.includes("piatto") && t.includes("apericena")) return "piatto_apericena";
-  if (t.includes("dopo") || t.includes("dopocena")) return "dopocena";
-  if (t.includes("apericena")) return "apericena";
-  if (t.includes("cena")) return "cena";
-  if (t.includes("nessuno") || t.includes("nessuna") || t.includes("no")) return null;
-
-  return "unknown";
-}
-
-function getPreorderOptionByKey(key) {
-  return PREORDER_OPTIONS.find((o) => o.key === key) || null;
-}
-
+// ======================= TIME HELPERS =======================
 function hmToMinutes(hm) {
   const [h, m] = String(hm).split(":").map(Number);
   return h * 60 + m;
@@ -332,7 +344,6 @@ function isTimeAtOrAfter(time24, minTime24) {
   return hmToMinutes(time24) >= hmToMinutes(minTime24);
 }
 
-// ======================= TIME / OPENING VALIDATION =======================
 function getRestaurantWindowForDay(day) {
   if (day === 5 || day === 6) return OPENING.restaurant.friSat; // Fri, Sat
   return OPENING.restaurant.default;
@@ -343,6 +354,22 @@ function isWithinWindow(time24, startHM, endHM) {
   const start = hmToMinutes(startHM);
   const end = hmToMinutes(endHM);
   return t >= start && t <= end;
+}
+
+function deriveBookingTypeAndConfirm(dateISO, time24) {
+  const d = new Date(`${dateISO}T00:00:00`);
+  const day = d.getDay();
+
+  if (day === OPENING.closedDay) return { bookingType: "operator", autoConfirm: false, reason: "Lunedì chiuso" };
+
+  const restWin = getRestaurantWindowForDay(day);
+  const inRestaurant = isWithinWindow(time24, restWin.start, restWin.end);
+  const inDrinks = isWithinWindow(time24, OPENING.drinksOnly.start, OPENING.drinksOnly.end);
+
+  if (inRestaurant) return { bookingType: "restaurant", autoConfirm: true, reason: null };
+  if (inDrinks) return { bookingType: "drinks", autoConfirm: true, reason: "Fuori orario cucina" };
+
+  return { bookingType: "closed", autoConfirm: false, reason: "Fuori orario" };
 }
 
 function getDurationMinutes(people, dateObj) {
@@ -379,24 +406,6 @@ function computeStartEndLocal(dateISO, time24, durationMinutes) {
   const endLocal = `${endDateISO}T${String(endH).padStart(2, "0")}:${String(endM).padStart(2, "0")}:00`;
 
   return { startLocal, endLocal };
-}
-
-function deriveBookingTypeAndConfirm(dateISO, time24) {
-  const d = new Date(`${dateISO}T00:00:00`);
-  const day = d.getDay();
-
-  if (day === OPENING.closedDay) {
-    return { bookingType: "operator", autoConfirm: false, reason: "Lunedì chiuso" };
-  }
-
-  const restWin = getRestaurantWindowForDay(day);
-  const inRestaurant = isWithinWindow(time24, restWin.start, restWin.end);
-  const inDrinks = isWithinWindow(time24, OPENING.drinksOnly.start, OPENING.drinksOnly.end);
-
-  if (inRestaurant) return { bookingType: "restaurant", autoConfirm: true, reason: null };
-  if (inDrinks) return { bookingType: "drinks", autoConfirm: true, reason: "Fuori orario cucina" };
-
-  return { bookingType: "closed", autoConfirm: false, reason: "Fuori orario" };
 }
 
 // ======================= TWILIO TWIML HELPERS =======================
@@ -472,7 +481,7 @@ function getCalendarClient() {
   return google.calendar({ version: "v3", auth });
 }
 
-// ======================= CALENDAR MARKERS (locale chiuso / no promo) =======================
+// ======================= CALENDAR HELPERS (markers / locks / idempotency) =======================
 function containsMarker(ev, markerLower) {
   const s = `${String(ev.summary || "")}\n${String(ev.description || "")}`.toLowerCase();
   return s.includes(markerLower);
@@ -495,20 +504,42 @@ async function calendarHasMarkerOnDate(calendar, dateISO, markerLower) {
 
 function isPromoEligibleByDay(dateISO) {
   const d = new Date(`${dateISO}T00:00:00`);
-  const day = d.getDay(); // 0..6
-
-  // Tue-Sun, excluding Fri
-  // Tue=2, Wed=3, Thu=4, Fri=5, Sat=6, Sun=0
+  const day = d.getDay();
+  // Tue-Sun excluding Fri (Tue=2, Wed=3, Thu=4, Sat=6, Sun=0)
   const allowedDay = day === 0 || day === 2 || day === 3 || day === 4 || day === 6;
   if (!allowedDay) return false;
-
-  // Exclude holidays from ENV list
   if (HOLIDAYS_SET.has(dateISO)) return false;
-
   return true;
 }
 
-// ======================= TABLE ALLOCATION + LOCKS =======================
+function parseLocksFromEvent(ev) {
+  const d = String(ev.description || "");
+  const m = d.match(/LOCKS:\s*([A-Z0-9,]+)/i);
+  if (!m) return [];
+  return m[1].split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+async function getLockedTables(calendar, dateISO) {
+  const timeMin = `${dateISO}T00:00:00Z`;
+  const timeMax = `${dateISO}T23:59:59Z`;
+
+  const resp = await calendar.events.list({
+    calendarId: GOOGLE_CALENDAR_ID,
+    timeMin,
+    timeMax,
+    singleEvents: true,
+    orderBy: "startTime",
+    maxResults: 250,
+  });
+
+  const locked = new Set();
+  for (const ev of resp.data.items || []) {
+    for (const t of parseLocksFromEvent(ev)) locked.add(t);
+  }
+  return locked;
+}
+
+// ======================= TABLE ALLOCATION =======================
 function buildCandidates(area) {
   const singles = TABLES
     .filter((t) => t.area === area)
@@ -537,41 +568,12 @@ function buildCandidates(area) {
   return singles.concat(combos);
 }
 
-function parseLocksFromEvent(ev) {
-  const d = String(ev.description || "");
-  const m = d.match(/LOCKS:\s*([A-Z0-9,]+)/i);
-  if (!m) return [];
-  return m[1].split(",").map((s) => s.trim()).filter(Boolean);
-}
-
-async function getLockedTables(calendar, dateISO) {
-  const timeMin = `${dateISO}T00:00:00Z`;
-  const timeMax = `${dateISO}T23:59:59Z`;
-
-  const resp = await calendar.events.list({
-    calendarId: GOOGLE_CALENDAR_ID,
-    timeMin,
-    timeMax,
-    singleEvents: true,
-    orderBy: "startTime",
-    maxResults: 250,
-  });
-
-  const items = resp.data.items || [];
-  const locked = new Set();
-  for (const ev of items) {
-    for (const t of parseLocksFromEvent(ev)) locked.add(t);
-  }
-  return locked;
-}
-
 function allocateTable({ area, people, lockedSet }) {
   const candidates = buildCandidates(area);
 
   let ok = candidates.filter((c) => people >= c.min && people <= c.max);
   ok = ok.filter((c) => c.locks.every((t) => !lockedSet.has(t)));
 
-  // Best fit: minimize wasted seats. Tie -> singles first.
   ok.sort((a, b) => {
     const wasteA = a.max - people;
     const wasteB = b.max - people;
@@ -611,10 +613,9 @@ async function createBookingEvent({
 
   const tz = GOOGLE_CALENDAR_TZ;
   const { startLocal, endLocal } = computeStartEndLocal(dateISO, time24, durationMinutes);
-
   const privateKey = `callsid:${callSid || "no-callsid"}`;
 
-  // Idempotency: search existing event by privateKey in that date window
+  // Idempotency: search existing event by privateKey in day window
   const existing = await calendar.events.list({
     calendarId: GOOGLE_CALENDAR_ID,
     q: privateKey,
@@ -625,9 +626,7 @@ async function createBookingEvent({
   });
 
   const found = (existing.data.items || []).find((ev) => String(ev.description || "").includes(privateKey));
-  if (found) {
-    return { created: false, eventId: found.id, htmlLink: found.htmlLink };
-  }
+  if (found) return { created: false, eventId: found.id, htmlLink: found.htmlLink };
 
   const prefix = autoConfirm ? "" : "DA CONFERMARE • ";
   const summary = `${prefix}TB • ${tableDisplayId} • ${name} • ${people} pax`;
@@ -700,15 +699,10 @@ async function sendWhatsAppConfirmation({
     `Tavolo: ${tableDisplayId} (${area === "inside" ? "interno" : "esterno"})`,
   ];
 
-  if (bookingType === "drinks") {
-    lines.push(`Nota: a quest'orario la cucina potrebbe essere chiusa (solo drink e vino).`);
-  }
+  if (bookingType === "drinks") lines.push(`Nota: a quest'orario la cucina potrebbe essere chiusa (solo drink e vino).`);
 
-  if (specialRequestsRaw && normalizeText(specialRequestsRaw) !== "nessuna") {
-    lines.push(`Richieste: ${specialRequestsRaw}`);
-  } else {
-    lines.push(`Richieste: nessuna`);
-  }
+  if (specialRequestsRaw && normalizeText(specialRequestsRaw) !== "nessuna") lines.push(`Richieste: ${specialRequestsRaw}`);
+  else lines.push(`Richieste: nessuna`);
 
   if (preorderLabel) {
     let preorderLine = `Preordine: ${preorderLabel}`;
@@ -720,9 +714,7 @@ async function sendWhatsAppConfirmation({
     }
   }
 
-  if (outsideDisclaimer) {
-    lines.push(`Nota: ${outsideDisclaimer}`);
-  }
+  if (outsideDisclaimer) lines.push(`Nota: ${outsideDisclaimer}`);
 
   lines.push(`A presto da TuttiBrilli!`);
 
@@ -803,6 +795,7 @@ app.post("/voice", async (req, res) => {
       }
 
       case 3: {
+        // FIX: no calendar calls here
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
             sayIt(vr, "Non ho capito l'orario. Ti passo un operatore.");
@@ -828,26 +821,7 @@ app.post("/voice", async (req, res) => {
 
         session.time24 = time24;
 
-        const calendar = getCalendarClient();
-        if (!calendar) throw new Error("Calendar client not configured");
-
-        // HARD BLOCK: "locale chiuso" on that date -> no bookings
-        const isClosed = await calendarHasMarkerOnDate(calendar, session.dateISO, "locale chiuso");
-        if (isClosed) {
-          sayIt(vr, "Mi dispiace, per quella data il locale risulta chiuso e non posso fissare prenotazioni. Ti passo un operatore.");
-          if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, "Grazie.");
-          vr.hangup();
-          sessions.delete(callSid);
-          break;
-        }
-
-        // Promo eligibility: by day + not "no promo" marker on calendar
-        const dayOk = isPromoEligibleByDay(session.dateISO);
-        const hasNoPromo = await calendarHasMarkerOnDate(calendar, session.dateISO, "no promo");
-        session.promoEligible = dayOk && !hasNoPromo;
-
-        // Validate opening hours / booking type
+        // Opening hours logic only (no external calls)
         const { bookingType, autoConfirm, reason } = deriveBookingTypeAndConfirm(session.dateISO, session.time24);
         session.bookingType = bookingType;
         session.autoConfirm = autoConfirm;
@@ -898,10 +872,7 @@ app.post("/voice", async (req, res) => {
         session.people = people;
         resetRetries(session);
         session.step = 5;
-        gatherSpeech(
-          vr,
-          "Ci sono allergie, intolleranze o richieste particolari? Puoi dire per esempio: nessuna, celiaco, senza lattosio, vegetariano, tavolo tranquillo."
-        );
+        gatherSpeech(vr, "Ci sono allergie, intolleranze o richieste particolari? Puoi dire per esempio: nessuna, celiaco, senza lattosio, vegetariano, tavolo tranquillo.");
         break;
       }
 
@@ -926,7 +897,6 @@ app.post("/voice", async (req, res) => {
       }
 
       case 6: {
-        // Preorder choice (single selection from fixed menu)
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
             session.preorderChoiceKey = null;
@@ -936,7 +906,7 @@ app.post("/voice", async (req, res) => {
             gatherSpeech(vr, "Preferisci sala interna o sala esterna? Ti consiglio l'interno.");
             break;
           }
-          gatherSpeech(vr, "Non ho sentito. Vuoi preordinare? Di' cena, apericena, dopocena, piatto apericena, piatto apericena promo, oppure nessuno.");
+          gatherSpeech(vr, "Non ho sentito. Di' cena, apericena, dopocena, piatto apericena, piatto apericena promo, oppure nessuno.");
           break;
         }
 
@@ -955,7 +925,6 @@ app.post("/voice", async (req, res) => {
           break;
         }
 
-        // "nessuno"
         if (!key) {
           session.preorderChoiceKey = null;
           session.preorderLabel = null;
@@ -965,7 +934,6 @@ app.post("/voice", async (req, res) => {
           break;
         }
 
-        // validate constraints
         const opt = getPreorderOptionByKey(key);
         if (!opt) {
           session.preorderChoiceKey = null;
@@ -976,7 +944,7 @@ app.post("/voice", async (req, res) => {
           break;
         }
 
-        // dopocena only after 22:30
+        // dopocena constraint enforced here (no calendar needed)
         if (opt.constraints && opt.constraints.minTime) {
           if (!isTimeAtOrAfter(session.time24, opt.constraints.minTime)) {
             sayIt(vr, "Il dopocena è disponibile solo dopo le 22 e 30.");
@@ -986,13 +954,7 @@ app.post("/voice", async (req, res) => {
           }
         }
 
-        // promo rule check: we allow selection, but if not eligible we warn & still record
-        if (opt.constraints && opt.constraints.promoOnly) {
-          if (!session.promoEligible) {
-            sayIt(vr, "Nota: oggi la promo potrebbe non essere valida, per giorno non promo, festivo o indicazione no promo. La segnalo comunque e verrà verificata.");
-          }
-        }
-
+        // promo eligibility computed later (after phone, at final step) - here we just store choice
         session.preorderChoiceKey = opt.key;
         session.preorderLabel = opt.label;
 
@@ -1003,7 +965,7 @@ app.post("/voice", async (req, res) => {
       }
 
       case 8: {
-        // Area selection with outside disclaimer + recommendation
+        // Area selection with outside disclaimer + recommendation + confirm
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
             session.area = "inside";
@@ -1081,7 +1043,7 @@ app.post("/voice", async (req, res) => {
       }
 
       case 10: {
-        // Phone / WhatsApp
+        // Phone / WhatsApp + FINAL STEP: Calendar checks + table lock + event creation + WhatsApp
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
             sayIt(vr, "Non ho capito il numero. Ti passo un operatore.");
@@ -1109,12 +1071,45 @@ app.post("/voice", async (req, res) => {
         session.waTo = `whatsapp:${phone}`;
         resetRetries(session);
 
-        // ===== ALLOCATE TABLE + CALENDAR LOCK =====
-        const calendar = getCalendarClient();
-        if (!calendar) throw new Error("Calendar client not configured");
+        // Compute duration now (needed for Calendar event start/end)
+        const d = new Date(`${session.dateISO}T00:00:00`);
+        session.durationMinutes = getDurationMinutes(session.people, d);
 
-        // Safety: re-check "locale chiuso" before committing
-        const isClosed = await calendarHasMarkerOnDate(calendar, session.dateISO, "locale chiuso");
+        const outsideDisclaimer =
+          session.area === "outside"
+            ? "Tavolo esterno: in caso di maltempo non è garantito il posto all'interno."
+            : null;
+
+        // Determine preorder price text
+        let preorderPriceText = null;
+        if (session.preorderChoiceKey) {
+          const opt = getPreorderOptionByKey(session.preorderChoiceKey);
+          if (opt && typeof opt.priceEUR === "number") preorderPriceText = `${opt.priceEUR} €`;
+        }
+
+        // ==== FINAL Calendar operations (wrapped in local try/catch) ====
+        const calendar = getCalendarClient();
+        if (!calendar) {
+          // Can't book without calendar. Offer operator.
+          sayIt(vr, "Mi dispiace, al momento non riesco a registrare la prenotazione. Ti passo un operatore.");
+          if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
+          sayIt(vr, "Puoi richiamare più tardi. Grazie.");
+          break;
+        }
+
+        let isClosed = false;
+        let hasNoPromo = false;
+
+        try {
+          isClosed = await calendarHasMarkerOnDate(calendar, session.dateISO, "locale chiuso");
+          hasNoPromo = await calendarHasMarkerOnDate(calendar, session.dateISO, "no promo");
+        } catch (err) {
+          console.error("[CALENDAR] marker checks error:", err);
+          // If marker checks fail, treat as not closed, promo unknown -> safest is mark promo as "da verificare"
+          isClosed = false;
+          hasNoPromo = true; // conservative: disable promo eligibility if can't verify
+        }
+
         if (isClosed) {
           sayIt(vr, "Mi dispiace, per quella data il locale risulta chiuso e non posso fissare prenotazioni. Ti passo un operatore.");
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
@@ -1124,10 +1119,23 @@ app.post("/voice", async (req, res) => {
           break;
         }
 
-        const d = new Date(`${session.dateISO}T00:00:00`);
-        session.durationMinutes = getDurationMinutes(session.people, d);
+        // Promo eligibility computed here (final step)
+        const dayOk = isPromoEligibleByDay(session.dateISO);
+        session.promoEligible = dayOk && !hasNoPromo;
 
-        const lockedSet = await getLockedTables(calendar, session.dateISO);
+        // If user selected promo but not eligible, we keep it but it's "da verificare" (and we record that in Calendar/WA)
+        // Table lock + allocation
+        let lockedSet;
+        try {
+          lockedSet = await getLockedTables(calendar, session.dateISO);
+        } catch (err) {
+          console.error("[CALENDAR] getLockedTables error:", err);
+          sayIt(vr, "Mi dispiace, al momento non riesco a verificare la disponibilità dei tavoli. Ti passo un operatore.");
+          if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
+          sayIt(vr, "Puoi richiamare più tardi. Grazie.");
+          break;
+        }
+
         const chosen = allocateTable({
           area: session.area,
           people: session.people,
@@ -1144,18 +1152,6 @@ app.post("/voice", async (req, res) => {
         session.tableDisplayId = chosen.displayId;
         session.tableLocks = chosen.locks;
         session.tableNotes = chosen.notes || null;
-
-        const outsideDisclaimer =
-          session.area === "outside"
-            ? "Tavolo esterno: in caso di maltempo non è garantito il posto all'interno."
-            : null;
-
-        // Preorder price text (if any)
-        let preorderPriceText = null;
-        if (session.preorderChoiceKey) {
-          const opt = getPreorderOptionByKey(session.preorderChoiceKey);
-          if (opt && typeof opt.priceEUR === "number") preorderPriceText = `${opt.priceEUR} €`;
-        }
 
         // Create Calendar Event (idempotent)
         let calResult;
@@ -1189,7 +1185,7 @@ app.post("/voice", async (req, res) => {
           break;
         }
 
-        // WhatsApp ONLY if autoConfirm is true AND calendar ok
+        // WhatsApp ONLY if autoConfirm is true AND calendar succeeded
         if (session.autoConfirm) {
           try {
             await sendWhatsAppConfirmation({
@@ -1209,31 +1205,23 @@ app.post("/voice", async (req, res) => {
             });
           } catch (e) {
             console.error("[WHATSAPP] send error:", e);
-            // Don't fail the call: calendar is created already.
           }
         }
 
         // Final voice confirmation
         if (session.autoConfirm) {
           let extra = "";
-          if (session.area === "outside") {
-            extra = " Ti ricordo che all'esterno in caso di maltempo non è garantito il posto dentro.";
-          }
+          if (session.area === "outside") extra = " Ti ricordo che all'esterno in caso di maltempo non è garantito il posto dentro.";
 
           let preorderVoice = "";
-          if (session.preorderLabel) {
-            preorderVoice = ` Ho segnato il preordine: ${session.preorderLabel}.`;
-          }
+          if (session.preorderLabel) preorderVoice = ` Ho segnato il preordine: ${session.preorderLabel}.`;
 
           sayIt(
             vr,
             `Perfetto ${session.name}. Ho registrato la prenotazione per ${session.people} persone il ${session.dateISO} alle ${session.time24}, tavolo ${session.tableDisplayId}.${preorderVoice}${extra} Ti ho inviato conferma su WhatsApp. A presto!`
           );
         } else {
-          sayIt(
-            vr,
-            `Perfetto ${session.name}. Ho registrato la richiesta. Un operatore la confermerà appena possibile. Grazie e a presto!`
-          );
+          sayIt(vr, `Perfetto ${session.name}. Ho registrato la richiesta. Un operatore la confermerà appena possibile. Grazie e a presto!`);
         }
 
         vr.hangup();
