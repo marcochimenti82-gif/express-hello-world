@@ -60,7 +60,7 @@ const PROMPTS = {
       "Ti dico la verità: per {{partySize}} persone a quell’orario siamo al completo. Se vuoi, proviamo un altro orario o un altro giorno."
   },
 
-  // STEP 6 — Raccolta dettagli allergie/richieste (senza ripetere la domanda lunga)
+  // STEP 6 — Raccolta dettagli allergie/richieste
   step6_collect_notes: {
     main: "Dimmi pure cosa devo segnalare.",
     short: "Cosa devo segnare?",
@@ -69,7 +69,7 @@ const PROMPTS = {
     noneClose: "Perfetto, tutto ok."
   },
 
-  // STEP 7 — WhatsApp (qui, non prima)
+  // STEP 7 — WhatsApp
   step7_whatsapp_number: {
     main: "Mi lasci un numero WhatsApp? Ti mando lì la conferma.",
     short: "Un numero WhatsApp, per favore.",
@@ -97,7 +97,7 @@ const PROMPTS = {
       "È una disponibilità un po’ stretta, ma ci stiamo dentro. Se confermi, blocco subito."
   },
 
-  // STEP 9A — Successo + WhatsApp
+  // STEP 9A — Successo
   step9_success: {
     main: "Perfetto, la prenotazione è confermata. Tra poco ricevi un messaggio WhatsApp con tutti i dettagli. Ti aspettiamo da TuttiBrilli.",
     short: "Fatto. Ti arriva subito la conferma su WhatsApp.",
@@ -105,7 +105,7 @@ const PROMPTS = {
     goodbye: "A presto, buona serata."
   },
 
-  // STEP 9B — Problemi => trasferimento operatore (SEMPRE)
+  // STEP 9B — Fallback operatore
   step9_fallback_transfer_operator: {
     main: "Un attimo solo, così ti seguiamo al meglio. Ti passo subito un collega.",
     short: "Ti metto in contatto con un collega.",
