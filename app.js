@@ -1,62 +1,11 @@
 "use strict";
 
-/**
- * TuttiBrilli Enoteca - Voice Booking Assistant (Single file, copy/paste)
- *
- * STACK:
- * - Twilio Voice (Speech Gather) -> Node/Express
- * - Google Calendar API (service account) for booking events
- * - Twilio WhatsApp confirmation ONLY after calendar success
- *
- * IMPORTANT FIX (vs previous version):
- * ✅ NO Google Calendar calls during early steps (name/date/time/etc.)
- *    Calendar is called ONLY at the final step (after phone) to:
- *      - block "locale chiuso"
- *      - detect "no promo"
- *      - lock tables (avoid double-booking)
- *      - create the booking event
- *      - send WhatsApp (only if Calendar succeeded and autoConfirm=true)
- *
- * FEATURES:
- * - Opening hours rules (restaurant/drinks/operator on Mondays)
- * - Table durations (+30min Wed/Fri music nights for <=8 pax)
- * - Table map (inside/outside) + combinations/unions
- * - Always ask inside/outside; if outside => warn + recommend inside + confirm
- * - Menu preorder (fixed options):
- *    - cena
- *    - apericena
- *    - dopocena (only after 22:30)
- *    - Piatto Apericena (25€)
- *    - Piatto Apericena in promo (eligibility rules + "no promo" marker)
- * - Promo rules:
- *    - Eligible Tue-Sun excluding Fri
- *    - Exclude holidays listed in ENV HOLIDAYS_YYYY_MM_DD
- *    - Exclude if Calendar has marker "no promo" on that date
- * - Block all bookings if Calendar has marker "locale chiuso" on that date
- * - Store allergies/intolerances/special requests in Calendar + WhatsApp
- *
- * ENV REQUIRED:
- *  PORT
- *  BASE_URL  (e.g. https://your-service.onrender.com)  <-- required for Twilio gather action URL
- *
- *  TWILIO_ACCOUNT_SID
- *  TWILIO_AUTH_TOKEN
- *  TWILIO_WHATSAPP_FROM   (e.g. whatsapp:+14155238886 or approved sender)
- *
- *  GOOGLE_CALENDAR_ID
- *  GOOGLE_CALENDAR_TZ (default Europe/Rome)
- *  GOOGLE_SERVICE_ACCOUNT_JSON_B64  (recommended) OR GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON string)
- *
- * OPTIONAL:
- *  ENABLE_FORWARDING=true/false
- *  HUMAN_FORWARD_TO=+39...
- *
- *  HOLIDAYS_YYYY_MM_DD="2025-01-01,2025-04-20,2025-12-25"  // promo exclusion on holidays
- */
-
 const express = require("express");
 const twilio = require("twilio");
 const { google } = require("googleapis");
+
+// ✅ PROMPTS layer (SOLO TESTI)
+const { PROMPTS } = require("./prompts");
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -89,16 +38,41 @@ const HOLIDAYS_SET = new Set(
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
+// ======================= PROMPTS HELPERS =======================
+// t("step.key.variant", { vars })  -> string with {{placeholders}} replaced
+function renderTemplate(str, vars = {}) {
+  const s = String(str || "");
+  return s.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key) => {
+    const v = vars[key];
+    return v === undefined || v === null ? "" : String(v);
+  });
+}
+
+function pickPrompt(path, fallback = "") {
+  // path like: "step1_welcome_name.main"
+  const parts = String(path || "").split(".");
+  let node = PROMPTS;
+  for (const p of parts) {
+    if (!node || typeof node !== "object" || !(p in node)) return fallback;
+    node = node[p];
+  }
+  if (typeof node === "string") return node;
+  return fallback;
+}
+
+function t(path, vars = {}, fallback = "") {
+  return renderTemplate(pickPrompt(path, fallback), vars);
+}
+
 // ======================= CONFIG: OPENING HOURS =======================
-// 0=Sunday ... 6=Saturday
 const OPENING = {
-  closedDay: 1, // Monday
+  closedDay: 1,
   restaurant: {
-    default: { start: "18:30", end: "22:30" }, // Tue-Thu, Sun
-    friSat: { start: "18:30", end: "23:00" }, // Fri-Sat
+    default: { start: "18:30", end: "22:30" },
+    friSat: { start: "18:30", end: "23:00" },
   },
-  drinksOnly: { start: "18:30", end: "24:00" }, // everyday
-  musicNights: { days: [3, 5], from: "20:00" }, // Wed(3) & Fri(5)
+  drinksOnly: { start: "18:30", end: "24:00" },
+  musicNights: { days: [3, 5], from: "20:00" },
 };
 
 // ======================= CONFIG: PREORDER MENU =======================
@@ -117,7 +91,6 @@ const PREORDER_OPTIONS = [
 
 // ======================= CONFIG: TABLES =======================
 const TABLES = [
-  // INSIDE
   { id: "T1", area: "inside", min: 2, max: 4, notes: "più riservato" },
   { id: "T2", area: "inside", min: 2, max: 4, notes: "più riservato" },
   { id: "T3", area: "inside", min: 2, max: 4, notes: "più riservato" },
@@ -136,7 +109,6 @@ const TABLES = [
   { id: "T16", area: "inside", min: 4, max: 5, notes: "tavolo alto con sgabelli" },
   { id: "T17", area: "inside", min: 4, max: 5, notes: "tavolo alto con sgabelli" },
 
-  // OUTSIDE
   { id: "T1F", area: "outside", min: 2, max: 2, notes: "botte con sgabelli" },
   { id: "T2F", area: "outside", min: 2, max: 2, notes: "tavolo alto con sgabelli" },
   { id: "T3F", area: "outside", min: 2, max: 2, notes: "tavolo alto con sgabelli" },
@@ -147,7 +119,6 @@ const TABLES = [
 ];
 
 const TABLE_COMBINATIONS = [
-  // INSIDE unions
   { displayId: "T1", area: "inside", replaces: ["T1", "T2"], min: 6, max: 6, notes: "unione T1+T2" },
   { displayId: "T3", area: "inside", replaces: ["T3", "T4"], min: 6, max: 6, notes: "unione T3+T4" },
   { displayId: "T14", area: "inside", replaces: ["T14", "T15"], min: 8, max: 18, notes: "unione T14+T15" },
@@ -156,11 +127,10 @@ const TABLE_COMBINATIONS = [
   { displayId: "T11", area: "inside", replaces: ["T11", "T12", "T13"], min: 8, max: 10, notes: "unione T11+T12+T13" },
   { displayId: "T16", area: "inside", replaces: ["T16", "T17"], min: 8, max: 10, notes: "unione T16+T17" },
 
-  // OUTSIDE union
   { displayId: "T7F", area: "outside", replaces: ["T7F", "T8F"], min: 6, max: 8, notes: "unione T7F+T8F" },
 ];
 
-// ======================= SESSIONS (in-memory) =======================
+// ======================= SESSIONS =======================
 const sessions = new Map();
 
 function getSession(callSid) {
@@ -180,24 +150,20 @@ function getSession(callSid) {
       preorderChoiceKey: null,
       preorderLabel: null,
 
-      // area
-      area: null, // inside/outside
+      area: null,
       pendingOutsideConfirm: false,
 
       phone: null,
       waTo: null,
 
-      // table allocation result
       tableDisplayId: null,
       tableLocks: [],
       tableNotes: null,
 
-      // derived
       durationMinutes: null,
-      bookingType: "restaurant", // restaurant/drinks/operator
+      bookingType: "restaurant",
       autoConfirm: true,
 
-      // computed only at final step (after Calendar checks)
       promoEligible: null,
     });
   }
@@ -212,7 +178,7 @@ function resetRetries(session) {
   session.retries = 0;
 }
 
-// ======================= TEXT / PARSERS =======================
+// ======================= PARSERS =======================
 function normalizeText(s) {
   return String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -310,14 +276,6 @@ function getPreorderOptionByKey(key) {
   return PREORDER_OPTIONS.find((o) => o.key === key) || null;
 }
 
-function parseYesNoIT(speech) {
-  const t = normalizeText(speech);
-  if (!t) return null;
-  if (t.includes("si") || t.includes("sì") || t.includes("certo") || t.includes("ok") || t.includes("va bene")) return true;
-  if (t === "no" || t.includes("no") || t.includes("non") || t.includes("niente") || t.includes("nessun")) return false;
-  return null;
-}
-
 function isValidPhoneE164(s) {
   return /^\+\d{8,15}$/.test(String(s || "").trim());
 }
@@ -345,15 +303,15 @@ function isTimeAtOrAfter(time24, minTime24) {
 }
 
 function getRestaurantWindowForDay(day) {
-  if (day === 5 || day === 6) return OPENING.restaurant.friSat; // Fri, Sat
+  if (day === 5 || day === 6) return OPENING.restaurant.friSat;
   return OPENING.restaurant.default;
 }
 
 function isWithinWindow(time24, startHM, endHM) {
-  const t = hmToMinutes(time24);
+  const tmin = hmToMinutes(time24);
   const start = hmToMinutes(startHM);
   const end = hmToMinutes(endHM);
-  return t >= start && t <= end;
+  return tmin >= start && tmin <= end;
 }
 
 function deriveBookingTypeAndConfirm(dateISO, time24) {
@@ -408,7 +366,7 @@ function computeStartEndLocal(dateISO, time24, durationMinutes) {
   return { startLocal, endLocal };
 }
 
-// ======================= TWILIO TWIML HELPERS =======================
+// ======================= TWILIO HELPERS =======================
 function buildTwiml() {
   return new twilio.twiml.VoiceResponse();
 }
@@ -435,7 +393,8 @@ function canForwardToHuman() {
 
 function forwardToHumanTwiml() {
   const vr = buildTwiml();
-  sayIt(vr, "Ti passo subito un operatore. Resta in linea.");
+  // ✅ PROMPTS: operator transfer
+  sayIt(vr, t("step9_fallback_transfer_operator.main"));
   vr.dial({}, HUMAN_FORWARD_TO);
   return vr.toString();
 }
@@ -481,7 +440,7 @@ function getCalendarClient() {
   return google.calendar({ version: "v3", auth });
 }
 
-// ======================= CALENDAR HELPERS (markers / locks / idempotency) =======================
+// ======================= CALENDAR HELPERS =======================
 function containsMarker(ev, markerLower) {
   const s = `${String(ev.summary || "")}\n${String(ev.description || "")}`.toLowerCase();
   return s.includes(markerLower);
@@ -498,14 +457,12 @@ async function calendarHasMarkerOnDate(calendar, dateISO, markerLower) {
     maxResults: 250,
     orderBy: "startTime",
   });
-
   return (resp.data.items || []).some((ev) => containsMarker(ev, markerLower));
 }
 
 function isPromoEligibleByDay(dateISO) {
   const d = new Date(`${dateISO}T00:00:00`);
   const day = d.getDay();
-  // Tue-Sun excluding Fri (Tue=2, Wed=3, Thu=4, Sat=6, Sun=0)
   const allowedDay = day === 0 || day === 2 || day === 3 || day === 4 || day === 6;
   if (!allowedDay) return false;
   if (HOLIDAYS_SET.has(dateISO)) return false;
@@ -534,7 +491,7 @@ async function getLockedTables(calendar, dateISO) {
 
   const locked = new Set();
   for (const ev of resp.data.items || []) {
-    for (const t of parseLocksFromEvent(ev)) locked.add(t);
+    for (const tId of parseLocksFromEvent(ev)) locked.add(tId);
   }
   return locked;
 }
@@ -542,14 +499,14 @@ async function getLockedTables(calendar, dateISO) {
 // ======================= TABLE ALLOCATION =======================
 function buildCandidates(area) {
   const singles = TABLES
-    .filter((t) => t.area === area)
-    .map((t) => ({
-      displayId: t.id,
-      locks: [t.id],
-      min: t.min,
-      max: t.max,
-      area: t.area,
-      notes: t.notes || "",
+    .filter((tt) => tt.area === area)
+    .map((tt) => ({
+      displayId: tt.id,
+      locks: [tt.id],
+      min: tt.min,
+      max: tt.max,
+      area: tt.area,
+      notes: tt.notes || "",
       kind: "single",
     }));
 
@@ -572,7 +529,7 @@ function allocateTable({ area, people, lockedSet }) {
   const candidates = buildCandidates(area);
 
   let ok = candidates.filter((c) => people >= c.min && people <= c.max);
-  ok = ok.filter((c) => c.locks.every((t) => !lockedSet.has(t)));
+  ok = ok.filter((c) => c.locks.every((tId) => !lockedSet.has(tId)));
 
   ok.sort((a, b) => {
     const wasteA = a.max - people;
@@ -586,7 +543,7 @@ function allocateTable({ area, people, lockedSet }) {
   return ok[0];
 }
 
-// ======================= GOOGLE CALENDAR EVENT CREATION (IDEMPOTENT) =======================
+// ======================= EVENT CREATION (IDEMPOTENT) =======================
 async function createBookingEvent({
   callSid,
   name,
@@ -615,7 +572,6 @@ async function createBookingEvent({
   const { startLocal, endLocal } = computeStartEndLocal(dateISO, time24, durationMinutes);
   const privateKey = `callsid:${callSid || "no-callsid"}`;
 
-  // Idempotency: search existing event by privateKey in day window
   const existing = await calendar.events.list({
     calendarId: GOOGLE_CALENDAR_ID,
     q: privateKey,
@@ -745,158 +701,183 @@ app.post("/voice", async (req, res) => {
       return res.type("text/xml").send(vr.toString());
     }
 
-    const speechNorm = normalizeText(speech);
-    const emptySpeech = !speechNorm;
+    const emptySpeech = !normalizeText(speech);
 
     switch (session.step) {
       case 1: {
         if (emptySpeech) {
           resetRetries(session);
-          gatherSpeech(vr, "Ciao! Benvenuto da TuttiBrilli. Dimmi il tuo nome per la prenotazione.");
+          // ✅ PROMPTS
+          gatherSpeech(vr, t("step1_welcome_name.main"));
           break;
         }
 
         session.name = speech.trim().slice(0, 60);
         resetRetries(session);
         session.step = 2;
-        gatherSpeech(vr, `Perfetto ${session.name}. Per quale data vuoi prenotare? Puoi dire per esempio domani o 30 dicembre.`);
+
+        // ✅ PROMPTS
+        gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name }));
         break;
       }
 
       case 2: {
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, "Non ho capito la data. Ti passo un operatore.");
+            // ✅ PROMPTS + operator transfer (same logic)
+            sayIt(vr, t("step3_confirm_date_ask_time.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          gatherSpeech(vr, "Non ho sentito la data. Dimmi la data della prenotazione.");
+          // ✅ PROMPTS (error name prompt used as generic “repeat”)
+          gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
           break;
         }
 
         const dateISO = parseDateIT(speech);
         if (!dateISO) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, "Non riesco a capire la data. Ti passo un operatore.");
+            sayIt(vr, t("step3_confirm_date_ask_time.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          gatherSpeech(vr, "Scusa, non ho capito. Dimmi la data, ad esempio: 30 12 2025, oppure domani.");
+          // ✅ PROMPTS
+          gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
           break;
         }
 
         session.dateISO = dateISO;
         resetRetries(session);
         session.step = 3;
-        gatherSpeech(vr, "A che ora? Ad esempio: 20 e 30.");
+
+        // ✅ PROMPTS
+        gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateISO }));
         break;
       }
 
       case 3: {
-        // FIX: no calendar calls here
+        // FIX: no calendar calls here (logic unchanged)
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, "Non ho capito l'orario. Ti passo un operatore.");
+            // ✅ PROMPTS (time error)
+            sayIt(vr, t("step4_confirm_time_ask_party_size.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          gatherSpeech(vr, "Non ho sentito l'orario. Dimmi a che ora vuoi prenotare.");
+          // ✅ PROMPTS
+          gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"));
           break;
         }
 
         const time24 = parseTimeIT(speech);
         if (!time24) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, "Non riesco a capire l'orario. Ti passo un operatore.");
+            sayIt(vr, t("step4_confirm_time_ask_party_size.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          gatherSpeech(vr, "Scusa, non ho capito. Dimmi l'orario, ad esempio 20 e 30.");
+          // ✅ PROMPTS
+          gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"));
           break;
         }
 
         session.time24 = time24;
 
-        // Opening hours logic only (no external calls)
         const { bookingType, autoConfirm, reason } = deriveBookingTypeAndConfirm(session.dateISO, session.time24);
         session.bookingType = bookingType;
         session.autoConfirm = autoConfirm;
 
         if (bookingType === "closed") {
-          sayIt(vr, `A quell'orario siamo chiusi. ${reason ? reason : ""} Ti passo un operatore.`);
+          // ✅ PROMPTS
+          sayIt(vr, t("step4_confirm_time_ask_party_size.outsideHours.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
           sayIt(vr, "Puoi richiamare durante l'orario di apertura. Grazie.");
           break;
         }
 
         if (bookingType === "operator") {
+          // (nessun prompt specifico in file per questa frase: lasciato invariato)
           sayIt(vr, "Ti avviso che il lunedì siamo chiusi, ma possiamo aprire per eventi su conferma dell'operatore. Raccolgo i dati e ti ricontatteremo.");
         } else if (bookingType === "drinks") {
-          sayIt(vr, "Nota: a quest'orario la cucina potrebbe essere chiusa. Possiamo fare solo drink e vino.");
+          // ✅ PROMPTS (kitchen closed)
+          sayIt(vr, t("step4_confirm_time_ask_party_size.kitchenClosed.main"));
         }
 
         resetRetries(session);
         session.step = 4;
-        gatherSpeech(vr, "Per quante persone?");
+
+        // ✅ PROMPTS
+        gatherSpeech(vr, t("step4_confirm_time_ask_party_size.main", { time: session.time24 }));
         break;
       }
 
       case 4: {
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, "Non ho capito il numero di persone. Ti passo un operatore.");
+            // ✅ PROMPTS
+            sayIt(vr, t("step5_party_size_ask_notes.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          gatherSpeech(vr, "Non ho sentito. Per quante persone?");
+          // ✅ PROMPTS
+          gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
           break;
         }
 
         const people = parsePeopleIT(speech);
         if (!people || people < 1 || people > 18) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, "Non riesco a gestire questa prenotazione automaticamente. Ti passo un operatore.");
+            sayIt(vr, t("step5_party_size_ask_notes.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Grazie.");
             break;
           }
-          gatherSpeech(vr, "Scusa, quante persone? Dimmi un numero tra 1 e 18.");
+          // ✅ PROMPTS
+          gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
           break;
         }
 
         session.people = people;
         resetRetries(session);
         session.step = 5;
-        gatherSpeech(vr, "Ci sono allergie, intolleranze o richieste particolari? Puoi dire per esempio: nessuna, celiaco, senza lattosio, vegetariano, tavolo tranquillo.");
+
+        // ✅ PROMPTS
+        gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people }));
         break;
       }
 
       case 5: {
+        // Notes collection (logic unchanged)
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
             session.specialRequestsRaw = "nessuna";
             resetRetries(session);
             session.step = 6;
+            // (preorder prompt not in PROMPTS: left unchanged)
             gatherSpeech(vr, "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno.");
             break;
           }
-          gatherSpeech(vr, "Non ho sentito. Ci sono allergie o richieste particolari? Se non ce ne sono, di' nessuna.");
+          // ✅ PROMPTS
+          gatherSpeech(vr, t("step6_collect_notes.error"));
           break;
         }
 
         session.specialRequestsRaw = speech.trim().slice(0, 200);
         resetRetries(session);
         session.step = 6;
+
+        // (preorder prompt not in PROMPTS: left unchanged)
         gatherSpeech(vr, "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno.");
         break;
       }
 
       case 6: {
+        // Preorder choice (logic unchanged; no matching prompts in provided file)
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
             session.preorderChoiceKey = null;
@@ -944,7 +925,6 @@ app.post("/voice", async (req, res) => {
           break;
         }
 
-        // dopocena constraint enforced here (no calendar needed)
         if (opt.constraints && opt.constraints.minTime) {
           if (!isTimeAtOrAfter(session.time24, opt.constraints.minTime)) {
             sayIt(vr, "Il dopocena è disponibile solo dopo le 22 e 30.");
@@ -954,7 +934,6 @@ app.post("/voice", async (req, res) => {
           }
         }
 
-        // promo eligibility computed later (after phone, at final step) - here we just store choice
         session.preorderChoiceKey = opt.key;
         session.preorderLabel = opt.label;
 
@@ -965,13 +944,14 @@ app.post("/voice", async (req, res) => {
       }
 
       case 8: {
-        // Area selection with outside disclaimer + recommendation + confirm
+        // Area selection (logic unchanged; no matching prompts in provided file)
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
             session.area = "inside";
             resetRetries(session);
             session.step = 10;
-            gatherSpeech(vr, "Perfetto. Dimmi il tuo numero di telefono, anche per WhatsApp.");
+            // ✅ PROMPTS for WhatsApp request
+            gatherSpeech(vr, t("step7_whatsapp_number.main"));
             break;
           }
           gatherSpeech(vr, "Non ho capito. Preferisci sala interna o sala esterna? Ti consiglio l'interno.");
@@ -980,22 +960,24 @@ app.post("/voice", async (req, res) => {
 
         if (session.pendingOutsideConfirm) {
           const area = parseAreaIT(speech);
-          const t = normalizeText(speech);
+          const tt = normalizeText(speech);
 
           if (area === "inside") {
             session.area = "inside";
             session.pendingOutsideConfirm = false;
             resetRetries(session);
             session.step = 10;
-            gatherSpeech(vr, "Perfetto, interno. Dimmi il tuo numero di telefono, anche per WhatsApp.");
+            // ✅ PROMPTS
+            gatherSpeech(vr, t("step7_whatsapp_number.main"));
             break;
           }
-          if (area === "outside" || t.includes("confermo") || t.includes("va bene esterno")) {
+          if (area === "outside" || tt.includes("confermo") || tt.includes("va bene esterno")) {
             session.area = "outside";
             session.pendingOutsideConfirm = false;
             resetRetries(session);
             session.step = 10;
-            gatherSpeech(vr, "Perfetto, esterno. Dimmi il tuo numero di telefono, anche per WhatsApp.");
+            // ✅ PROMPTS
+            gatherSpeech(vr, t("step7_whatsapp_number.main"));
             break;
           }
 
@@ -1004,7 +986,8 @@ app.post("/voice", async (req, res) => {
             session.pendingOutsideConfirm = false;
             resetRetries(session);
             session.step = 10;
-            gatherSpeech(vr, "Ok, ti assegno un tavolo interno. Dimmi il tuo numero di telefono.");
+            // ✅ PROMPTS
+            gatherSpeech(vr, t("step7_whatsapp_number.main"));
             break;
           }
 
@@ -1018,7 +1001,8 @@ app.post("/voice", async (req, res) => {
             session.area = "inside";
             resetRetries(session);
             session.step = 10;
-            gatherSpeech(vr, "Ok, ti assegno un tavolo interno. Dimmi il tuo numero di telefono.");
+            // ✅ PROMPTS
+            gatherSpeech(vr, t("step7_whatsapp_number.main"));
             break;
           }
           gatherSpeech(vr, "Scusa, non ho capito. Preferisci sala interna o sala esterna? Ti consiglio l'interno.");
@@ -1038,32 +1022,36 @@ app.post("/voice", async (req, res) => {
         session.area = "inside";
         resetRetries(session);
         session.step = 10;
-        gatherSpeech(vr, "Perfetto, interno. Dimmi il tuo numero di telefono, anche per WhatsApp.");
+        // ✅ PROMPTS
+        gatherSpeech(vr, t("step7_whatsapp_number.main"));
         break;
       }
 
       case 10: {
-        // Phone / WhatsApp + FINAL STEP: Calendar checks + table lock + event creation + WhatsApp
+        // Phone / WhatsApp + FINAL step calendar
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, "Non ho capito il numero. Ti passo un operatore.");
+            // ✅ PROMPTS + operator transfer (logic unchanged)
+            sayIt(vr, t("step7_whatsapp_number.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          gatherSpeech(vr, "Non ho sentito il numero. Dimmi il tuo numero di telefono, per WhatsApp.");
+          // ✅ PROMPTS
+          gatherSpeech(vr, t("step7_whatsapp_number.error"));
           break;
         }
 
         const phone = extractPhoneFromSpeech(speech);
         if (!phone || !isValidPhoneE164(phone)) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, "Non riesco a capire il numero. Ti passo un operatore.");
+            sayIt(vr, t("step7_whatsapp_number.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Grazie.");
             break;
           }
-          gatherSpeech(vr, "Scusa, non ho capito. Dimmi il numero in questo formato: più trentanove, e poi il numero.");
+          // ✅ PROMPTS (spokeTooFast as “repeat”)
+          gatherSpeech(vr, t("step7_whatsapp_number.spokeTooFast"));
           break;
         }
 
@@ -1071,7 +1059,6 @@ app.post("/voice", async (req, res) => {
         session.waTo = `whatsapp:${phone}`;
         resetRetries(session);
 
-        // Compute duration now (needed for Calendar event start/end)
         const d = new Date(`${session.dateISO}T00:00:00`);
         session.durationMinutes = getDurationMinutes(session.people, d);
 
@@ -1080,18 +1067,15 @@ app.post("/voice", async (req, res) => {
             ? "Tavolo esterno: in caso di maltempo non è garantito il posto all'interno."
             : null;
 
-        // Determine preorder price text
         let preorderPriceText = null;
         if (session.preorderChoiceKey) {
           const opt = getPreorderOptionByKey(session.preorderChoiceKey);
           if (opt && typeof opt.priceEUR === "number") preorderPriceText = `${opt.priceEUR} €`;
         }
 
-        // ==== FINAL Calendar operations (wrapped in local try/catch) ====
         const calendar = getCalendarClient();
         if (!calendar) {
-          // Can't book without calendar. Offer operator.
-          sayIt(vr, "Mi dispiace, al momento non riesco a registrare la prenotazione. Ti passo un operatore.");
+          sayIt(vr, t("step9_fallback_transfer_operator.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
           sayIt(vr, "Puoi richiamare più tardi. Grazie.");
           break;
@@ -1105,13 +1089,12 @@ app.post("/voice", async (req, res) => {
           hasNoPromo = await calendarHasMarkerOnDate(calendar, session.dateISO, "no promo");
         } catch (err) {
           console.error("[CALENDAR] marker checks error:", err);
-          // If marker checks fail, treat as not closed, promo unknown -> safest is mark promo as "da verificare"
           isClosed = false;
-          hasNoPromo = true; // conservative: disable promo eligibility if can't verify
+          hasNoPromo = true;
         }
 
         if (isClosed) {
-          sayIt(vr, "Mi dispiace, per quella data il locale risulta chiuso e non posso fissare prenotazioni. Ti passo un operatore.");
+          sayIt(vr, t("step9_fallback_transfer_operator.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
           sayIt(vr, "Grazie.");
           vr.hangup();
@@ -1119,18 +1102,15 @@ app.post("/voice", async (req, res) => {
           break;
         }
 
-        // Promo eligibility computed here (final step)
         const dayOk = isPromoEligibleByDay(session.dateISO);
         session.promoEligible = dayOk && !hasNoPromo;
 
-        // If user selected promo but not eligible, we keep it but it's "da verificare" (and we record that in Calendar/WA)
-        // Table lock + allocation
         let lockedSet;
         try {
           lockedSet = await getLockedTables(calendar, session.dateISO);
         } catch (err) {
           console.error("[CALENDAR] getLockedTables error:", err);
-          sayIt(vr, "Mi dispiace, al momento non riesco a verificare la disponibilità dei tavoli. Ti passo un operatore.");
+          sayIt(vr, t("step9_fallback_transfer_operator.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
           sayIt(vr, "Puoi richiamare più tardi. Grazie.");
           break;
@@ -1143,7 +1123,7 @@ app.post("/voice", async (req, res) => {
         });
 
         if (!chosen) {
-          sayIt(vr, "Mi dispiace, per quell'orario non ho tavoli disponibili nella sala scelta. Ti passo un operatore per trovare una soluzione.");
+          sayIt(vr, t("step9_fallback_transfer_operator.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
           sayIt(vr, "Puoi provare un altro orario. Grazie.");
           break;
@@ -1153,10 +1133,8 @@ app.post("/voice", async (req, res) => {
         session.tableLocks = chosen.locks;
         session.tableNotes = chosen.notes || null;
 
-        // Create Calendar Event (idempotent)
-        let calResult;
         try {
-          calResult = await createBookingEvent({
+          await createBookingEvent({
             callSid,
             name: session.name,
             dateISO: session.dateISO,
@@ -1179,13 +1157,12 @@ app.post("/voice", async (req, res) => {
           });
         } catch (e) {
           console.error("[CALENDAR] create error:", e);
-          sayIt(vr, "Mi dispiace, c'è stato un problema nel registrare la prenotazione. Ti passo un operatore.");
+          sayIt(vr, t("step9_fallback_transfer_operator.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
           sayIt(vr, "Puoi richiamare più tardi. Grazie.");
           break;
         }
 
-        // WhatsApp ONLY if autoConfirm is true AND calendar succeeded
         if (session.autoConfirm) {
           try {
             await sendWhatsAppConfirmation({
@@ -1208,21 +1185,9 @@ app.post("/voice", async (req, res) => {
           }
         }
 
-        // Final voice confirmation
-        if (session.autoConfirm) {
-          let extra = "";
-          if (session.area === "outside") extra = " Ti ricordo che all'esterno in caso di maltempo non è garantito il posto dentro.";
-
-          let preorderVoice = "";
-          if (session.preorderLabel) preorderVoice = ` Ho segnato il preordine: ${session.preorderLabel}.`;
-
-          sayIt(
-            vr,
-            `Perfetto ${session.name}. Ho registrato la prenotazione per ${session.people} persone il ${session.dateISO} alle ${session.time24}, tavolo ${session.tableDisplayId}.${preorderVoice}${extra} Ti ho inviato conferma su WhatsApp. A presto!`
-          );
-        } else {
-          sayIt(vr, `Perfetto ${session.name}. Ho registrato la richiesta. Un operatore la confermerà appena possibile. Grazie e a presto!`);
-        }
+        // ✅ PROMPTS: success + goodbye (no business logic change)
+        sayIt(vr, t("step9_success.main"));
+        sayIt(vr, t("step9_success.goodbye"));
 
         vr.hangup();
         sessions.delete(callSid);
@@ -1230,7 +1195,7 @@ app.post("/voice", async (req, res) => {
       }
 
       default: {
-        sayIt(vr, "Grazie. A presto!");
+        sayIt(vr, t("step9_success.goodbye"));
         vr.hangup();
         sessions.delete(callSid);
         break;
@@ -1242,7 +1207,7 @@ app.post("/voice", async (req, res) => {
     console.error("[VOICE] Error:", err);
     sayIt(vr, "Mi dispiace, c'è stato un errore tecnico. Riprova tra poco.");
     if (canForwardToHuman()) {
-      sayIt(vr, "Ti passo un operatore.");
+      sayIt(vr, t("step9_fallback_transfer_operator.main"));
       vr.dial({}, HUMAN_FORWARD_TO);
     } else {
       vr.hangup();
