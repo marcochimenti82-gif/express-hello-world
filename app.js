@@ -3,8 +3,6 @@
 const express = require("express");
 const twilio = require("twilio");
 const { google } = require("googleapis");
-
-// ✅ PROMPTS layer (SOLO TESTI)
 const { PROMPTS } = require("./prompts");
 
 const app = express();
@@ -29,17 +27,13 @@ const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || "";
 
 const HOLIDAYS_YYYY_MM_DD = process.env.HOLIDAYS_YYYY_MM_DD || "";
 const HOLIDAYS_SET = new Set(
-  HOLIDAYS_YYYY_MM_DD
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
+  HOLIDAYS_YYYY_MM_DD.split(",").map((s) => s.trim()).filter(Boolean)
 );
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
 // ======================= PROMPTS HELPERS =======================
-// t("step.key.variant", { vars })  -> string with {{placeholders}} replaced
 function renderTemplate(str, vars = {}) {
   const s = String(str || "");
   return s.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key) => {
@@ -49,15 +43,13 @@ function renderTemplate(str, vars = {}) {
 }
 
 function pickPrompt(path, fallback = "") {
-  // path like: "step1_welcome_name.main"
   const parts = String(path || "").split(".");
   let node = PROMPTS;
   for (const p of parts) {
     if (!node || typeof node !== "object" || !(p in node)) return fallback;
     node = node[p];
   }
-  if (typeof node === "string") return node;
-  return fallback;
+  return typeof node === "string" ? node : fallback;
 }
 
 function t(path, vars = {}, fallback = "") {
@@ -66,13 +58,13 @@ function t(path, vars = {}, fallback = "") {
 
 // ======================= CONFIG: OPENING HOURS =======================
 const OPENING = {
-  closedDay: 1,
+  closedDay: 1, // Monday
   restaurant: {
-    default: { start: "18:30", end: "22:30" },
-    friSat: { start: "18:30", end: "23:00" },
+    default: { start: "18:30", end: "22:30" }, // Tue-Thu, Sun
+    friSat: { start: "18:30", end: "23:00" }, // Fri-Sat
   },
-  drinksOnly: { start: "18:30", end: "24:00" },
-  musicNights: { days: [3, 5], from: "20:00" },
+  drinksOnly: { start: "18:30", end: "24:00" }, // everyday
+  musicNights: { days: [3, 5], from: "20:00" }, // Wed & Fri
 };
 
 // ======================= CONFIG: PREORDER MENU =======================
@@ -81,16 +73,12 @@ const PREORDER_OPTIONS = [
   { key: "apericena", label: "Apericena", priceEUR: null, constraints: {} },
   { key: "dopocena", label: "Dopocena (dopo le 22:30)", priceEUR: null, constraints: { minTime: "22:30" } },
   { key: "piatto_apericena", label: "Piatto Apericena", priceEUR: 25, constraints: {} },
-  {
-    key: "piatto_apericena_promo",
-    label: "Piatto Apericena in promo (previa registrazione)",
-    priceEUR: null,
-    constraints: { promoOnly: true },
-  },
+  { key: "piatto_apericena_promo", label: "Piatto Apericena in promo (previa registrazione)", priceEUR: null, constraints: { promoOnly: true } },
 ];
 
 // ======================= CONFIG: TABLES =======================
 const TABLES = [
+  // INSIDE
   { id: "T1", area: "inside", min: 2, max: 4, notes: "più riservato" },
   { id: "T2", area: "inside", min: 2, max: 4, notes: "più riservato" },
   { id: "T3", area: "inside", min: 2, max: 4, notes: "più riservato" },
@@ -109,6 +97,7 @@ const TABLES = [
   { id: "T16", area: "inside", min: 4, max: 5, notes: "tavolo alto con sgabelli" },
   { id: "T17", area: "inside", min: 4, max: 5, notes: "tavolo alto con sgabelli" },
 
+  // OUTSIDE
   { id: "T1F", area: "outside", min: 2, max: 2, notes: "botte con sgabelli" },
   { id: "T2F", area: "outside", min: 2, max: 2, notes: "tavolo alto con sgabelli" },
   { id: "T3F", area: "outside", min: 2, max: 2, notes: "tavolo alto con sgabelli" },
@@ -119,6 +108,7 @@ const TABLES = [
 ];
 
 const TABLE_COMBINATIONS = [
+  // INSIDE unions
   { displayId: "T1", area: "inside", replaces: ["T1", "T2"], min: 6, max: 6, notes: "unione T1+T2" },
   { displayId: "T3", area: "inside", replaces: ["T3", "T4"], min: 6, max: 6, notes: "unione T3+T4" },
   { displayId: "T14", area: "inside", replaces: ["T14", "T15"], min: 8, max: 18, notes: "unione T14+T15" },
@@ -127,6 +117,7 @@ const TABLE_COMBINATIONS = [
   { displayId: "T11", area: "inside", replaces: ["T11", "T12", "T13"], min: 8, max: 10, notes: "unione T11+T12+T13" },
   { displayId: "T16", area: "inside", replaces: ["T16", "T17"], min: 8, max: 10, notes: "unione T16+T17" },
 
+  // OUTSIDE union
   { displayId: "T7F", area: "outside", replaces: ["T7F", "T8F"], min: 6, max: 8, notes: "unione T7F+T8F" },
 ];
 
@@ -194,8 +185,21 @@ function nowLocal() {
   return new Date();
 }
 
+/**
+ * ✅ DATE PARSER ENHANCED:
+ * - oggi, domani
+ * - 30/12, 30-12, 30 12 (+ optional year)
+ * - 2025-12-30
+ * - 30 dicembre / martedì 30 dicembre
+ * - questo venerdì / prossimo venerdì / venerdì prossimo / venerdì
+ */
 function parseDateIT(speech) {
-  const t = normalizeText(speech);
+  const t0 = normalizeText(speech);
+  const t = t0
+    .replace(/[,\.]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
   const today = nowLocal();
 
   if (t.includes("oggi")) return toISODate(today);
@@ -204,15 +208,94 @@ function parseDateIT(speech) {
     return toISODate(d);
   }
 
+  // 1) ISO yyyy-mm-dd
   const iso = t.match(/(\d{4})-(\d{2})-(\d{2})/);
   if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
 
+  // 2) dd/mm(/yyyy) or dd-mm(-yyyy)
   const dmY = t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
   if (dmY) {
     let dd = Number(dmY[1]);
     let mm = Number(dmY[2]);
     let yy = dmY[3] ? Number(dmY[3]) : today.getFullYear();
     if (yy < 100) yy += 2000;
+    if (dd >= 1 && dd <= 31 && mm >= 1 && mm <= 12) {
+      const d = new Date(yy, mm - 1, dd);
+      return toISODate(d);
+    }
+  }
+
+  // 3) dd mm (yyyy)  -> es: "30 12" o "30 12 2025"
+  const dmSpace = t.match(/\b(\d{1,2})\s+(\d{1,2})(?:\s+(\d{2,4}))?\b/);
+  if (dmSpace) {
+    let dd = Number(dmSpace[1]);
+    let mm = Number(dmSpace[2]);
+    let yy = dmSpace[3] ? Number(dmSpace[3]) : today.getFullYear();
+    if (yy < 100) yy += 2000;
+    if (dd >= 1 && dd <= 31 && mm >= 1 && mm <= 12) {
+      const d = new Date(yy, mm - 1, dd);
+      return toISODate(d);
+    }
+  }
+
+  // 4) weekday phrases: "questo venerdì", "prossimo venerdì", "venerdì prossimo", "venerdì"
+  const weekdayMap = {
+    domenica: 0,
+    lunedi: 1, "lunedì": 1,
+    martedi: 2, "martedì": 2,
+    mercoledi: 3, "mercoledì": 3,
+    giovedi: 4, "giovedì": 4,
+    venerdi: 5, "venerdì": 5,
+    sabato: 6,
+  };
+
+  const hasQuesto = /\b(questo|questa|sto|sta)\b/.test(t);
+  const hasProssimo = /\b(prossimo|prossima)\b/.test(t);
+  const hasGiornoProssimoPost = /\b(domenica|lunedi|lunedì|martedi|martedì|mercoledi|mercoledì|giovedi|giovedì|venerdi|venerdì|sabato)\s+prossim[oa]\b/.test(t);
+
+  const weekdayMatch = t.match(/\b(domenica|lunedi|lunedì|martedi|martedì|mercoledi|mercoledì|giovedi|giovedì|venerdi|venerdì|sabato)\b/);
+  if (weekdayMatch) {
+    const wdToken = weekdayMatch[1];
+    const target = weekdayMap[wdToken];
+
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const current = d.getDay();
+
+    let diff = (target - current + 7) % 7;
+    const wantsNext = hasProssimo || hasGiornoProssimoPost;
+
+    if (wantsNext) {
+      if (diff === 0) diff = 7;
+      else diff += 7;
+    } else if (hasQuesto) {
+      // allow today if same day; otherwise upcoming (diff ok)
+    } else {
+      // bare weekday -> upcoming occurrence (today if same day)
+    }
+
+    d.setDate(d.getDate() + diff);
+    return toISODate(d);
+  }
+
+  // 5) "30 dicembre" / "martedì 30 dicembre"
+  const months = {
+    gennaio: 1, febbraio: 2, marzo: 3, aprile: 4, maggio: 5, giugno: 6,
+    luglio: 7, agosto: 8, settembre: 9, ottobre: 10, novembre: 11, dicembre: 12,
+  };
+
+  const cleaned = t
+    .replace(/\b(lunedi|lunedì|martedi|martedì|mercoledi|mercoledì|giovedi|giovedì|venerdi|venerdì|sabato|domenica)\b/g, " ")
+    .replace(/\b(questo|questa|prossimo|prossima|il|lo|la|per|di)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const m = cleaned.match(/\b(\d{1,2})\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)(?:\s+(\d{2,4}))?\b/);
+  if (m) {
+    const dd = Number(m[1]);
+    const mm = months[m[2]];
+    let yy = m[3] ? Number(m[3]) : today.getFullYear();
+    if (yy < 100) yy += 2000;
+
     if (dd >= 1 && dd <= 31 && mm >= 1 && mm <= 12) {
       const d = new Date(yy, mm - 1, dd);
       return toISODate(d);
@@ -303,7 +386,7 @@ function isTimeAtOrAfter(time24, minTime24) {
 }
 
 function getRestaurantWindowForDay(day) {
-  if (day === 5 || day === 6) return OPENING.restaurant.friSat;
+  if (day === 5 || day === 6) return OPENING.restaurant.friSat; // Fri, Sat
   return OPENING.restaurant.default;
 }
 
@@ -393,7 +476,6 @@ function canForwardToHuman() {
 
 function forwardToHumanTwiml() {
   const vr = buildTwiml();
-  // ✅ PROMPTS: operator transfer
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
   vr.dial({}, HUMAN_FORWARD_TO);
   return vr.toString();
@@ -463,7 +545,7 @@ async function calendarHasMarkerOnDate(calendar, dateISO, markerLower) {
 function isPromoEligibleByDay(dateISO) {
   const d = new Date(`${dateISO}T00:00:00`);
   const day = d.getDay();
-  const allowedDay = day === 0 || day === 2 || day === 3 || day === 4 || day === 6;
+  const allowedDay = day === 0 || day === 2 || day === 3 || day === 4 || day === 6; // Tue-Sun excl Fri
   if (!allowedDay) return false;
   if (HOLIDAYS_SET.has(dateISO)) return false;
   return true;
@@ -498,29 +580,25 @@ async function getLockedTables(calendar, dateISO) {
 
 // ======================= TABLE ALLOCATION =======================
 function buildCandidates(area) {
-  const singles = TABLES
-    .filter((tt) => tt.area === area)
-    .map((tt) => ({
-      displayId: tt.id,
-      locks: [tt.id],
-      min: tt.min,
-      max: tt.max,
-      area: tt.area,
-      notes: tt.notes || "",
-      kind: "single",
-    }));
+  const singles = TABLES.filter((tt) => tt.area === area).map((tt) => ({
+    displayId: tt.id,
+    locks: [tt.id],
+    min: tt.min,
+    max: tt.max,
+    area: tt.area,
+    notes: tt.notes || "",
+    kind: "single",
+  }));
 
-  const combos = TABLE_COMBINATIONS
-    .filter((c) => c.area === area)
-    .map((c) => ({
-      displayId: c.displayId,
-      locks: c.replaces.slice(),
-      min: c.min,
-      max: c.max,
-      area: c.area,
-      notes: c.notes || "",
-      kind: "combo",
-    }));
+  const combos = TABLE_COMBINATIONS.filter((c) => c.area === area).map((c) => ({
+    displayId: c.displayId,
+    locks: c.replaces.slice(),
+    min: c.min,
+    max: c.max,
+    area: c.area,
+    notes: c.notes || "",
+    kind: "combo",
+  }));
 
   return singles.concat(combos);
 }
@@ -707,7 +785,6 @@ app.post("/voice", async (req, res) => {
       case 1: {
         if (emptySpeech) {
           resetRetries(session);
-          // ✅ PROMPTS
           gatherSpeech(vr, t("step1_welcome_name.main"));
           break;
         }
@@ -715,8 +792,6 @@ app.post("/voice", async (req, res) => {
         session.name = speech.trim().slice(0, 60);
         resetRetries(session);
         session.step = 2;
-
-        // ✅ PROMPTS
         gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name }));
         break;
       }
@@ -724,13 +799,11 @@ app.post("/voice", async (req, res) => {
       case 2: {
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
-            // ✅ PROMPTS + operator transfer (same logic)
             sayIt(vr, t("step3_confirm_date_ask_time.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          // ✅ PROMPTS (error name prompt used as generic “repeat”)
           gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
           break;
         }
@@ -743,7 +816,6 @@ app.post("/voice", async (req, res) => {
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          // ✅ PROMPTS
           gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
           break;
         }
@@ -751,23 +823,18 @@ app.post("/voice", async (req, res) => {
         session.dateISO = dateISO;
         resetRetries(session);
         session.step = 3;
-
-        // ✅ PROMPTS
         gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateISO }));
         break;
       }
 
       case 3: {
-        // FIX: no calendar calls here (logic unchanged)
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
-            // ✅ PROMPTS (time error)
             sayIt(vr, t("step4_confirm_time_ask_party_size.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          // ✅ PROMPTS
           gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"));
           break;
         }
@@ -780,19 +847,17 @@ app.post("/voice", async (req, res) => {
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          // ✅ PROMPTS
           gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"));
           break;
         }
 
         session.time24 = time24;
 
-        const { bookingType, autoConfirm, reason } = deriveBookingTypeAndConfirm(session.dateISO, session.time24);
+        const { bookingType, autoConfirm } = deriveBookingTypeAndConfirm(session.dateISO, session.time24);
         session.bookingType = bookingType;
         session.autoConfirm = autoConfirm;
 
         if (bookingType === "closed") {
-          // ✅ PROMPTS
           sayIt(vr, t("step4_confirm_time_ask_party_size.outsideHours.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
           sayIt(vr, "Puoi richiamare durante l'orario di apertura. Grazie.");
@@ -800,17 +865,13 @@ app.post("/voice", async (req, res) => {
         }
 
         if (bookingType === "operator") {
-          // (nessun prompt specifico in file per questa frase: lasciato invariato)
           sayIt(vr, "Ti avviso che il lunedì siamo chiusi, ma possiamo aprire per eventi su conferma dell'operatore. Raccolgo i dati e ti ricontatteremo.");
         } else if (bookingType === "drinks") {
-          // ✅ PROMPTS (kitchen closed)
           sayIt(vr, t("step4_confirm_time_ask_party_size.kitchenClosed.main"));
         }
 
         resetRetries(session);
         session.step = 4;
-
-        // ✅ PROMPTS
         gatherSpeech(vr, t("step4_confirm_time_ask_party_size.main", { time: session.time24 }));
         break;
       }
@@ -818,13 +879,11 @@ app.post("/voice", async (req, res) => {
       case 4: {
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
-            // ✅ PROMPTS
             sayIt(vr, t("step5_party_size_ask_notes.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          // ✅ PROMPTS
           gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
           break;
         }
@@ -837,7 +896,6 @@ app.post("/voice", async (req, res) => {
             sayIt(vr, "Grazie.");
             break;
           }
-          // ✅ PROMPTS
           gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
           break;
         }
@@ -845,24 +903,19 @@ app.post("/voice", async (req, res) => {
         session.people = people;
         resetRetries(session);
         session.step = 5;
-
-        // ✅ PROMPTS
         gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people }));
         break;
       }
 
       case 5: {
-        // Notes collection (logic unchanged)
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
             session.specialRequestsRaw = "nessuna";
             resetRetries(session);
             session.step = 6;
-            // (preorder prompt not in PROMPTS: left unchanged)
             gatherSpeech(vr, "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno.");
             break;
           }
-          // ✅ PROMPTS
           gatherSpeech(vr, t("step6_collect_notes.error"));
           break;
         }
@@ -870,14 +923,11 @@ app.post("/voice", async (req, res) => {
         session.specialRequestsRaw = speech.trim().slice(0, 200);
         resetRetries(session);
         session.step = 6;
-
-        // (preorder prompt not in PROMPTS: left unchanged)
         gatherSpeech(vr, "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno.");
         break;
       }
 
       case 6: {
-        // Preorder choice (logic unchanged; no matching prompts in provided file)
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
             session.preorderChoiceKey = null;
@@ -944,13 +994,11 @@ app.post("/voice", async (req, res) => {
       }
 
       case 8: {
-        // Area selection (logic unchanged; no matching prompts in provided file)
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
             session.area = "inside";
             resetRetries(session);
             session.step = 10;
-            // ✅ PROMPTS for WhatsApp request
             gatherSpeech(vr, t("step7_whatsapp_number.main"));
             break;
           }
@@ -967,7 +1015,6 @@ app.post("/voice", async (req, res) => {
             session.pendingOutsideConfirm = false;
             resetRetries(session);
             session.step = 10;
-            // ✅ PROMPTS
             gatherSpeech(vr, t("step7_whatsapp_number.main"));
             break;
           }
@@ -976,7 +1023,6 @@ app.post("/voice", async (req, res) => {
             session.pendingOutsideConfirm = false;
             resetRetries(session);
             session.step = 10;
-            // ✅ PROMPTS
             gatherSpeech(vr, t("step7_whatsapp_number.main"));
             break;
           }
@@ -986,7 +1032,6 @@ app.post("/voice", async (req, res) => {
             session.pendingOutsideConfirm = false;
             resetRetries(session);
             session.step = 10;
-            // ✅ PROMPTS
             gatherSpeech(vr, t("step7_whatsapp_number.main"));
             break;
           }
@@ -1001,7 +1046,6 @@ app.post("/voice", async (req, res) => {
             session.area = "inside";
             resetRetries(session);
             session.step = 10;
-            // ✅ PROMPTS
             gatherSpeech(vr, t("step7_whatsapp_number.main"));
             break;
           }
@@ -1022,22 +1066,18 @@ app.post("/voice", async (req, res) => {
         session.area = "inside";
         resetRetries(session);
         session.step = 10;
-        // ✅ PROMPTS
         gatherSpeech(vr, t("step7_whatsapp_number.main"));
         break;
       }
 
       case 10: {
-        // Phone / WhatsApp + FINAL step calendar
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
-            // ✅ PROMPTS + operator transfer (logic unchanged)
             sayIt(vr, t("step7_whatsapp_number.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, "Puoi richiamare più tardi. Grazie.");
             break;
           }
-          // ✅ PROMPTS
           gatherSpeech(vr, t("step7_whatsapp_number.error"));
           break;
         }
@@ -1050,7 +1090,6 @@ app.post("/voice", async (req, res) => {
             sayIt(vr, "Grazie.");
             break;
           }
-          // ✅ PROMPTS (spokeTooFast as “repeat”)
           gatherSpeech(vr, t("step7_whatsapp_number.spokeTooFast"));
           break;
         }
@@ -1116,12 +1155,7 @@ app.post("/voice", async (req, res) => {
           break;
         }
 
-        const chosen = allocateTable({
-          area: session.area,
-          people: session.people,
-          lockedSet,
-        });
-
+        const chosen = allocateTable({ area: session.area, people: session.people, lockedSet });
         if (!chosen) {
           sayIt(vr, t("step9_fallback_transfer_operator.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
@@ -1185,7 +1219,6 @@ app.post("/voice", async (req, res) => {
           }
         }
 
-        // ✅ PROMPTS: success + goodbye (no business logic change)
         sayIt(vr, t("step9_success.main"));
         sayIt(vr, t("step9_success.goodbye"));
 
