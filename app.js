@@ -1,12 +1,27 @@
+/**
+ * app.js — TuttiBrilli Enoteca Voice Assistant
+ * Full version (A-Z) con:
+ * - dotenv + body-parser
+ * - sayIt() senza voice="alice" (usa voce Twilio Console)
+ * - fix telefono: non interrompe chiamata, prenotazione parziale su Calendar
+ * - parsing telefono robusto + default +39
+ * - parsing date robusto + comandi "indietro/modifica/errore"
+ * - WhatsApp SOLO se Calendar OK e numero valido
+ */
+
 "use strict";
+
+require("dotenv").config();
 
 const express = require("express");
 const twilio = require("twilio");
+const bodyParser = require("body-parser");
 const { google } = require("googleapis");
+
 const { PROMPTS } = require("./prompts");
 
 const app = express();
-app.use(express.urlencoded({ extended: false }));
+app.use(bodyParser.urlencoded({ extended: false }));
 app.use(express.json());
 
 // ======================= ENV =======================
@@ -71,13 +86,12 @@ const PREORDER_OPTIONS = [
   { key: "apericena", label: "Apericena", priceEUR: null, constraints: {} },
   { key: "dopocena", label: "Dopocena (dopo le 22:30)", priceEUR: null, constraints: { minTime: "22:30" } },
   { key: "piatto_apericena", label: "Piatto Apericena", priceEUR: 25, constraints: {} },
-  {
-    key: "piatto_apericena_promo",
-    label: "Piatto Apericena in promo (previa registrazione)",
-    priceEUR: null,
-    constraints: { promoOnly: true },
-  },
+  { key: "piatto_apericena_promo", label: "Piatto Apericena in promo (previa registrazione)", priceEUR: null, constraints: { promoOnly: true } },
 ];
+
+function getPreorderOptionByKey(key) {
+  return PREORDER_OPTIONS.find((o) => o.key === key) || null;
+}
 
 // ======================= CONFIG: TABLES =======================
 const TABLES = [
@@ -206,7 +220,6 @@ function goBack(session) {
   if (!session || typeof session.step !== "number") return;
   if (session.step <= 1) return;
 
-  // Mappa coerente col flusso:
   // 1 nome -> 2 data -> 3 ora -> 4 pax -> 5 note -> 6 preordine -> 8 area -> 10 telefono
   if (session.step === 2) session.step = 1;
   else if (session.step === 3) session.step = 2;
@@ -254,12 +267,12 @@ function promptForStep(vr, session) {
 }
 
 /**
- * ✅ DATE PARSER ENHANCED:
- * - oggi, domani
- * - tra/fra X giorni (anche in parole: "tre", "due"...)
- * - 30/12, 30-12, 30 12 (+ optional year)
+ * DATE PARSER robusto:
+ * - oggi/domani
+ * - tra/fra X giorni (anche "tre")
+ * - 30/12, 30-12, 30 12 (+ anno opzionale)
  * - 2025-12-30
- * - 30 dicembre / il primo gennaio / trenta dicembre
+ * - 30 dicembre / trenta dicembre / primo gennaio
  * - questo venerdì / venerdì prossimo
  */
 function parseItalianNumberToInt(text) {
@@ -496,10 +509,6 @@ function parsePreorderChoiceKey(speech) {
   return "unknown";
 }
 
-function getPreorderOptionByKey(key) {
-  return PREORDER_OPTIONS.find((o) => o.key === key) || null;
-}
-
 // ======================= PHONE HELPERS =======================
 function isValidPhoneE164(s) {
   return /^\+\d{8,15}$/.test(String(s || "").trim());
@@ -569,7 +578,7 @@ function speechToDigitsIT(raw) {
 function extractPhoneFromSpeech(speech) {
   if (!speech) return null;
 
-  // 1) prova direttamente dalle cifre
+  // 1) prova direttamente dalle cifre presenti
   let raw = String(speech).replace(/[^\d+]/g, "");
   if (raw) {
     if (raw.startsWith("00")) raw = "+" + raw.slice(2);
@@ -585,14 +594,14 @@ function extractPhoneFromSpeech(speech) {
           const e164 = "+" + digits;
           if (isValidPhoneE164(e164)) return e164;
         } else {
-          const e164 = "+39" + digits;
+          const e164 = "+39" + digits; // default IT
           if (isValidPhoneE164(e164)) return e164;
         }
       }
     }
   }
 
-  // 2) prova a convertire parole -> cifre
+  // 2) converti parole -> cifre
   const fromWords = speechToDigitsIT(speech);
   if (!fromWords) return null;
 
@@ -698,8 +707,13 @@ function buildTwiml() {
   return new twilio.twiml.VoiceResponse();
 }
 
+/**
+ * VOICE FIX
+ * NON forziamo più "alice"
+ * Twilio userà la voce configurata in Console (es. Chirp3-HD-Aoede)
+ */
 function sayIt(response, text) {
-  response.say({ voice: "alice", language: "it-IT" }, text);
+  response.say({ language: "it-IT" }, text);
 }
 
 function gatherSpeech(response, promptText) {
@@ -894,6 +908,7 @@ async function createBookingEvent({
   const { startLocal, endLocal } = computeStartEndLocal(dateISO, time24, durationMinutes);
   const privateKey = `callsid:${callSid || "no-callsid"}`;
 
+  // idempotenza
   const existing = await calendar.events.list({
     calendarId: GOOGLE_CALENDAR_ID,
     q: privateKey,
@@ -1117,10 +1132,7 @@ app.post("/voice", async (req, res) => {
         }
 
         if (bookingType === "operator") {
-          sayIt(
-            vr,
-            "Ti avviso che il lunedì siamo chiusi, ma possiamo aprire per eventi su conferma dell'operatore. Raccolgo i dati e ti ricontatteremo."
-          );
+          sayIt(vr, "Ti avviso che il lunedì siamo chiusi, ma possiamo aprire per eventi su conferma dell'operatore. Raccolgo i dati e ti ricontatteremo.");
         } else if (bookingType === "drinks") {
           sayIt(vr, t("step4_confirm_time_ask_party_size.kitchenClosed.main"));
         }
@@ -1183,7 +1195,7 @@ app.post("/voice", async (req, res) => {
         session.step = 6;
         gatherSpeech(
           vr,
-          "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, piatto apericena promo. Se non vuoi, dì nessuno."
+          "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
         );
         break;
       }
@@ -1332,9 +1344,9 @@ app.post("/voice", async (req, res) => {
       }
 
       case 10: {
-        // ✅ Step telefono: NON deve mai bloccare Calendar.
-        // - Se il numero non viene capito: riprova massimo 2 volte.
-        // - Poi prosegui senza numero (prenotazione parziale su Calendar).
+        // ✅ FIX CRITICO: lo step telefono NON deve mai interrompere il flusso.
+        // Dopo 2 tentativi falliti, proseguiamo senza telefono/WA e salviamo comunque su Calendar (prenotazione parziale).
+
         if (emptySpeech) {
           if (bumpRetries(session) <= 2) {
             gatherSpeech(vr, t("step7_whatsapp_number.error"));
@@ -1459,7 +1471,7 @@ app.post("/voice", async (req, res) => {
           break;
         }
 
-        // ✅ WhatsApp SOLO se numero valido (e Calendar ok)
+        // ✅ WhatsApp SOLO se numero valido (e Calendar OK)
         if (session.autoConfirm && session.waTo && hasValidWaAddress(session.waTo)) {
           try {
             await sendWhatsAppConfirmation({
