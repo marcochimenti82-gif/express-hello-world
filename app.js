@@ -26,9 +26,7 @@ const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "false").toLowerCase
 const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || "";
 
 const HOLIDAYS_YYYY_MM_DD = process.env.HOLIDAYS_YYYY_MM_DD || "";
-const HOLIDAYS_SET = new Set(
-  HOLIDAYS_YYYY_MM_DD.split(",").map((s) => s.trim()).filter(Boolean)
-);
+const HOLIDAYS_SET = new Set(HOLIDAYS_YYYY_MM_DD.split(",").map((s) => s.trim()).filter(Boolean));
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
@@ -73,7 +71,12 @@ const PREORDER_OPTIONS = [
   { key: "apericena", label: "Apericena", priceEUR: null, constraints: {} },
   { key: "dopocena", label: "Dopocena (dopo le 22:30)", priceEUR: null, constraints: { minTime: "22:30" } },
   { key: "piatto_apericena", label: "Piatto Apericena", priceEUR: 25, constraints: {} },
-  { key: "piatto_apericena_promo", label: "Piatto Apericena in promo (previa registrazione)", priceEUR: null, constraints: { promoOnly: true } },
+  {
+    key: "piatto_apericena_promo",
+    label: "Piatto Apericena in promo (previa registrazione)",
+    priceEUR: null,
+    constraints: { promoOnly: true },
+  },
 ];
 
 // ======================= CONFIG: TABLES =======================
@@ -203,7 +206,7 @@ function goBack(session) {
   if (!session || typeof session.step !== "number") return;
   if (session.step <= 1) return;
 
-  // Mappa minima coerente col tuo flusso:
+  // Mappa coerente col flusso:
   // 1 nome -> 2 data -> 3 ora -> 4 pax -> 5 note -> 6 preordine -> 8 area -> 10 telefono
   if (session.step === 2) session.step = 1;
   else if (session.step === 3) session.step = 2;
@@ -219,36 +222,46 @@ function promptForStep(vr, session) {
   switch (session.step) {
     case 1:
       gatherSpeech(vr, t("step1_welcome_name.main"));
-      return true;
+      return;
     case 2:
       gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" }));
-      return true;
+      return;
     case 3:
       gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateISO || "" }));
-      return true;
+      return;
     case 4:
       gatherSpeech(vr, t("step4_confirm_time_ask_party_size.main", { time: session.time24 || "" }));
-      return true;
+      return;
     case 5:
       gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" }));
-      return true;
+      return;
     case 6:
-      // qui nel tuo flusso è hardcoded il preordine
-      gatherSpeech(vr, "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno.");
-      return true;
+      gatherSpeech(
+        vr,
+        "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+      );
+      return;
     case 8:
       gatherSpeech(vr, "Preferisci sala interna o sala esterna? Ti consiglio l'interno.");
-      return true;
+      return;
     case 10:
       gatherSpeech(vr, t("step7_whatsapp_number.main"));
-      return true;
+      return;
     default:
       gatherSpeech(vr, t("step1_welcome_name.short"));
-      return true;
+      return;
   }
 }
 
-// ----------------------- DATE “SUPER ROBUST” -----------------------
+/**
+ * ✅ DATE PARSER ENHANCED:
+ * - oggi, domani
+ * - tra/fra X giorni (anche in parole: "tre", "due"...)
+ * - 30/12, 30-12, 30 12 (+ optional year)
+ * - 2025-12-30
+ * - 30 dicembre / il primo gennaio / trenta dicembre
+ * - questo venerdì / venerdì prossimo
+ */
 function parseItalianNumberToInt(text) {
   const t = normalizeText(text)
     .replace(/[-,\.]/g, " ")
@@ -256,7 +269,9 @@ function parseItalianNumberToInt(text) {
     .trim();
 
   const direct = {
-    uno: 1, una: 1, primo: 1,
+    uno: 1,
+    una: 1,
+    primo: 1,
     due: 2,
     tre: 3,
     quattro: 4,
@@ -280,17 +295,13 @@ function parseItalianNumberToInt(text) {
   };
   if (direct[t] != null) return direct[t];
 
-  // ventuno/ventidue/... (supporto pratico)
   const cleaned = t.replace(/’/g, "'").replace(/'/g, "");
-  const units = {
-    uno: 1, una: 1, due: 2, tre: 3, quattro: 4, cinque: 5, sei: 6, sette: 7, otto: 8, nove: 9
-  };
+  const units = { uno: 1, una: 1, due: 2, tre: 3, quattro: 4, cinque: 5, sei: 6, sette: 7, otto: 8, nove: 9 };
 
   if (cleaned.startsWith("venti")) {
     const tail = cleaned.slice("venti".length).trim();
     if (!tail) return 20;
     if (units[tail] != null) return 20 + units[tail];
-    if (tail === "tre") return 23;
   }
 
   if (cleaned.startsWith("trenta")) {
@@ -316,7 +327,6 @@ function parseDateIT(speech) {
     return toISODate(d);
   }
 
-  // "tra 3 giorni" / "fra due giorni"
   const rel = t.match(/\b(tra|fra)\s+(.+?)\s+giorn[io]\b/);
   if (rel) {
     const n = parseItalianNumberToInt(rel[2]);
@@ -327,11 +337,9 @@ function parseDateIT(speech) {
     }
   }
 
-  // ISO yyyy-mm-dd
   const iso = t.match(/(\d{4})-(\d{2})-(\d{2})/);
   if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
 
-  // dd/mm(/yyyy) or dd-mm(-yyyy)
   const dmY = t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
   if (dmY) {
     let dd = Number(dmY[1]);
@@ -344,7 +352,6 @@ function parseDateIT(speech) {
     }
   }
 
-  // dd mm (yyyy)  -> "30 12" / "30 12 2025"
   const dmSpace = t.match(/\b(\d{1,2})\s+(\d{1,2})(?:\s+(\d{2,4}))?\b/);
   if (dmSpace) {
     let dd = Number(dmSpace[1]);
@@ -357,25 +364,31 @@ function parseDateIT(speech) {
     }
   }
 
-  // weekday phrases: "questo venerdì", "prossimo venerdì", "venerdì prossimo", "venerdì"
   const weekdayMap = {
     domenica: 0,
-    lunedi: 1, "lunedì": 1,
-    martedi: 2, "martedì": 2,
-    mercoledi: 3, "mercoledì": 3,
-    giovedi: 4, "giovedì": 4,
-    venerdi: 5, "venerdì": 5,
+    lunedi: 1,
+    "lunedì": 1,
+    martedi: 2,
+    "martedì": 2,
+    mercoledi: 3,
+    "mercoledì": 3,
+    giovedi: 4,
+    "giovedì": 4,
+    venerdi: 5,
+    "venerdì": 5,
     sabato: 6,
   };
 
   const hasQuesto = /\b(questo|questa|sto|sta)\b/.test(t);
-  const hasProssimo = /\b(prossimo|prossima)\b/.test(t) ||
+  const hasProssimo =
+    /\b(prossimo|prossima)\b/.test(t) ||
     /\b(domenica|lunedi|lunedì|martedi|martedì|mercoledi|mercoledì|giovedi|giovedì|venerdi|venerdì|sabato)\s+prossim[oa]\b/.test(t);
 
-  const weekdayMatch = t.match(/\b(domenica|lunedi|lunedì|martedi|martedì|mercoledi|mercoledì|giovedi|giovedì|venerdi|venerdì|sabato)\b/);
+  const weekdayMatch = t.match(
+    /\b(domenica|lunedi|lunedì|martedi|martedì|mercoledi|mercoledì|giovedi|giovedì|venerdi|venerdì|sabato)\b/
+  );
   if (weekdayMatch) {
-    const wdToken = weekdayMatch[1];
-    const target = weekdayMap[wdToken];
+    const target = weekdayMap[weekdayMatch[1]];
     const d = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     const current = d.getDay();
 
@@ -394,10 +407,19 @@ function parseDateIT(speech) {
     return toISODate(d);
   }
 
-  // "trenta dicembre" / "il primo gennaio" / "martedì trenta dicembre"
   const months = {
-    gennaio: 1, febbraio: 2, marzo: 3, aprile: 4, maggio: 5, giugno: 6,
-    luglio: 7, agosto: 8, settembre: 9, ottobre: 10, novembre: 11, dicembre: 12,
+    gennaio: 1,
+    febbraio: 2,
+    marzo: 3,
+    aprile: 4,
+    maggio: 5,
+    giugno: 6,
+    luglio: 7,
+    agosto: 8,
+    settembre: 9,
+    ottobre: 10,
+    novembre: 11,
+    dicembre: 12,
   };
 
   const cleaned = t
@@ -406,7 +428,9 @@ function parseDateIT(speech) {
     .replace(/\s+/g, " ")
     .trim();
 
-  const m = cleaned.match(/\b(.+?)\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)(?:\s+(\d{2,4}))?\b/);
+  const m = cleaned.match(
+    /\b(.+?)\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)(?:\s+(\d{2,4}))?\b/
+  );
   if (m) {
     const dd = parseItalianNumberToInt(m[1]);
     const mm = months[m[2]];
@@ -476,45 +500,123 @@ function getPreorderOptionByKey(key) {
   return PREORDER_OPTIONS.find((o) => o.key === key) || null;
 }
 
-// ----------------------- PHONE (DEFAULT +39, NEVER DROP) -----------------------
+// ======================= PHONE HELPERS =======================
 function isValidPhoneE164(s) {
   return /^\+\d{8,15}$/.test(String(s || "").trim());
 }
-
 function hasValidWaAddress(s) {
   return /^whatsapp:\+\d{8,15}$/.test(String(s || "").trim());
 }
 
-function normalizePhoneWithDefaultItaly(rawSpeech) {
-  if (!rawSpeech) return null;
+function speechToDigitsIT(raw) {
+  const t = normalizeText(raw);
 
-  let s = String(rawSpeech).replace(/[^\d+]/g, "");
+  const map = {
+    zero: "0",
+    uno: "1",
+    una: "1",
+    due: "2",
+    tre: "3",
+    quattro: "4",
+    cinque: "5",
+    sei: "6",
+    sette: "7",
+    otto: "8",
+    nove: "9",
+  };
+
+  const tokens = t
+    .replace(/[^a-z0-9+\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+
+  let out = "";
+
+  for (let i = 0; i < tokens.length; i++) {
+    const w = tokens[i];
+
+    if (/^\d+$/.test(w)) {
+      out += w;
+      continue;
+    }
+
+    if (w === "+" || w === "piu" || w === "più") {
+      out += "+";
+      continue;
+    }
+
+    if (w === "doppio" || w === "triplo") {
+      const next = tokens[i + 1];
+      const digit = map[next] || (next && /^\d$/.test(next) ? next : null);
+      if (digit) {
+        out += w === "doppio" ? digit + digit : digit + digit + digit;
+        i++;
+        continue;
+      }
+    }
+
+    if (map[w]) {
+      out += map[w];
+      continue;
+    }
+  }
+
+  return out;
+}
+
+function extractPhoneFromSpeech(speech) {
+  if (!speech) return null;
+
+  // 1) prova direttamente dalle cifre
+  let raw = String(speech).replace(/[^\d+]/g, "");
+  if (raw) {
+    if (raw.startsWith("00")) raw = "+" + raw.slice(2);
+
+    if (raw.startsWith("+")) {
+      const digits = raw.slice(1).replace(/\D/g, "");
+      const e164 = "+" + digits;
+      if (isValidPhoneE164(e164)) return e164;
+    } else {
+      const digits = raw.replace(/\D/g, "");
+      if (digits.length >= 8 && digits.length <= 15) {
+        if (digits.startsWith("39")) {
+          const e164 = "+" + digits;
+          if (isValidPhoneE164(e164)) return e164;
+        } else {
+          const e164 = "+39" + digits;
+          if (isValidPhoneE164(e164)) return e164;
+        }
+      }
+    }
+  }
+
+  // 2) prova a convertire parole -> cifre
+  const fromWords = speechToDigitsIT(speech);
+  if (!fromWords) return null;
+
+  let s = String(fromWords).replace(/[^\d+]/g, "");
   if (!s) return null;
 
   if (s.startsWith("00")) s = "+" + s.slice(2);
 
   if (s.startsWith("+")) {
-    const digits = s.slice(1).replace(/[^\d]/g, "");
-    if (!digits) return null;
-    return "+" + digits;
+    const digits = s.slice(1).replace(/\D/g, "");
+    const e164 = "+" + digits;
+    return isValidPhoneE164(e164) ? e164 : null;
   }
 
-  const digitsOnly = s.replace(/[^\d]/g, "");
-  if (!digitsOnly) return null;
+  const digits = s.replace(/\D/g, "");
+  if (!digits) return null;
 
-  if (digitsOnly.startsWith("39")) return "+" + digitsOnly;
-  return "+39" + digitsOnly;
-}
+  if (digits.startsWith("39")) {
+    const e164 = "+" + digits;
+    return isValidPhoneE164(e164) ? e164 : null;
+  }
 
-function extractPhoneFromSpeech(speech) {
-  const p = normalizePhoneWithDefaultItaly(speech);
-  if (!p) return null;
-
-  const digits = p.replace(/[^\d]/g, "");
-  if (digits.length < 8) return null;
-
-  if (digits.length > 15) return "+" + digits.slice(0, 15);
-  return p;
+  const e164 = "+39" + digits;
+  return isValidPhoneE164(e164) ? e164 : null;
 }
 
 // ======================= TIME HELPERS =======================
@@ -528,7 +630,7 @@ function isTimeAtOrAfter(time24, minTime24) {
 }
 
 function getRestaurantWindowForDay(day) {
-  if (day === 5 || day === 6) return OPENING.restaurant.friSat; // Fri, Sat
+  if (day === 5 || day === 6) return OPENING.restaurant.friSat;
   return OPENING.restaurant.default;
 }
 
@@ -923,7 +1025,7 @@ app.post("/voice", async (req, res) => {
 
     const emptySpeech = !normalizeText(speech);
 
-    // ✅ Comandi: "indietro / modifica / errore"
+    // ✅ Comandi vocali: "indietro / modifica / errore"
     if (!emptySpeech && isBackCommand(speech)) {
       resetRetries(session);
       goBack(session);
@@ -1015,7 +1117,10 @@ app.post("/voice", async (req, res) => {
         }
 
         if (bookingType === "operator") {
-          sayIt(vr, "Ti avviso che il lunedì siamo chiusi, ma possiamo aprire per eventi su conferma dell'operatore. Raccolgo i dati e ti ricontatteremo.");
+          sayIt(
+            vr,
+            "Ti avviso che il lunedì siamo chiusi, ma possiamo aprire per eventi su conferma dell'operatore. Raccolgo i dati e ti ricontatteremo."
+          );
         } else if (bookingType === "drinks") {
           sayIt(vr, t("step4_confirm_time_ask_party_size.kitchenClosed.main"));
         }
@@ -1063,7 +1168,10 @@ app.post("/voice", async (req, res) => {
             session.specialRequestsRaw = "nessuna";
             resetRetries(session);
             session.step = 6;
-            gatherSpeech(vr, "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno.");
+            gatherSpeech(
+              vr,
+              "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+            );
             break;
           }
           gatherSpeech(vr, t("step6_collect_notes.error"));
@@ -1073,7 +1181,10 @@ app.post("/voice", async (req, res) => {
         session.specialRequestsRaw = speech.trim().slice(0, 200);
         resetRetries(session);
         session.step = 6;
-        gatherSpeech(vr, "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno.");
+        gatherSpeech(
+          vr,
+          "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, piatto apericena promo. Se non vuoi, dì nessuno."
+        );
         break;
       }
 
@@ -1221,17 +1332,17 @@ app.post("/voice", async (req, res) => {
       }
 
       case 10: {
-        // ✅ Step telefono: mai interrompere la chiamata, e prenotazione sempre su Calendar
+        // ✅ Step telefono: NON deve mai bloccare Calendar.
+        // - Se il numero non viene capito: riprova massimo 2 volte.
+        // - Poi prosegui senza numero (prenotazione parziale su Calendar).
         if (emptySpeech) {
-          if (bumpRetries(session) > 2) {
-            // dopo 3 tentativi vuoto -> prenotazione parziale (senza WA)
-            session.phone = null;
-            session.waTo = null;
-            resetRetries(session);
-          } else {
+          if (bumpRetries(session) <= 2) {
             gatherSpeech(vr, t("step7_whatsapp_number.error"));
             break;
           }
+          session.phone = null;
+          session.waTo = null;
+          resetRetries(session);
         } else {
           const phone = extractPhoneFromSpeech(speech);
 
@@ -1240,7 +1351,6 @@ app.post("/voice", async (req, res) => {
               gatherSpeech(vr, t("step7_whatsapp_number.spokeTooFast"));
               break;
             }
-            // dopo 3 tentativi -> prenotazione parziale
             session.phone = null;
             session.waTo = null;
             resetRetries(session);
@@ -1251,14 +1361,11 @@ app.post("/voice", async (req, res) => {
           }
         }
 
-        // Calcolo durata / disclaimer
         const d = new Date(`${session.dateISO}T00:00:00`);
         session.durationMinutes = getDurationMinutes(session.people, d);
 
         const outsideDisclaimer =
-          session.area === "outside"
-            ? "Tavolo esterno: in caso di maltempo non è garantito il posto all'interno."
-            : null;
+          session.area === "outside" ? "Tavolo esterno: in caso di maltempo non è garantito il posto all'interno." : null;
 
         let preorderPriceText = null;
         if (session.preorderChoiceKey) {
@@ -1321,7 +1428,7 @@ app.post("/voice", async (req, res) => {
         session.tableLocks = chosen.locks;
         session.tableNotes = chosen.notes || null;
 
-        // ✅ Calendar SEMPRE, anche senza telefono/WA
+        // ✅ Calendar SEMPRE (anche prenotazione parziale)
         try {
           await createBookingEvent({
             callSid,
@@ -1352,7 +1459,7 @@ app.post("/voice", async (req, res) => {
           break;
         }
 
-        // ✅ WhatsApp SOLO se WA valido
+        // ✅ WhatsApp SOLO se numero valido (e Calendar ok)
         if (session.autoConfirm && session.waTo && hasValidWaAddress(session.waTo)) {
           try {
             await sendWhatsAppConfirmation({
@@ -1375,11 +1482,13 @@ app.post("/voice", async (req, res) => {
           }
         }
 
-        // messaggio finale: se non c'è WA, non promettere WhatsApp
         if (session.waTo && hasValidWaAddress(session.waTo)) {
           sayIt(vr, t("step9_success.main"));
         } else {
-          sayIt(vr, "Perfetto, ho registrato la prenotazione. Se vuoi ricevere la conferma su WhatsApp, puoi richiamare e lasciarmi il numero con calma.");
+          sayIt(
+            vr,
+            "Perfetto, ho registrato la prenotazione. Se vuoi ricevere la conferma su WhatsApp, puoi richiamare e lasciarmi con calma il numero."
+          );
         }
         sayIt(vr, t("step9_success.goodbye"));
 
