@@ -15,12 +15,12 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || ""; // es: whatsapp:+14155238886 (sandbox) oppure whatsapp:+<sender approvato>
 
-// (OPZIONALE ma consigliato) per evitare problemi di JSON spezzato nelle ENV
-// Metti qui il JSON del service account in Base64
+// Service account: consigliato B64
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
 
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || ""; // es: ...@group.calendar.google.com
+const GOOGLE_CALENDAR_TZ = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
 const DEFAULT_EVENT_DURATION_MINUTES = parseInt(process.env.DEFAULT_EVENT_DURATION_MINUTES || "120", 10);
 
 // Inoltro chiamata a operatore (opzionale)
@@ -44,12 +44,11 @@ const twilioClient =
 // Google Calendar helpers
 // --------------------
 function getServiceAccountJsonRaw() {
-  // preferisci B64 se presente
   if (GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
     try {
       return Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
     } catch (e) {
-      console.error("GOOGLE_SERVICE_ACCOUNT_JSON_B64 decode failed:", e?.message || e);
+      console.error("[CALENDAR] GOOGLE_SERVICE_ACCOUNT_JSON_B64 decode failed:", e?.message || e);
       return "";
     }
   }
@@ -156,21 +155,6 @@ function gatherSpeech({
 // --------------------
 // Sessioni in memoria (MVP). In produzione: Redis/DB.
 // --------------------
-/**
- * session schema:
- * {
- *  step: number,
- *  substep?: string|null,
- *  retries: number,
- *  intent: "booking"|"info"|null,
- *  name: string|null,
- *  dateISO: "YYYY-MM-DD"|null,
- *  time24: "HH:MM"|null,
- *  people: number|null,
- *  waTo: "whatsapp:+39..."|null,
- *  phone: string|null,
- * }
- */
 const sessions = new Map();
 
 function getSession(callSid) {
@@ -219,10 +203,9 @@ function toISODate(d) {
 }
 
 function parseDateIT_MVP(speech) {
-  // MVP: accetta "oggi", "domani" o "YYYY-MM-DD" o "27 dicembre" etc.
   const t = normalizeText(speech);
-
   const today = nowLocal();
+
   if (t.includes("oggi")) return toISODate(today);
   if (t.includes("domani")) {
     const d = new Date(today.getTime() + 24 * 60 * 60 * 1000);
@@ -233,7 +216,7 @@ function parseDateIT_MVP(speech) {
   const iso = t.match(/(\d{4})-(\d{2})-(\d{2})/);
   if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
 
-  // match dd/mm/yyyy
+  // match dd/mm/yyyy or dd-mm-yyyy
   const dmY = t.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
   if (dmY) {
     const dd = String(dmY[1]).padStart(2, "0");
@@ -246,7 +229,6 @@ function parseDateIT_MVP(speech) {
 }
 
 function parseTimeIT_MVP(speech) {
-  // MVP: accetta "20 30", "20:30", "alle 8 e mezza"
   const t = normalizeText(speech);
 
   const hm = t.match(/(\d{1,2})[:\s](\d{2})/);
@@ -312,14 +294,13 @@ async function createBookingEvent({
   // accettiamo anche i nomi del debug endpoint
   timeHHMM,
   partySize,
-  notes, // opzionale
+  notes,
 }) {
-  // ============================
-  // NORMALIZZAZIONE INPUT + GUARDRAILS
-  // ============================
+  // Normalizzazione nomi
   if (people == null && partySize != null) people = partySize;
   if (!time24 && timeHHMM) time24 = timeHHMM;
 
+  // Guardrails
   if (!name) throw new Error("createBookingEvent: name mancante");
   if (!dateISO || !/^\d{4}-\d{2}-\d{2}$/.test(dateISO)) {
     throw new Error(`createBookingEvent: dateISO non valido: ${dateISO}`);
@@ -340,9 +321,7 @@ async function createBookingEvent({
 
   const privateKey = `callsid:${callSid || "no-callsid"}`;
 
-  // ============================
-  // IDEMPOTENZA: evita doppioni su retry Twilio
-  // ============================
+  // Idempotenza: se già creato per lo stesso callSid, non ricreare
   const existing = await calendar.events.list({
     calendarId: GOOGLE_CALENDAR_ID,
     q: privateKey,
@@ -361,20 +340,40 @@ async function createBookingEvent({
   }
 
   // ============================
-  // START/END RFC3339 ROBUSTI (anti 400)
+  // ✅ FIX FUSO ORARIO:
+  // inviamo a Google ORA LOCALE + timeZone Europe/Rome
+  // NIENTE "Z" e NIENTE toISOString()
   // ============================
-  const tz = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const tz = GOOGLE_CALENDAR_TZ;
 
-  // NOTA: aggiungiamo "Z" per evitare ambiguità timezone sul server (Render)
-  const start = new Date(`${dateISO}T${time24}:00Z`);
-  if (Number.isNaN(start.getTime())) {
-    throw new Error(`createBookingEvent: start invalido: ${dateISO} ${time24}`);
+  const [hhStr, mmStr] = time24.split(":");
+  const startH = Number(hhStr);
+  const startM = Number(mmStr);
+
+  if (!Number.isFinite(startH) || !Number.isFinite(startM) || startH < 0 || startH > 23 || startM < 0 || startM > 59) {
+    throw new Error(`createBookingEvent: time24 non valido: ${time24}`);
   }
 
-  const end = addMinutes(start, DEFAULT_EVENT_DURATION_MINUTES);
-  if (Number.isNaN(end.getTime())) {
-    throw new Error(`createBookingEvent: end invalido da start: ${start.toISOString()}`);
+  // Calcola end locale (gestisce anche il passaggio al giorno dopo)
+  const duration = DEFAULT_EVENT_DURATION_MINUTES;
+  const startTotal = startH * 60 + startM;
+  const endTotal = startTotal + duration;
+
+  const endDayOffset = Math.floor(endTotal / (24 * 60)); // 0 o 1 (o più, ma improbabile)
+  const endMinutesOfDay = endTotal % (24 * 60);
+  const endH = Math.floor(endMinutesOfDay / 60);
+  const endM = endMinutesOfDay % 60;
+
+  // dateISO + offset giorni se sfora mezzanotte
+  let endDateISO = dateISO;
+  if (endDayOffset > 0) {
+    const d = new Date(`${dateISO}T00:00:00`);
+    d.setDate(d.getDate() + endDayOffset);
+    endDateISO = toISODate(d);
   }
+
+  const startLocal = `${dateISO}T${String(startH).padStart(2, "0")}:${String(startM).padStart(2, "0")}:00`;
+  const endLocal = `${endDateISO}T${String(endH).padStart(2, "0")}:${String(endM).padStart(2, "0")}:00`;
 
   const requestBody = {
     summary: `TuttiBrilli - ${name} - ${peopleNum} pax`,
@@ -389,8 +388,8 @@ async function createBookingEvent({
     ]
       .filter(Boolean)
       .join("\n"),
-    start: { dateTime: start.toISOString(), timeZone: tz },
-    end: { dateTime: end.toISOString(), timeZone: tz },
+    start: { dateTime: startLocal, timeZone: tz },
+    end: { dateTime: endLocal, timeZone: tz },
   };
 
   console.log("[CALENDAR] requestBody:", JSON.stringify(requestBody, null, 2));
@@ -420,11 +419,8 @@ app.post("/voice", async (req, res) => {
 
   try {
     const callSid = req.body.CallSid || `local-${Date.now()}`;
-    const from = req.body.From || ""; // caller id (può essere forwarder)
-
     const session = getSession(callSid);
 
-    // Twilio speech input
     const speech = req.body.SpeechResult || "";
     const step = session.step || 1;
 
@@ -550,10 +546,8 @@ ${gatherSpeech({ action: `${BASE_URL}/voice`, prompt: "Dimmi il numero di telefo
 
     // STEP 6: phone / whatsapp
     if (step === 6) {
-      // MVP: estrai un numero tipo +39...
       let phone = String(speech || "").replace(/[^\d+]/g, "");
       if (phone && !phone.startsWith("+")) {
-        // se l'utente dice 331..., aggiungi +39 (italia)
         if (phone.length >= 9 && phone.length <= 11) phone = `+39${phone}`;
       }
 
@@ -585,9 +579,9 @@ ${redirect(`${BASE_URL}/voice`)}
 
     // STEP 7: crea evento su Calendar + invia WhatsApp (SOLO SE CALENDAR OK)
     if (session.step === 7) {
-      // 1) Google Calendar (DEVE andare a buon fine)
       let calendarResult = null;
 
+      // 1) Google Calendar (DEVE andare a buon fine)
       try {
         calendarResult = await createBookingEvent({
           callSid,
@@ -613,8 +607,7 @@ ${hangup()}
       }
 
       if (!calendarResult) {
-        console.error("Google Calendar insert failed: calendarResult is null/undefined");
-
+        console.error("[VOICE] createBookingEvent returned null/undefined");
         sessions.delete(callSid);
         return respond(`
 ${say("Non sono riuscito a registrare la prenotazione in calendario. Riprova tra poco oppure scrivici su WhatsApp.")}
@@ -625,14 +618,17 @@ ${hangup()}
       // 2) WhatsApp (SOLO DOPO Calendar OK)
       try {
         const waTo = session.waTo;
-        const waBody = `Ciao ${session.name}! Prenotazione registrata ✅\nData: ${session.dateISO}\nOra: ${session.time24}\nPersone: ${session.people}\nA presto da TuttiBrilli!`;
+        const waBody =
+          `Ciao ${session.name}! Prenotazione registrata ✅\n` +
+          `Data: ${session.dateISO}\nOra: ${session.time24}\nPersone: ${session.people}\n` +
+          `A presto da TuttiBrilli!`;
 
         if (!twilioClient) {
-          console.error("Twilio client non configurato: manca TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
+          console.error("[WA] Twilio client non configurato: manca TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN");
         } else if (!TWILIO_WHATSAPP_FROM) {
-          console.error("TWILIO_WHATSAPP_FROM non valido/mancante:", TWILIO_WHATSAPP_FROM);
+          console.error("[WA] TWILIO_WHATSAPP_FROM mancante:", TWILIO_WHATSAPP_FROM);
         } else if (!waTo || !hasValidWaAddress(waTo)) {
-          console.error("waTo non valido:", waTo);
+          console.error("[WA] waTo non valido:", waTo);
         } else {
           await twilioClient.messages.create({
             from: TWILIO_WHATSAPP_FROM,
@@ -641,7 +637,7 @@ ${hangup()}
           });
         }
       } catch (e) {
-        console.error("WhatsApp send failed:", e);
+        console.error("[WA] WhatsApp send failed:", e);
         // Non blocchiamo: evento già creato
       }
 
@@ -658,9 +654,8 @@ ${hangup()}
 ${say("Ripartiamo da capo.")}
 ${redirect(`${BASE_URL}/voice`)}
 `);
-
   } catch (err) {
-    console.error("VOICE FLOW ERROR:", err);
+    console.error("[VOICE] FLOW ERROR:", err);
 
     if (canForwardToHuman()) {
       return res.type("text/xml").status(200).send(twiml(forwardToHumanTwiml()));
@@ -722,6 +717,7 @@ app.listen(PORT, () => {
 
   const raw = getServiceAccountJsonRaw();
   console.log(`Calendar configured: ${Boolean(raw && GOOGLE_CALENDAR_ID)}`);
+  console.log(`Calendar TZ: ${GOOGLE_CALENDAR_TZ}`);
   console.log(`Twilio configured: ${Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN)}`);
 
   console.log(
