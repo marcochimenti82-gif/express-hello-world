@@ -1,17 +1,18 @@
 /**
  * app.js — TuttiBrilli Enoteca Voice Assistant
- * Full version (A-Z) con:
- * - dotenv + body-parser
- * - sayIt() senza voice="alice" (usa voce Twilio Console)
- * - fix telefono: non interrompe chiamata, prenotazione parziale su Calendar
- * - parsing telefono robusto + default +39
- * - parsing date robusto + comandi "indietro/modifica/errore"
- * - WhatsApp SOLO se Calendar OK e numero valido
+ * - dotenv opzionale (non rompe su Render se dotenv non installato)
+ * - sayIt() NON forza "alice" (usa voce configurata su Twilio Console)
+ * - Fix: chiamata non si interrompe al telefono
+ * - Fix: prenotazione parziale su Calendar se telefono non valido
+ * - Parsing date/telefono robusti + default +39
  */
 
 "use strict";
 
-require("dotenv").config();
+// dotenv opzionale: in produzione (Render) le env vars sono già presenti
+try {
+  require("dotenv").config();
+} catch (_) {}
 
 const express = require("express");
 const twilio = require("twilio");
@@ -25,7 +26,7 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(express.json());
 
 // ======================= ENV =======================
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || "";
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
@@ -46,30 +47,7 @@ const HOLIDAYS_SET = new Set(HOLIDAYS_YYYY_MM_DD.split(",").map((s) => s.trim())
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
-// ======================= PROMPTS HELPERS =======================
-function renderTemplate(str, vars = {}) {
-  const s = String(str || "");
-  return s.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key) => {
-    const v = vars[key];
-    return v === undefined || v === null ? "" : String(v);
-  });
-}
-
-function pickPrompt(path, fallback = "") {
-  const parts = String(path || "").split(".");
-  let node = PROMPTS;
-  for (const p of parts) {
-    if (!node || typeof node !== "object" || !(p in node)) return fallback;
-    node = node[p];
-  }
-  return typeof node === "string" ? node : fallback;
-}
-
-function t(path, vars = {}, fallback = "") {
-  return renderTemplate(pickPrompt(path, fallback), vars);
-}
-
-// ======================= CONFIG: OPENING HOURS =======================
+// ======================= OPENING HOURS =======================
 const OPENING = {
   closedDay: 1, // Monday
   restaurant: {
@@ -77,10 +55,10 @@ const OPENING = {
     friSat: { start: "18:30", end: "23:00" }, // Fri-Sat
   },
   drinksOnly: { start: "18:30", end: "24:00" }, // everyday
-  musicNights: { days: [3, 5], from: "20:00" }, // Wed & Fri
+  musicNights: { days: [3, 5] }, // Wed & Fri
 };
 
-// ======================= CONFIG: PREORDER MENU =======================
+// ======================= PREORDER MENU =======================
 const PREORDER_OPTIONS = [
   { key: "cena", label: "Cena", priceEUR: null, constraints: {} },
   { key: "apericena", label: "Apericena", priceEUR: null, constraints: {} },
@@ -93,7 +71,7 @@ function getPreorderOptionByKey(key) {
   return PREORDER_OPTIONS.find((o) => o.key === key) || null;
 }
 
-// ======================= CONFIG: TABLES =======================
+// ======================= TABLES =======================
 const TABLES = [
   // INSIDE
   { id: "T1", area: "inside", min: 2, max: 4, notes: "più riservato" },
@@ -138,7 +116,73 @@ const TABLE_COMBINATIONS = [
   { displayId: "T7F", area: "outside", replaces: ["T7F", "T8F"], min: 6, max: 8, notes: "unione T7F+T8F" },
 ];
 
-// ======================= SESSIONS =======================
+// ======================= PROMPTS HELPERS =======================
+function renderTemplate(str, vars = {}) {
+  const s = String(str || "");
+  return s.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key) => {
+    const v = vars[key];
+    return v === undefined || v === null ? "" : String(v);
+  });
+}
+
+function pickPrompt(path, fallback = "") {
+  const parts = String(path || "").split(".");
+  let node = PROMPTS;
+  for (const p of parts) {
+    if (!node || typeof node !== "object" || !(p in node)) return fallback;
+    node = node[p];
+  }
+  return typeof node === "string" ? node : fallback;
+}
+
+function t(path, vars = {}, fallback = "") {
+  return renderTemplate(pickPrompt(path, fallback), vars);
+}
+
+// ======================= TWILIO HELPERS =======================
+function buildTwiml() {
+  return new twilio.twiml.VoiceResponse();
+}
+
+/**
+ * VOICE FIX: NON forziamo "alice"
+ * Twilio userà la voce configurata in Console (es. Chirp3-HD-Aoede)
+ */
+function sayIt(response, text) {
+  response.say({ language: "it-IT" }, text);
+}
+
+function gatherSpeech(response, promptText) {
+  const actionUrl = `${BASE_URL}/voice`;
+  const gather = response.gather({
+    input: "speech",
+    language: "it-IT",
+    speechTimeout: "auto",
+    action: actionUrl,
+    method: "POST",
+  });
+  sayIt(gather, promptText);
+}
+
+function isValidPhoneE164(s) {
+  return /^\+\d{8,15}$/.test(String(s || "").trim());
+}
+function hasValidWaAddress(s) {
+  return /^whatsapp:\+\d{8,15}$/.test(String(s || "").trim());
+}
+
+function canForwardToHuman() {
+  return ENABLE_FORWARDING && Boolean(HUMAN_FORWARD_TO) && isValidPhoneE164(HUMAN_FORWARD_TO);
+}
+
+function forwardToHumanTwiml() {
+  const vr = buildTwiml();
+  sayIt(vr, t("step9_fallback_transfer_operator.main"));
+  vr.dial({}, HUMAN_FORWARD_TO);
+  return vr.toString();
+}
+
+// ======================= SESSION =======================
 const sessions = new Map();
 
 function getSession(callSid) {
@@ -186,7 +230,7 @@ function resetRetries(session) {
   session.retries = 0;
 }
 
-// ======================= PARSERS =======================
+// ======================= PARSING & UTIL =======================
 function normalizeText(s) {
   return String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -202,7 +246,7 @@ function nowLocal() {
   return new Date();
 }
 
-// ----------------------- BACK / EDIT COMMANDS -----------------------
+// ---- Back/edit commands
 function isBackCommand(speech) {
   const t = normalizeText(speech);
   return (
@@ -266,45 +310,15 @@ function promptForStep(vr, session) {
   }
 }
 
-/**
- * DATE PARSER robusto:
- * - oggi/domani
- * - tra/fra X giorni (anche "tre")
- * - 30/12, 30-12, 30 12 (+ anno opzionale)
- * - 2025-12-30
- * - 30 dicembre / trenta dicembre / primo gennaio
- * - questo venerdì / venerdì prossimo
- */
+// ---- Date parsing robusto
 function parseItalianNumberToInt(text) {
-  const t = normalizeText(text)
-    .replace(/[-,\.]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const t = normalizeText(text).replace(/[-,\.]/g, " ").replace(/\s+/g, " ").trim();
 
   const direct = {
-    uno: 1,
-    una: 1,
-    primo: 1,
-    due: 2,
-    tre: 3,
-    quattro: 4,
-    cinque: 5,
-    sei: 6,
-    sette: 7,
-    otto: 8,
-    nove: 9,
-    dieci: 10,
-    undici: 11,
-    dodici: 12,
-    tredici: 13,
-    quattordici: 14,
-    quindici: 15,
-    sedici: 16,
-    diciassette: 17,
-    diciotto: 18,
-    diciannove: 19,
-    venti: 20,
-    trenta: 30,
+    uno: 1, una: 1, primo: 1,
+    due: 2, tre: 3, quattro: 4, cinque: 5, sei: 6, sette: 7, otto: 8, nove: 9,
+    dieci: 10, undici: 11, dodici: 12, tredici: 13, quattordici: 14, quindici: 15, sedici: 16, diciassette: 17,
+    diciotto: 18, diciannove: 19, venti: 20, trenta: 30
   };
   if (direct[t] != null) return direct[t];
 
@@ -379,40 +393,26 @@ function parseDateIT(speech) {
 
   const weekdayMap = {
     domenica: 0,
-    lunedi: 1,
-    "lunedì": 1,
-    martedi: 2,
-    "martedì": 2,
-    mercoledi: 3,
-    "mercoledì": 3,
-    giovedi: 4,
-    "giovedì": 4,
-    venerdi: 5,
-    "venerdì": 5,
+    lunedi: 1, "lunedì": 1,
+    martedi: 2, "martedì": 2,
+    mercoledi: 3, "mercoledì": 3,
+    giovedi: 4, "giovedì": 4,
+    venerdi: 5, "venerdì": 5,
     sabato: 6,
   };
 
   const hasQuesto = /\b(questo|questa|sto|sta)\b/.test(t);
-  const hasProssimo =
-    /\b(prossimo|prossima)\b/.test(t) ||
-    /\b(domenica|lunedi|lunedì|martedi|martedì|mercoledi|mercoledì|giovedi|giovedì|venerdi|venerdì|sabato)\s+prossim[oa]\b/.test(t);
+  const hasProssimo = /\b(prossimo|prossima)\b/.test(t);
 
-  const weekdayMatch = t.match(
-    /\b(domenica|lunedi|lunedì|martedi|martedì|mercoledi|mercoledì|giovedi|giovedì|venerdi|venerdì|sabato)\b/
-  );
+  const weekdayMatch = t.match(/\b(domenica|lunedi|lunedì|martedi|martedì|mercoledi|mercoledì|giovedi|giovedì|venerdi|venerdì|sabato)\b/);
   if (weekdayMatch) {
     const target = weekdayMap[weekdayMatch[1]];
     const d = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     const current = d.getDay();
-
     let diff = (target - current + 7) % 7;
 
-    if (hasProssimo) {
-      if (diff === 0) diff = 7;
-      else diff += 7;
-    } else if (hasQuesto) {
-      // ok
-    } else {
+    if (hasProssimo) diff = diff === 0 ? 7 : diff + 7;
+    else if (hasQuesto) {
       // ok
     }
 
@@ -421,18 +421,8 @@ function parseDateIT(speech) {
   }
 
   const months = {
-    gennaio: 1,
-    febbraio: 2,
-    marzo: 3,
-    aprile: 4,
-    maggio: 5,
-    giugno: 6,
-    luglio: 7,
-    agosto: 8,
-    settembre: 9,
-    ottobre: 10,
-    novembre: 11,
-    dicembre: 12,
+    gennaio: 1, febbraio: 2, marzo: 3, aprile: 4, maggio: 5, giugno: 6,
+    luglio: 7, agosto: 8, settembre: 9, ottobre: 10, novembre: 11, dicembre: 12,
   };
 
   const cleaned = t
@@ -441,9 +431,7 @@ function parseDateIT(speech) {
     .replace(/\s+/g, " ")
     .trim();
 
-  const m = cleaned.match(
-    /\b(.+?)\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)(?:\s+(\d{2,4}))?\b/
-  );
+  const m = cleaned.match(/\b(.+?)\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)(?:\s+(\d{2,4}))?\b/);
   if (m) {
     const dd = parseItalianNumberToInt(m[1]);
     const mm = months[m[2]];
@@ -498,63 +486,28 @@ function parseAreaIT(speech) {
 
 function parsePreorderChoiceKey(speech) {
   const t = normalizeText(speech);
-
   if (t.includes("promo")) return "piatto_apericena_promo";
   if (t.includes("piatto") && t.includes("apericena")) return "piatto_apericena";
   if (t.includes("dopocena") || t.includes("dopo cena") || t.includes("dopo")) return "dopocena";
   if (t.includes("apericena")) return "apericena";
   if (t.includes("cena")) return "cena";
   if (t.includes("nessuno") || t.includes("nessuna") || t.includes("no")) return null;
-
   return "unknown";
 }
 
-// ======================= PHONE HELPERS =======================
-function isValidPhoneE164(s) {
-  return /^\+\d{8,15}$/.test(String(s || "").trim());
-}
-function hasValidWaAddress(s) {
-  return /^whatsapp:\+\d{8,15}$/.test(String(s || "").trim());
-}
-
+// ---- Phone parsing robusto + default +39
 function speechToDigitsIT(raw) {
   const t = normalizeText(raw);
+  const map = { zero: "0", uno: "1", una: "1", due: "2", tre: "3", quattro: "4", cinque: "5", sei: "6", sette: "7", otto: "8", nove: "9" };
 
-  const map = {
-    zero: "0",
-    uno: "1",
-    una: "1",
-    due: "2",
-    tre: "3",
-    quattro: "4",
-    cinque: "5",
-    sei: "6",
-    sette: "7",
-    otto: "8",
-    nove: "9",
-  };
-
-  const tokens = t
-    .replace(/[^a-z0-9+\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .split(" ")
-    .filter(Boolean);
-
+  const tokens = t.replace(/[^a-z0-9+\s]/g, " ").replace(/\s+/g, " ").trim().split(" ").filter(Boolean);
   let out = "";
 
   for (let i = 0; i < tokens.length; i++) {
     const w = tokens[i];
 
-    if (/^\d+$/.test(w)) {
-      out += w;
-      continue;
-    }
-
-    if (w === "+" || w === "piu" || w === "più") {
-      out += "+";
-      continue;
-    }
+    if (/^\d+$/.test(w)) { out += w; continue; }
+    if (w === "+" || w === "piu" || w === "più") { out += "+"; continue; }
 
     if (w === "doppio" || w === "triplo") {
       const next = tokens[i + 1];
@@ -566,10 +519,7 @@ function speechToDigitsIT(raw) {
       }
     }
 
-    if (map[w]) {
-      out += map[w];
-      continue;
-    }
+    if (map[w]) { out += map[w]; continue; }
   }
 
   return out;
@@ -578,7 +528,7 @@ function speechToDigitsIT(raw) {
 function extractPhoneFromSpeech(speech) {
   if (!speech) return null;
 
-  // 1) prova direttamente dalle cifre presenti
+  // 1) cifre già presenti
   let raw = String(speech).replace(/[^\d+]/g, "");
   if (raw) {
     if (raw.startsWith("00")) raw = "+" + raw.slice(2);
@@ -594,14 +544,14 @@ function extractPhoneFromSpeech(speech) {
           const e164 = "+" + digits;
           if (isValidPhoneE164(e164)) return e164;
         } else {
-          const e164 = "+39" + digits; // default IT
+          const e164 = "+39" + digits;
           if (isValidPhoneE164(e164)) return e164;
         }
       }
     }
   }
 
-  // 2) converti parole -> cifre
+  // 2) parole -> cifre
   const fromWords = speechToDigitsIT(speech);
   if (!fromWords) return null;
 
@@ -654,16 +604,16 @@ function deriveBookingTypeAndConfirm(dateISO, time24) {
   const d = new Date(`${dateISO}T00:00:00`);
   const day = d.getDay();
 
-  if (day === OPENING.closedDay) return { bookingType: "operator", autoConfirm: false, reason: "Lunedì chiuso" };
+  if (day === OPENING.closedDay) return { bookingType: "operator", autoConfirm: false };
 
   const restWin = getRestaurantWindowForDay(day);
   const inRestaurant = isWithinWindow(time24, restWin.start, restWin.end);
   const inDrinks = isWithinWindow(time24, OPENING.drinksOnly.start, OPENING.drinksOnly.end);
 
-  if (inRestaurant) return { bookingType: "restaurant", autoConfirm: true, reason: null };
-  if (inDrinks) return { bookingType: "drinks", autoConfirm: true, reason: "Fuori orario cucina" };
+  if (inRestaurant) return { bookingType: "restaurant", autoConfirm: true };
+  if (inDrinks) return { bookingType: "drinks", autoConfirm: true };
 
-  return { bookingType: "closed", autoConfirm: false, reason: "Fuori orario" };
+  return { bookingType: "closed", autoConfirm: false };
 }
 
 function getDurationMinutes(people, dateObj) {
@@ -679,6 +629,12 @@ function getDurationMinutes(people, dateObj) {
   return minutes;
 }
 
+function toISODateWithOffset(dateISO, daysOffset) {
+  const d = new Date(`${dateISO}T00:00:00`);
+  d.setDate(d.getDate() + daysOffset);
+  return toISODate(d);
+}
+
 function computeStartEndLocal(dateISO, time24, durationMinutes) {
   const [sh, sm] = time24.split(":").map(Number);
   const startTotal = sh * 60 + sm;
@@ -689,12 +645,7 @@ function computeStartEndLocal(dateISO, time24, durationMinutes) {
   const endH = Math.floor(endMinutesOfDay / 60);
   const endM = endMinutesOfDay % 60;
 
-  let endDateISO = dateISO;
-  if (endDayOffset > 0) {
-    const d = new Date(`${dateISO}T00:00:00`);
-    d.setDate(d.getDate() + endDayOffset);
-    endDateISO = toISODate(d);
-  }
+  const endDateISO = endDayOffset > 0 ? toISODateWithOffset(dateISO, endDayOffset) : dateISO;
 
   const startLocal = `${dateISO}T${String(sh).padStart(2, "0")}:${String(sm).padStart(2, "0")}:00`;
   const endLocal = `${endDateISO}T${String(endH).padStart(2, "0")}:${String(endM).padStart(2, "0")}:00`;
@@ -702,44 +653,7 @@ function computeStartEndLocal(dateISO, time24, durationMinutes) {
   return { startLocal, endLocal };
 }
 
-// ======================= TWILIO HELPERS =======================
-function buildTwiml() {
-  return new twilio.twiml.VoiceResponse();
-}
-
-/**
- * VOICE FIX
- * NON forziamo più "alice"
- * Twilio userà la voce configurata in Console (es. Chirp3-HD-Aoede)
- */
-function sayIt(response, text) {
-  response.say({ language: "it-IT" }, text);
-}
-
-function gatherSpeech(response, promptText) {
-  const actionUrl = `${BASE_URL}/voice`;
-  const gather = response.gather({
-    input: "speech",
-    language: "it-IT",
-    speechTimeout: "auto",
-    action: actionUrl,
-    method: "POST",
-  });
-  sayIt(gather, promptText);
-}
-
-function canForwardToHuman() {
-  return ENABLE_FORWARDING && Boolean(HUMAN_FORWARD_TO) && isValidPhoneE164(HUMAN_FORWARD_TO);
-}
-
-function forwardToHumanTwiml() {
-  const vr = buildTwiml();
-  sayIt(vr, t("step9_fallback_transfer_operator.main"));
-  vr.dial({}, HUMAN_FORWARD_TO);
-  return vr.toString();
-}
-
-// ======================= GOOGLE CALENDAR CLIENT =======================
+// ======================= GOOGLE CALENDAR =======================
 function getServiceAccountJsonRaw() {
   if (GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
     try {
@@ -764,15 +678,10 @@ function getServiceAccountJsonRaw() {
 }
 
 function getCalendarClient() {
-  if (!GOOGLE_CALENDAR_ID) {
-    console.error("[CALENDAR] Missing GOOGLE_CALENDAR_ID");
-    return null;
-  }
+  if (!GOOGLE_CALENDAR_ID) return null;
+
   const raw = getServiceAccountJsonRaw();
-  if (!raw) {
-    console.error("[CALENDAR] Missing service account JSON");
-    return null;
-  }
+  if (!raw) return null;
 
   const creds = JSON.parse(raw);
   const scopes = ["https://www.googleapis.com/auth/calendar"];
@@ -780,7 +689,6 @@ function getCalendarClient() {
   return google.calendar({ version: "v3", auth });
 }
 
-// ======================= CALENDAR HELPERS =======================
 function containsMarker(ev, markerLower) {
   const s = `${String(ev.summary || "")}\n${String(ev.description || "")}`.toLowerCase();
   return s.includes(markerLower);
@@ -908,7 +816,7 @@ async function createBookingEvent({
   const { startLocal, endLocal } = computeStartEndLocal(dateISO, time24, durationMinutes);
   const privateKey = `callsid:${callSid || "no-callsid"}`;
 
-  // idempotenza
+  // Idempotenza su CallSid (salvata nel description)
   const existing = await calendar.events.list({
     calendarId: GOOGLE_CALENDAR_ID,
     q: privateKey,
@@ -919,7 +827,7 @@ async function createBookingEvent({
   });
 
   const found = (existing.data.items || []).find((ev) => String(ev.description || "").includes(privateKey));
-  if (found) return { created: false, eventId: found.id, htmlLink: found.htmlLink };
+  if (found) return { created: false, eventId: found.id };
 
   const prefix = autoConfirm ? "" : "DA CONFERMARE • ";
   const summary = `${prefix}TB • ${tableDisplayId} • ${name} • ${people} pax`;
@@ -961,7 +869,7 @@ async function createBookingEvent({
     requestBody,
   });
 
-  return { created: true, eventId: resp.data.id, htmlLink: resp.data.htmlLink };
+  return { created: true, eventId: resp.data.id };
 }
 
 // ======================= WHATSAPP CONFIRMATION =======================
@@ -1040,7 +948,7 @@ app.post("/voice", async (req, res) => {
 
     const emptySpeech = !normalizeText(speech);
 
-    // ✅ Comandi vocali: "indietro / modifica / errore"
+    // Back / modifica
     if (!emptySpeech && isBackCommand(speech)) {
       resetRetries(session);
       goBack(session);
@@ -1132,8 +1040,14 @@ app.post("/voice", async (req, res) => {
         }
 
         if (bookingType === "operator") {
-          sayIt(vr, "Ti avviso che il lunedì siamo chiusi, ma possiamo aprire per eventi su conferma dell'operatore. Raccolgo i dati e ti ricontatteremo.");
-        } else if (bookingType === "drinks") {
+          // lunedì gestito da operatore
+          sayIt(vr, t("step9_fallback_transfer_operator.gentle"));
+          if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
+          sayIt(vr, t("step9_fallback_transfer_operator.main"));
+          break;
+        }
+
+        if (bookingType === "drinks") {
           sayIt(vr, t("step4_confirm_time_ask_party_size.kitchenClosed.main"));
         }
 
@@ -1148,7 +1062,7 @@ app.post("/voice", async (req, res) => {
           if (bumpRetries(session) > 2) {
             sayIt(vr, t("step5_party_size_ask_notes.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-            sayIt(vr, "Puoi richiamare più tardi. Grazie.");
+            sayIt(vr, t("step9_fallback_transfer_operator.main"));
             break;
           }
           gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
@@ -1160,7 +1074,7 @@ app.post("/voice", async (req, res) => {
           if (bumpRetries(session) > 2) {
             sayIt(vr, t("step5_party_size_ask_notes.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-            sayIt(vr, "Grazie.");
+            sayIt(vr, t("step9_fallback_transfer_operator.main"));
             break;
           }
           gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
@@ -1182,7 +1096,7 @@ app.post("/voice", async (req, res) => {
             session.step = 6;
             gatherSpeech(
               vr,
-              "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+              "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
             );
             break;
           }
@@ -1195,7 +1109,7 @@ app.post("/voice", async (req, res) => {
         session.step = 6;
         gatherSpeech(
           vr,
-          "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+          "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
         );
         break;
       }
@@ -1244,15 +1158,15 @@ app.post("/voice", async (req, res) => {
           session.preorderLabel = null;
           resetRetries(session);
           session.step = 8;
-          gatherSpeech(vr, "Ok. Preferisci sala interna o sala esterna? Ti consiglio l'interno.");
+          gatherSpeech(vr, "Perfetto. Preferisci sala interna o sala esterna? Ti consiglio l'interno.");
           break;
         }
 
         if (opt.constraints && opt.constraints.minTime) {
           if (!isTimeAtOrAfter(session.time24, opt.constraints.minTime)) {
-            sayIt(vr, "Il dopocena è disponibile solo dopo le 22 e 30.");
+            sayIt(vr, t("step4_confirm_time_ask_party_size.afterDinner"));
             resetRetries(session);
-            gatherSpeech(vr, "Vuoi scegliere tra cena, apericena o piatto apericena? Oppure dì nessuno.");
+            gatherSpeech(vr, "Puoi scegliere: cena, apericena o piatto apericena. Oppure dì nessuno.");
             break;
           }
         }
@@ -1291,6 +1205,7 @@ app.post("/voice", async (req, res) => {
             gatherSpeech(vr, t("step7_whatsapp_number.main"));
             break;
           }
+
           if (area === "outside" || tt.includes("confermo") || tt.includes("va bene esterno")) {
             session.area = "outside";
             session.pendingOutsideConfirm = false;
@@ -1344,8 +1259,9 @@ app.post("/voice", async (req, res) => {
       }
 
       case 10: {
-        // ✅ FIX CRITICO: lo step telefono NON deve mai interrompere il flusso.
-        // Dopo 2 tentativi falliti, proseguiamo senza telefono/WA e salviamo comunque su Calendar (prenotazione parziale).
+        // ✅ FIX CRITICO:
+        // lo step telefono NON deve mai interrompere il flusso.
+        // Dopo 2 tentativi falliti, proseguiamo senza telefono/WA e salviamo comunque su Calendar.
 
         if (emptySpeech) {
           if (bumpRetries(session) <= 2) {
@@ -1373,6 +1289,7 @@ app.post("/voice", async (req, res) => {
           }
         }
 
+        // durata
         const d = new Date(`${session.dateISO}T00:00:00`);
         session.durationMinutes = getDurationMinutes(session.people, d);
 
@@ -1389,10 +1306,11 @@ app.post("/voice", async (req, res) => {
         if (!calendar) {
           sayIt(vr, t("step9_fallback_transfer_operator.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, "Puoi richiamare più tardi. Grazie.");
+          sayIt(vr, t("step9_fallback_transfer_operator.short"));
           break;
         }
 
+        // blocco “locale chiuso” + controllo “no promo”
         let isClosed = false;
         let hasNoPromo = false;
 
@@ -1401,6 +1319,7 @@ app.post("/voice", async (req, res) => {
           hasNoPromo = await calendarHasMarkerOnDate(calendar, session.dateISO, "no promo");
         } catch (err) {
           console.error("[CALENDAR] marker checks error:", err);
+          // se non riesco a controllare, tratto come "no promo" per sicurezza
           isClosed = false;
           hasNoPromo = true;
         }
@@ -1408,7 +1327,7 @@ app.post("/voice", async (req, res) => {
         if (isClosed) {
           sayIt(vr, t("step9_fallback_transfer_operator.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, "Grazie.");
+          sayIt(vr, t("step9_fallback_transfer_operator.short"));
           vr.hangup();
           sessions.delete(callSid);
           break;
@@ -1417,6 +1336,7 @@ app.post("/voice", async (req, res) => {
         const dayOk = isPromoEligibleByDay(session.dateISO);
         session.promoEligible = dayOk && !hasNoPromo;
 
+        // tavoli occupati
         let lockedSet;
         try {
           lockedSet = await getLockedTables(calendar, session.dateISO);
@@ -1424,15 +1344,16 @@ app.post("/voice", async (req, res) => {
           console.error("[CALENDAR] getLockedTables error:", err);
           sayIt(vr, t("step9_fallback_transfer_operator.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, "Puoi richiamare più tardi. Grazie.");
+          sayIt(vr, t("step9_fallback_transfer_operator.short"));
           break;
         }
 
+        // assegna tavolo (priorità: combaciare pax)
         const chosen = allocateTable({ area: session.area, people: session.people, lockedSet });
         if (!chosen) {
           sayIt(vr, t("step9_fallback_transfer_operator.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, "Puoi provare un altro orario. Grazie.");
+          sayIt(vr, t("step9_fallback_transfer_operator.short"));
           break;
         }
 
@@ -1440,7 +1361,7 @@ app.post("/voice", async (req, res) => {
         session.tableLocks = chosen.locks;
         session.tableNotes = chosen.notes || null;
 
-        // ✅ Calendar SEMPRE (anche prenotazione parziale)
+        // crea evento (sempre, anche senza telefono)
         try {
           await createBookingEvent({
             callSid,
@@ -1467,11 +1388,11 @@ app.post("/voice", async (req, res) => {
           console.error("[CALENDAR] create error:", e);
           sayIt(vr, t("step9_fallback_transfer_operator.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, "Puoi richiamare più tardi. Grazie.");
+          sayIt(vr, t("step9_fallback_transfer_operator.short"));
           break;
         }
 
-        // ✅ WhatsApp SOLO se numero valido (e Calendar OK)
+        // WhatsApp solo se valido
         if (session.autoConfirm && session.waTo && hasValidWaAddress(session.waTo)) {
           try {
             await sendWhatsAppConfirmation({
@@ -1494,13 +1415,12 @@ app.post("/voice", async (req, res) => {
           }
         }
 
+        // finale voce
         if (session.waTo && hasValidWaAddress(session.waTo)) {
           sayIt(vr, t("step9_success.main"));
         } else {
-          sayIt(
-            vr,
-            "Perfetto, ho registrato la prenotazione. Se vuoi ricevere la conferma su WhatsApp, puoi richiamare e lasciarmi con calma il numero."
-          );
+          // niente testo “whatsapp” dei prompts perché qui non abbiamo WhatsApp
+          sayIt(vr, "Perfetto, ho registrato la prenotazione. Se vuoi ricevere la conferma su WhatsApp, puoi richiamare e lasciarmi con calma il numero.");
         }
         sayIt(vr, t("step9_success.goodbye"));
 
@@ -1520,13 +1440,12 @@ app.post("/voice", async (req, res) => {
     return res.type("text/xml").send(vr.toString());
   } catch (err) {
     console.error("[VOICE] Error:", err);
-    sayIt(vr, "Mi dispiace, c'è stato un errore tecnico. Riprova tra poco.");
+
     if (canForwardToHuman()) {
-      sayIt(vr, t("step9_fallback_transfer_operator.main"));
-      vr.dial({}, HUMAN_FORWARD_TO);
-    } else {
-      vr.hangup();
+      return res.type("text/xml").send(forwardToHumanTwiml());
     }
+
+    sayIt(vr, t("step9_fallback_transfer_operator.main"));
     return res.type("text/xml").send(vr.toString());
   }
 });
@@ -1536,6 +1455,5 @@ app.get("/", (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`[BOOT] Listening on port ${PORT}`);
-  console.log(`[BOOT] BASE_URL=${BASE_URL}`);
+  console.log(`Voice assistant running on port ${PORT}`);
 });
