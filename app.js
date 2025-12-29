@@ -1,15 +1,14 @@
 /**
  * app.js — TuttiBrilli Enoteca Voice Assistant
- * - dotenv opzionale (non rompe su Render se dotenv non installato)
- * - sayIt() NON forza "alice" (usa voce configurata su Twilio Console)
- * - Fix: chiamata non si interrompe al telefono
- * - Fix: prenotazione parziale su Calendar se telefono non valido
- * - Parsing date/telefono robusti + default +39
+ * FIX CRITICO: la chiamata non cade allo step telefono
+ * - /voice gestisce SOLO dialogo/gather (risposte veloci)
+ * - /finalize esegue Calendar + WhatsApp (operazioni pesanti) via redirect Twilio
+ * - dotenv opzionale (no crash su Render)
  */
 
 "use strict";
 
-// dotenv opzionale: in produzione (Render) le env vars sono già presenti
+// dotenv opzionale: su Render non serve
 try {
   require("dotenv").config();
 } catch (_) {}
@@ -27,7 +26,7 @@ app.use(express.json());
 
 // ======================= ENV =======================
 const PORT = process.env.PORT || 3000;
-const BASE_URL = process.env.BASE_URL || "";
+const BASE_URL = process.env.BASE_URL || ""; // su Render metti https://<tuo-servizio>.onrender.com
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
@@ -145,15 +144,14 @@ function buildTwiml() {
 }
 
 /**
- * VOICE FIX: NON forziamo "alice"
- * Twilio userà la voce configurata in Console (es. Chirp3-HD-Aoede)
+ * NON forziamo "alice": usa voce configurata su Twilio Console
  */
 function sayIt(response, text) {
   response.say({ language: "it-IT" }, text);
 }
 
 function gatherSpeech(response, promptText) {
-  const actionUrl = `${BASE_URL}/voice`;
+  const actionUrl = BASE_URL ? `${BASE_URL}/voice` : "/voice";
   const gather = response.gather({
     input: "speech",
     language: "it-IT",
@@ -230,7 +228,7 @@ function resetRetries(session) {
   session.retries = 0;
 }
 
-// ======================= PARSING & UTIL =======================
+// ======================= UTIL/PARSING =======================
 function normalizeText(s) {
   return String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -240,10 +238,6 @@ function toISODate(d) {
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
-}
-
-function nowLocal() {
-  return new Date();
 }
 
 // ---- Back/edit commands
@@ -295,7 +289,7 @@ function promptForStep(vr, session) {
     case 6:
       gatherSpeech(
         vr,
-        "Vuoi preordinare qualcosa? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+        "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
       );
       return;
     case 8:
@@ -310,7 +304,7 @@ function promptForStep(vr, session) {
   }
 }
 
-// ---- Date parsing robusto
+// ---- Date parsing robusto (come prima, completo)
 function parseItalianNumberToInt(text) {
   const t = normalizeText(text).replace(/[-,\.]/g, " ").replace(/\s+/g, " ").trim();
 
@@ -346,7 +340,7 @@ function parseItalianNumberToInt(text) {
 function parseDateIT(speech) {
   const t0 = normalizeText(speech);
   const t = t0.replace(/[,\.]/g, " ").replace(/\s+/g, " ").trim();
-  const today = nowLocal();
+  const today = new Date();
 
   if (t.includes("oggi")) return toISODate(today);
   if (t.includes("domani")) {
@@ -409,8 +403,8 @@ function parseDateIT(speech) {
     const target = weekdayMap[weekdayMatch[1]];
     const d = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     const current = d.getDay();
-    let diff = (target - current + 7) % 7;
 
+    let diff = (target - current + 7) % 7;
     if (hasProssimo) diff = diff === 0 ? 7 : diff + 7;
     else if (hasQuesto) {
       // ok
@@ -495,7 +489,7 @@ function parsePreorderChoiceKey(speech) {
   return "unknown";
 }
 
-// ---- Phone parsing robusto + default +39
+// ---- Phone parsing robusto + default +39 (come prima)
 function speechToDigitsIT(raw) {
   const t = normalizeText(raw);
   const map = { zero: "0", uno: "1", una: "1", due: "2", tre: "3", quattro: "4", cinque: "5", sei: "6", sette: "7", otto: "8", nove: "9" };
@@ -528,7 +522,6 @@ function speechToDigitsIT(raw) {
 function extractPhoneFromSpeech(speech) {
   if (!speech) return null;
 
-  // 1) cifre già presenti
   let raw = String(speech).replace(/[^\d+]/g, "");
   if (raw) {
     if (raw.startsWith("00")) raw = "+" + raw.slice(2);
@@ -551,7 +544,6 @@ function extractPhoneFromSpeech(speech) {
     }
   }
 
-  // 2) parole -> cifre
   const fromWords = speechToDigitsIT(speech);
   if (!fromWords) return null;
 
@@ -629,12 +621,6 @@ function getDurationMinutes(people, dateObj) {
   return minutes;
 }
 
-function toISODateWithOffset(dateISO, daysOffset) {
-  const d = new Date(`${dateISO}T00:00:00`);
-  d.setDate(d.getDate() + daysOffset);
-  return toISODate(d);
-}
-
 function computeStartEndLocal(dateISO, time24, durationMinutes) {
   const [sh, sm] = time24.split(":").map(Number);
   const startTotal = sh * 60 + sm;
@@ -645,7 +631,12 @@ function computeStartEndLocal(dateISO, time24, durationMinutes) {
   const endH = Math.floor(endMinutesOfDay / 60);
   const endM = endMinutesOfDay % 60;
 
-  const endDateISO = endDayOffset > 0 ? toISODateWithOffset(dateISO, endDayOffset) : dateISO;
+  let endDateISO = dateISO;
+  if (endDayOffset > 0) {
+    const d = new Date(`${dateISO}T00:00:00`);
+    d.setDate(d.getDate() + endDayOffset);
+    endDateISO = toISODate(d);
+  }
 
   const startLocal = `${dateISO}T${String(sh).padStart(2, "0")}:${String(sm).padStart(2, "0")}:00`;
   const endLocal = `${endDateISO}T${String(endH).padStart(2, "0")}:${String(endM).padStart(2, "0")}:00`;
@@ -694,18 +685,44 @@ function containsMarker(ev, markerLower) {
   return s.includes(markerLower);
 }
 
-async function calendarHasMarkerOnDate(calendar, dateISO, markerLower) {
+function parseLocksFromEvent(ev) {
+  const d = String(ev.description || "");
+  const m = d.match(/LOCKS:\s*([A-Z0-9,]+)/i);
+  if (!m) return [];
+  return m[1].split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * ✅ UNA SOLA CHIAMATA Calendar per:
+ * - locale chiuso
+ * - no promo
+ * - locks tavoli
+ */
+async function getDayCalendarSnapshot(calendar, dateISO) {
   const timeMin = `${dateISO}T00:00:00Z`;
   const timeMax = `${dateISO}T23:59:59Z`;
+
   const resp = await calendar.events.list({
     calendarId: GOOGLE_CALENDAR_ID,
     timeMin,
     timeMax,
     singleEvents: true,
-    maxResults: 250,
     orderBy: "startTime",
+    maxResults: 250,
   });
-  return (resp.data.items || []).some((ev) => containsMarker(ev, markerLower));
+
+  const items = resp.data.items || [];
+  const locked = new Set();
+  let isClosed = false;
+  let hasNoPromo = false;
+
+  for (const ev of items) {
+    if (containsMarker(ev, "locale chiuso")) isClosed = true;
+    if (containsMarker(ev, "no promo")) hasNoPromo = true;
+    for (const tId of parseLocksFromEvent(ev)) locked.add(tId);
+  }
+
+  return { isClosed, hasNoPromo, lockedSet: locked };
 }
 
 function isPromoEligibleByDay(dateISO) {
@@ -715,33 +732,6 @@ function isPromoEligibleByDay(dateISO) {
   if (!allowedDay) return false;
   if (HOLIDAYS_SET.has(dateISO)) return false;
   return true;
-}
-
-function parseLocksFromEvent(ev) {
-  const d = String(ev.description || "");
-  const m = d.match(/LOCKS:\s*([A-Z0-9,]+)/i);
-  if (!m) return [];
-  return m[1].split(",").map((s) => s.trim()).filter(Boolean);
-}
-
-async function getLockedTables(calendar, dateISO) {
-  const timeMin = `${dateISO}T00:00:00Z`;
-  const timeMax = `${dateISO}T23:59:59Z`;
-
-  const resp = await calendar.events.list({
-    calendarId: GOOGLE_CALENDAR_ID,
-    timeMin,
-    timeMax,
-    singleEvents: true,
-    orderBy: "startTime",
-    maxResults: 250,
-  });
-
-  const locked = new Set();
-  for (const ev of resp.data.items || []) {
-    for (const tId of parseLocksFromEvent(ev)) locked.add(tId);
-  }
-  return locked;
 }
 
 // ======================= TABLE ALLOCATION =======================
@@ -788,35 +778,33 @@ function allocateTable({ area, people, lockedSet }) {
 }
 
 // ======================= EVENT CREATION (IDEMPOTENT) =======================
-async function createBookingEvent({
-  callSid,
-  name,
-  dateISO,
-  time24,
-  people,
-  phone,
-  waTo,
-  area,
-  bookingType,
-  autoConfirm,
-  durationMinutes,
-  tableDisplayId,
-  tableLocks,
-  tableNotes,
-  specialRequestsRaw,
-  preorderLabel,
-  preorderPriceText,
-  outsideDisclaimer,
-  promoEligible,
-}) {
-  const calendar = getCalendarClient();
-  if (!calendar) throw new Error("Calendar client not configured");
+async function createBookingEvent(calendar, payload) {
+  const {
+    callSid,
+    name,
+    dateISO,
+    time24,
+    people,
+    phone,
+    waTo,
+    area,
+    bookingType,
+    autoConfirm,
+    durationMinutes,
+    tableDisplayId,
+    tableLocks,
+    tableNotes,
+    specialRequestsRaw,
+    preorderLabel,
+    preorderPriceText,
+    outsideDisclaimer,
+    promoEligible,
+  } = payload;
 
   const tz = GOOGLE_CALENDAR_TZ;
   const { startLocal, endLocal } = computeStartEndLocal(dateISO, time24, durationMinutes);
   const privateKey = `callsid:${callSid || "no-callsid"}`;
 
-  // Idempotenza su CallSid (salvata nel description)
   const existing = await calendar.events.list({
     calendarId: GOOGLE_CALENDAR_ID,
     q: privateKey,
@@ -872,25 +860,27 @@ async function createBookingEvent({
   return { created: true, eventId: resp.data.id };
 }
 
-// ======================= WHATSAPP CONFIRMATION =======================
-async function sendWhatsAppConfirmation({
-  waTo,
-  name,
-  dateISO,
-  time24,
-  people,
-  tableDisplayId,
-  area,
-  specialRequestsRaw,
-  preorderLabel,
-  preorderPriceText,
-  outsideDisclaimer,
-  bookingType,
-  promoEligible,
-}) {
-  if (!twilioClient) throw new Error("Twilio client not configured");
-  if (!TWILIO_WHATSAPP_FROM) throw new Error("Missing TWILIO_WHATSAPP_FROM");
-  if (!waTo || !hasValidWaAddress(waTo)) throw new Error("Invalid WhatsApp address");
+// ======================= WHATSAPP (fire-and-forget) =======================
+async function sendWhatsAppConfirmation(payload) {
+  const {
+    waTo,
+    name,
+    dateISO,
+    time24,
+    people,
+    tableDisplayId,
+    area,
+    specialRequestsRaw,
+    preorderLabel,
+    preorderPriceText,
+    outsideDisclaimer,
+    bookingType,
+    promoEligible,
+  } = payload;
+
+  if (!twilioClient) return;
+  if (!TWILIO_WHATSAPP_FROM) return;
+  if (!waTo || !hasValidWaAddress(waTo)) return;
 
   const lines = [
     `Ciao ${name}! Prenotazione registrata ✅`,
@@ -921,23 +911,24 @@ async function sendWhatsAppConfirmation({
 
   const body = lines.join("\n");
 
-  const msg = await twilioClient.messages.create({
+  await twilioClient.messages.create({
     from: TWILIO_WHATSAPP_FROM,
     to: waTo,
     body,
   });
-
-  return msg.sid;
 }
 
 // ======================= ROUTES =======================
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+/**
+ * /voice: SOLO dialogo (risposte rapide).
+ * IMPORTANTISSIMO: allo step 10 dopo aver salvato il numero facciamo redirect a /finalize.
+ */
 app.post("/voice", async (req, res) => {
   const callSid = req.body.CallSid || "";
   const speech = req.body.SpeechResult || "";
   const session = getSession(callSid);
-
   const vr = buildTwiml();
 
   try {
@@ -948,7 +939,7 @@ app.post("/voice", async (req, res) => {
 
     const emptySpeech = !normalizeText(speech);
 
-    // Back / modifica
+    // comandi indietro/modifica
     if (!emptySpeech && isBackCommand(speech)) {
       resetRetries(session);
       goBack(session);
@@ -974,9 +965,8 @@ app.post("/voice", async (req, res) => {
       case 2: {
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, t("step3_confirm_date_ask_time.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-            sayIt(vr, "Puoi richiamare più tardi. Grazie.");
+            sayIt(vr, t("step9_fallback_transfer_operator.main"));
             break;
           }
           gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
@@ -986,9 +976,8 @@ app.post("/voice", async (req, res) => {
         const dateISO = parseDateIT(speech);
         if (!dateISO) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, t("step3_confirm_date_ask_time.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-            sayIt(vr, "Puoi richiamare più tardi. Grazie.");
+            sayIt(vr, t("step9_fallback_transfer_operator.main"));
             break;
           }
           gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
@@ -1005,9 +994,8 @@ app.post("/voice", async (req, res) => {
       case 3: {
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, t("step4_confirm_time_ask_party_size.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-            sayIt(vr, "Puoi richiamare più tardi. Grazie.");
+            sayIt(vr, t("step9_fallback_transfer_operator.main"));
             break;
           }
           gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"));
@@ -1017,9 +1005,8 @@ app.post("/voice", async (req, res) => {
         const time24 = parseTimeIT(speech);
         if (!time24) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, t("step4_confirm_time_ask_party_size.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-            sayIt(vr, "Puoi richiamare più tardi. Grazie.");
+            sayIt(vr, t("step9_fallback_transfer_operator.main"));
             break;
           }
           gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"));
@@ -1035,13 +1022,12 @@ app.post("/voice", async (req, res) => {
         if (bookingType === "closed") {
           sayIt(vr, t("step4_confirm_time_ask_party_size.outsideHours.main"));
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, "Puoi richiamare durante l'orario di apertura. Grazie.");
+          sayIt(vr, t("step9_fallback_transfer_operator.main"));
           break;
         }
 
         if (bookingType === "operator") {
-          // lunedì gestito da operatore
-          sayIt(vr, t("step9_fallback_transfer_operator.gentle"));
+          // lunedì: operatore
           if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
           sayIt(vr, t("step9_fallback_transfer_operator.main"));
           break;
@@ -1060,7 +1046,6 @@ app.post("/voice", async (req, res) => {
       case 4: {
         if (emptySpeech) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, t("step5_party_size_ask_notes.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, t("step9_fallback_transfer_operator.main"));
             break;
@@ -1072,7 +1057,6 @@ app.post("/voice", async (req, res) => {
         const people = parsePeopleIT(speech);
         if (!people || people < 1 || people > 18) {
           if (bumpRetries(session) > 2) {
-            sayIt(vr, t("step5_party_size_ask_notes.error"));
             if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
             sayIt(vr, t("step9_fallback_transfer_operator.main"));
             break;
@@ -1153,16 +1137,7 @@ app.post("/voice", async (req, res) => {
         }
 
         const opt = getPreorderOptionByKey(key);
-        if (!opt) {
-          session.preorderChoiceKey = null;
-          session.preorderLabel = null;
-          resetRetries(session);
-          session.step = 8;
-          gatherSpeech(vr, "Perfetto. Preferisci sala interna o sala esterna? Ti consiglio l'interno.");
-          break;
-        }
-
-        if (opt.constraints && opt.constraints.minTime) {
+        if (opt && opt.constraints && opt.constraints.minTime) {
           if (!isTimeAtOrAfter(session.time24, opt.constraints.minTime)) {
             sayIt(vr, t("step4_confirm_time_ask_party_size.afterDinner"));
             resetRetries(session);
@@ -1171,8 +1146,8 @@ app.post("/voice", async (req, res) => {
           }
         }
 
-        session.preorderChoiceKey = opt.key;
-        session.preorderLabel = opt.label;
+        session.preorderChoiceKey = opt ? opt.key : null;
+        session.preorderLabel = opt ? opt.label : null;
 
         resetRetries(session);
         session.step = 8;
@@ -1259,10 +1234,7 @@ app.post("/voice", async (req, res) => {
       }
 
       case 10: {
-        // ✅ FIX CRITICO:
-        // lo step telefono NON deve mai interrompere il flusso.
-        // Dopo 2 tentativi falliti, proseguiamo senza telefono/WA e salviamo comunque su Calendar.
-
+        // STEP TELEFONO: qui NON facciamo Calendar. Salviamo e REDIRECT a /finalize.
         if (emptySpeech) {
           if (bumpRetries(session) <= 2) {
             gatherSpeech(vr, t("step7_whatsapp_number.error"));
@@ -1289,143 +1261,12 @@ app.post("/voice", async (req, res) => {
           }
         }
 
-        // durata
-        const d = new Date(`${session.dateISO}T00:00:00`);
-        session.durationMinutes = getDurationMinutes(session.people, d);
+        // ✅ risposta veloce + redirect (evita timeout Twilio)
+        sayIt(vr, t("step7_whatsapp_number.afterCapture"));
 
-        const outsideDisclaimer =
-          session.area === "outside" ? "Tavolo esterno: in caso di maltempo non è garantito il posto all'interno." : null;
+        const finalizeUrl = BASE_URL ? `${BASE_URL}/finalize` : "/finalize";
+        vr.redirect({ method: "POST" }, finalizeUrl);
 
-        let preorderPriceText = null;
-        if (session.preorderChoiceKey) {
-          const opt = getPreorderOptionByKey(session.preorderChoiceKey);
-          if (opt && typeof opt.priceEUR === "number") preorderPriceText = `${opt.priceEUR} €`;
-        }
-
-        const calendar = getCalendarClient();
-        if (!calendar) {
-          sayIt(vr, t("step9_fallback_transfer_operator.main"));
-          if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, t("step9_fallback_transfer_operator.short"));
-          break;
-        }
-
-        // blocco “locale chiuso” + controllo “no promo”
-        let isClosed = false;
-        let hasNoPromo = false;
-
-        try {
-          isClosed = await calendarHasMarkerOnDate(calendar, session.dateISO, "locale chiuso");
-          hasNoPromo = await calendarHasMarkerOnDate(calendar, session.dateISO, "no promo");
-        } catch (err) {
-          console.error("[CALENDAR] marker checks error:", err);
-          // se non riesco a controllare, tratto come "no promo" per sicurezza
-          isClosed = false;
-          hasNoPromo = true;
-        }
-
-        if (isClosed) {
-          sayIt(vr, t("step9_fallback_transfer_operator.main"));
-          if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, t("step9_fallback_transfer_operator.short"));
-          vr.hangup();
-          sessions.delete(callSid);
-          break;
-        }
-
-        const dayOk = isPromoEligibleByDay(session.dateISO);
-        session.promoEligible = dayOk && !hasNoPromo;
-
-        // tavoli occupati
-        let lockedSet;
-        try {
-          lockedSet = await getLockedTables(calendar, session.dateISO);
-        } catch (err) {
-          console.error("[CALENDAR] getLockedTables error:", err);
-          sayIt(vr, t("step9_fallback_transfer_operator.main"));
-          if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, t("step9_fallback_transfer_operator.short"));
-          break;
-        }
-
-        // assegna tavolo (priorità: combaciare pax)
-        const chosen = allocateTable({ area: session.area, people: session.people, lockedSet });
-        if (!chosen) {
-          sayIt(vr, t("step9_fallback_transfer_operator.main"));
-          if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, t("step9_fallback_transfer_operator.short"));
-          break;
-        }
-
-        session.tableDisplayId = chosen.displayId;
-        session.tableLocks = chosen.locks;
-        session.tableNotes = chosen.notes || null;
-
-        // crea evento (sempre, anche senza telefono)
-        try {
-          await createBookingEvent({
-            callSid,
-            name: session.name,
-            dateISO: session.dateISO,
-            time24: session.time24,
-            people: session.people,
-            phone: session.phone,
-            waTo: session.waTo,
-            area: session.area,
-            bookingType: session.bookingType,
-            autoConfirm: session.autoConfirm,
-            durationMinutes: session.durationMinutes,
-            tableDisplayId: session.tableDisplayId,
-            tableLocks: session.tableLocks,
-            tableNotes: session.tableNotes,
-            specialRequestsRaw: session.specialRequestsRaw,
-            preorderLabel: session.preorderLabel,
-            preorderPriceText,
-            outsideDisclaimer,
-            promoEligible: Boolean(session.promoEligible),
-          });
-        } catch (e) {
-          console.error("[CALENDAR] create error:", e);
-          sayIt(vr, t("step9_fallback_transfer_operator.main"));
-          if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
-          sayIt(vr, t("step9_fallback_transfer_operator.short"));
-          break;
-        }
-
-        // WhatsApp solo se valido
-        if (session.autoConfirm && session.waTo && hasValidWaAddress(session.waTo)) {
-          try {
-            await sendWhatsAppConfirmation({
-              waTo: session.waTo,
-              name: session.name,
-              dateISO: session.dateISO,
-              time24: session.time24,
-              people: session.people,
-              tableDisplayId: session.tableDisplayId,
-              area: session.area,
-              specialRequestsRaw: session.specialRequestsRaw,
-              preorderLabel: session.preorderLabel,
-              preorderPriceText,
-              outsideDisclaimer,
-              bookingType: session.bookingType,
-              promoEligible: Boolean(session.promoEligible),
-            });
-          } catch (e) {
-            console.error("[WHATSAPP] send error:", e);
-          }
-        }
-
-        // finale voce
-        if (session.waTo && hasValidWaAddress(session.waTo)) {
-          sayIt(vr, t("step9_success.main"));
-        } else {
-          // niente testo “whatsapp” dei prompts perché qui non abbiamo WhatsApp
-          sayIt(vr, "Perfetto, ho registrato la prenotazione. Se vuoi ricevere la conferma su WhatsApp, puoi richiamare e lasciarmi con calma il numero.");
-        }
-        sayIt(vr, t("step9_success.goodbye"));
-
-        vr.hangup();
-        sessions.delete(callSid);
         break;
       }
 
@@ -1440,12 +1281,140 @@ app.post("/voice", async (req, res) => {
     return res.type("text/xml").send(vr.toString());
   } catch (err) {
     console.error("[VOICE] Error:", err);
+    if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
+    sayIt(vr, t("step9_fallback_transfer_operator.main"));
+    return res.type("text/xml").send(vr.toString());
+  }
+});
 
-    if (canForwardToHuman()) {
-      return res.type("text/xml").send(forwardToHumanTwiml());
+/**
+ * /finalize: qui facciamo Calendar + WhatsApp.
+ * Twilio ci arriva con redirect dopo lo step telefono.
+ */
+app.post("/finalize", async (req, res) => {
+  const callSid = req.body.CallSid || "";
+  const session = getSession(callSid);
+  const vr = buildTwiml();
+
+  try {
+    if (!session || !session.name || !session.dateISO || !session.time24 || !session.people || !session.area) {
+      sayIt(vr, t("step9_fallback_transfer_operator.main"));
+      if (canForwardToHuman()) {
+        vr.dial({}, HUMAN_FORWARD_TO);
+      } else {
+        vr.hangup();
+      }
+      return res.type("text/xml").send(vr.toString());
     }
 
+    const calendar = getCalendarClient();
+    if (!calendar) {
+      sayIt(vr, t("step9_fallback_transfer_operator.main"));
+      if (canForwardToHuman()) vr.dial({}, HUMAN_FORWARD_TO);
+      else vr.hangup();
+      return res.type("text/xml").send(vr.toString());
+    }
+
+    // durata
+    const d = new Date(`${session.dateISO}T00:00:00`);
+    session.durationMinutes = getDurationMinutes(session.people, d);
+
+    const outsideDisclaimer =
+      session.area === "outside" ? "Tavolo esterno: in caso di maltempo non è garantito il posto all'interno." : null;
+
+    let preorderPriceText = null;
+    if (session.preorderChoiceKey) {
+      const opt = getPreorderOptionByKey(session.preorderChoiceKey);
+      if (opt && typeof opt.priceEUR === "number") preorderPriceText = `${opt.priceEUR} €`;
+    }
+
+    // ✅ UNA SOLA list per chiusura/no promo/locks
+    const snap = await getDayCalendarSnapshot(calendar, session.dateISO);
+
+    if (snap.isClosed) {
+      sayIt(vr, t("step9_fallback_transfer_operator.main"));
+      if (canForwardToHuman()) vr.dial({}, HUMAN_FORWARD_TO);
+      else vr.hangup();
+      sessions.delete(callSid);
+      return res.type("text/xml").send(vr.toString());
+    }
+
+    const dayOk = isPromoEligibleByDay(session.dateISO);
+    session.promoEligible = dayOk && !snap.hasNoPromo;
+
+    // assegna tavolo
+    const chosen = allocateTable({ area: session.area, people: session.people, lockedSet: snap.lockedSet });
+    if (!chosen) {
+      sayIt(vr, t("step9_fallback_transfer_operator.main"));
+      if (canForwardToHuman()) vr.dial({}, HUMAN_FORWARD_TO);
+      else vr.hangup();
+      sessions.delete(callSid);
+      return res.type("text/xml").send(vr.toString());
+    }
+
+    session.tableDisplayId = chosen.displayId;
+    session.tableLocks = chosen.locks;
+    session.tableNotes = chosen.notes || null;
+
+    // crea evento (sempre, anche senza telefono)
+    await createBookingEvent(calendar, {
+      callSid,
+      name: session.name,
+      dateISO: session.dateISO,
+      time24: session.time24,
+      people: session.people,
+      phone: session.phone,
+      waTo: session.waTo,
+      area: session.area,
+      bookingType: session.bookingType,
+      autoConfirm: session.autoConfirm,
+      durationMinutes: session.durationMinutes,
+      tableDisplayId: session.tableDisplayId,
+      tableLocks: session.tableLocks,
+      tableNotes: session.tableNotes,
+      specialRequestsRaw: session.specialRequestsRaw,
+      preorderLabel: session.preorderLabel,
+      preorderPriceText,
+      outsideDisclaimer,
+      promoEligible: Boolean(session.promoEligible),
+    });
+
+    // WhatsApp solo se numero valido (fire-and-forget)
+    if (session.autoConfirm && session.waTo && hasValidWaAddress(session.waTo)) {
+      sendWhatsAppConfirmation({
+        waTo: session.waTo,
+        name: session.name,
+        dateISO: session.dateISO,
+        time24: session.time24,
+        people: session.people,
+        tableDisplayId: session.tableDisplayId,
+        area: session.area,
+        specialRequestsRaw: session.specialRequestsRaw,
+        preorderLabel: session.preorderLabel,
+        preorderPriceText,
+        outsideDisclaimer,
+        bookingType: session.bookingType,
+        promoEligible: Boolean(session.promoEligible),
+      }).catch((e) => console.error("[WHATSAPP] send error:", e));
+    }
+
+    // voce finale
+    if (session.waTo && hasValidWaAddress(session.waTo)) {
+      sayIt(vr, t("step9_success.main"));
+    } else {
+      sayIt(vr, "Perfetto, ho registrato la prenotazione. Se vuoi ricevere la conferma su WhatsApp, puoi richiamare e lasciarmi con calma il numero.");
+    }
+    sayIt(vr, t("step9_success.goodbye"));
+
+    vr.hangup();
+    sessions.delete(callSid);
+    return res.type("text/xml").send(vr.toString());
+  } catch (err) {
+    console.error("[FINALIZE] error:", err);
+    if (canForwardToHuman()) return res.type("text/xml").send(forwardToHumanTwiml());
     sayIt(vr, t("step9_fallback_transfer_operator.main"));
+    vr.hangup();
+    sessions.delete(callSid);
     return res.type("text/xml").send(vr.toString());
   }
 });
