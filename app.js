@@ -1,9 +1,19 @@
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
+
 // dotenv opzionale (su Render non serve)
-try {
+const dotenvModuleDir = path.join(__dirname, "node_modules", "dotenv");
+const dotenvPackageJson = path.join(dotenvModuleDir, "package.json");
+const dotenvEntryPoint = path.join(dotenvModuleDir, "index.js");
+const hasDotenv =
+  fs.existsSync(dotenvPackageJson) ||
+  fs.existsSync(dotenvEntryPoint) ||
+  fs.existsSync(dotenvModuleDir);
+if (hasDotenv) {
   require("dotenv").config();
-} catch (_) {}
+}
 
 const express = require("express");
 const twilio = require("twilio");
