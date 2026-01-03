@@ -48,6 +48,9 @@ const HOLIDAYS_SET = new Set(HOLIDAYS_YYYY_MM_DD.split(",").map((s) => s.trim())
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
+const YES_WORDS = ["si", "sì", "certo", "confermo", "ok", "va bene", "perfetto", "esatto"];
+const NO_WORDS = ["no", "non", "annulla", "cancella", "negativo"];
+
 // ======================= OPENING HOURS =======================
 const OPENING = {
   closedDay: 1, // Monday
@@ -151,7 +154,6 @@ function buildTwiml() {
 }
 
 function sayIt(response, text) {
-  // ESCAPE per evitare XML rotto (’ ecc)
   response.say({ language: "it-IT" }, xmlEscape(text));
 }
 
@@ -164,7 +166,6 @@ function gatherSpeech(response, promptText) {
     action: actionUrl,
     method: "POST",
   });
-  // Anche qui escape
   gather.say({ language: "it-IT" }, xmlEscape(promptText));
 }
 
@@ -259,8 +260,8 @@ function goBack(session) {
   else if (session.step === 4) session.step = 3;
   else if (session.step === 5) session.step = 4;
   else if (session.step === 6) session.step = 5;
-  else if (session.step === 8) session.step = 6;
-  else if (session.step === 10) session.step = 8;
+  else if (session.step === 7) session.step = 6;
+  else if (session.step === 8) session.step = 7;
   else session.step = Math.max(1, session.step - 1);
 }
 
@@ -277,13 +278,18 @@ function promptForStep(vr, session) {
         "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
       );
       return;
-    case 8: gatherSpeech(vr, "Preferisci sala interna o sala esterna? Ti consiglio l'interno."); return;
-    case 10: gatherSpeech(vr, t("step7_whatsapp_number.main")); return;
+    case 7: gatherSpeech(vr, t("step7_whatsapp_number.main")); return;
+    case 8: gatherSpeech(vr, t("step8_summary_confirm.main", {
+      name: session.name || "",
+      dateLabel: session.dateISO || "",
+      time: session.time24 || "",
+      partySize: session.people || "",
+    })); return;
     default: gatherSpeech(vr, t("step1_welcome_name.short")); return;
   }
 }
 
-// ====== parsing basilari (per arrivare al punto: FIX crash step 5) ======
+// ====== parsing basilari ======
 function parseTimeIT(speech) {
   const tt = normalizeText(speech);
   const hm = tt.match(/(\d{1,2})[:\s](\d{2})/);
@@ -311,7 +317,26 @@ function parsePeopleIT(speech) {
   return n;
 }
 
-// ---- Date: user-friendly (stesso parser robusto, qui versione breve per stabilità)
+function parseYesNo(speech) {
+  const tt = normalizeText(speech);
+  if (!tt) return null;
+  if (YES_WORDS.some((w) => tt.includes(w))) return true;
+  if (NO_WORDS.some((w) => tt.includes(w))) return false;
+  return null;
+}
+
+function parseWhatsAppNumber(speech) {
+  const digits = String(speech || "").replace(/[^\d+]/g, "");
+  if (hasValidWaAddress(digits)) return digits;
+  if (isValidPhoneE164(digits)) return `whatsapp:${digits}`;
+  const justNumbers = String(speech || "").replace(/[^\d]/g, "");
+  if (justNumbers.length >= 8 && justNumbers.length <= 15) {
+    return `whatsapp:+${justNumbers}`;
+  }
+  return null;
+}
+
+// ---- Date parser
 function parseDateIT(speech) {
   const tt = normalizeText(speech).replace(/[,\.]/g, " ").replace(/\s+/g, " ").trim();
   const today = new Date();
@@ -347,6 +372,76 @@ function parseDateIT(speech) {
   }
 
   return null;
+}
+
+// ---- Google Calendar helpers
+function getGoogleCredentials() {
+  if (GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
+    try {
+      const decoded = Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
+      return JSON.parse(decoded);
+    } catch (err) {
+      console.error("[GOOGLE] Invalid base64 credentials:", err);
+    }
+  }
+  if (GOOGLE_SERVICE_ACCOUNT_JSON) {
+    try {
+      return JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
+    } catch (err) {
+      console.error("[GOOGLE] Invalid JSON credentials:", err);
+    }
+  }
+  return null;
+}
+
+function buildCalendarClient() {
+  const credentials = getGoogleCredentials();
+  if (!credentials) return null;
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ["https://www.googleapis.com/auth/calendar"],
+  });
+  return google.calendar({ version: "v3", auth });
+}
+
+async function createCalendarEvent(session) {
+  if (!GOOGLE_CALENDAR_ID) return null;
+  const calendar = buildCalendarClient();
+  if (!calendar) return null;
+  if (!session?.dateISO || !session?.time24 || !session?.name || !session?.people) return null;
+
+  const startDateTime = `${session.dateISO}T${session.time24}:00`;
+  const endDate = new Date(`${session.dateISO}T${session.time24}:00`);
+  endDate.setMinutes(endDate.getMinutes() + 120);
+  const endDateTime = `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, "0")}-${String(
+    endDate.getDate()
+  ).padStart(2, "0")}T${String(endDate.getHours()).padStart(2, "0")}:${String(
+    endDate.getMinutes()
+  ).padStart(2, "0")}:00`;
+
+  const event = {
+    summary: `Prenotazione ${session.name} (${session.people} pax)`,
+    description: [
+      `Nome: ${session.name}`,
+      `Persone: ${session.people}`,
+      `Note: ${session.specialRequestsRaw || "nessuna"}`,
+      `Preordine: ${session.preorderLabel || "nessuno"}`,
+      `WhatsApp: ${session.waTo || "non fornito"}`,
+    ].join("\n"),
+    start: { dateTime: startDateTime, timeZone: GOOGLE_CALENDAR_TZ },
+    end: { dateTime: endDateTime, timeZone: GOOGLE_CALENDAR_TZ },
+  };
+
+  try {
+    const result = await calendar.events.insert({
+      calendarId: GOOGLE_CALENDAR_ID,
+      requestBody: event,
+    });
+    return result?.data || null;
+  } catch (err) {
+    console.error("[GOOGLE] Calendar insert failed:", err);
+    return null;
+  }
 }
 
 // ======================= ROUTES =======================
@@ -434,16 +529,12 @@ app.post("/voice", async (req, res) => {
         }
         session.people = people;
         resetRetries(session);
-
-        // ✅ QUI: lo step che ti fa cadere la chiamata.
-        // Ora il testo è XML-safe + charset corretto, quindi non può più rompere TwiML.
         session.step = 5;
         gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people }));
         break;
       }
 
       case 5: {
-        // raccolta note (qui non facciamo nulla di pesante)
         session.specialRequestsRaw = emptySpeech ? "nessuna" : speech.trim().slice(0, 200);
         resetRetries(session);
         session.step = 6;
@@ -454,10 +545,87 @@ app.post("/voice", async (req, res) => {
         break;
       }
 
+      case 6: {
+        if (emptySpeech) {
+          promptForStep(vr, session);
+          break;
+        }
+        const normalized = normalizeText(speech);
+        if (normalized.includes("nessuno") || normalized.includes("niente") || normalized.includes("no")) {
+          session.preorderChoiceKey = null;
+          session.preorderLabel = "nessuno";
+        } else {
+          const option = PREORDER_OPTIONS.find((o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " ")));
+          if (option) {
+            session.preorderChoiceKey = option.key;
+            session.preorderLabel = option.label;
+          } else {
+            gatherSpeech(
+              vr,
+              "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+            );
+            break;
+          }
+        }
+        resetRetries(session);
+        session.step = 7;
+        gatherSpeech(vr, t("step7_whatsapp_number.main"));
+        break;
+      }
+
+      case 7: {
+        if (emptySpeech) {
+          gatherSpeech(vr, t("step7_whatsapp_number.error"));
+          break;
+        }
+        const waTo = parseWhatsAppNumber(speech);
+        if (!waTo) {
+          gatherSpeech(vr, t("step7_whatsapp_number.error"));
+          break;
+        }
+        session.waTo = waTo;
+        resetRetries(session);
+        session.step = 8;
+        gatherSpeech(vr, t("step8_summary_confirm.main", {
+          name: session.name || "",
+          dateLabel: session.dateISO || "",
+          time: session.time24 || "",
+          partySize: session.people || "",
+        }));
+        break;
+      }
+
+      case 8: {
+        const confirmation = parseYesNo(speech);
+        if (confirmation === null) {
+          gatherSpeech(vr, t("step8_summary_confirm.short", {
+            dateLabel: session.dateISO || "",
+            time: session.time24 || "",
+            partySize: session.people || "",
+          }));
+          break;
+        }
+        if (!confirmation) {
+          resetRetries(session);
+          goBack(session);
+          promptForStep(vr, session);
+          break;
+        }
+        await createCalendarEvent(session);
+        resetRetries(session);
+        session.step = 1;
+        gatherSpeech(vr, t("step9_success.main"));
+        break;
+      }
+
       default: {
-        sayIt(vr, t("step9_success.goodbye"));
-        vr.hangup();
-        sessions.delete(callSid);
+        if (canForwardToHuman()) {
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(forwardToHumanTwiml());
+        }
+        resetRetries(session);
+        session.step = 1;
+        gatherSpeech(vr, t("step1_welcome_name.short"));
         break;
       }
     }
@@ -475,9 +643,6 @@ app.post("/voice", async (req, res) => {
     return res.send(vr.toString());
   }
 });
-
-// NOTA: /finalize lo rimettiamo dopo, quando confermi che non cade più allo step 5.
-// (non serve per risolvere il crash delle intolleranze)
 
 app.get("/", (req, res) => {
   res.send("TuttiBrilli Voice Booking is running. Use POST /voice from Twilio.");
