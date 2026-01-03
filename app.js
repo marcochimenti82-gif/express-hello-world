@@ -49,6 +49,7 @@ const twilioClient =
 
 const YES_WORDS = ["si", "sì", "certo", "confermo", "ok", "va bene", "perfetto", "esatto"];
 const NO_WORDS = ["no", "non", "annulla", "cancella", "negativo"];
+const CANCEL_WORDS = ["annulla", "annullare", "cancella", "modifica"];
 
 // ======================= OPENING HOURS =======================
 const OPENING = {
@@ -205,6 +206,7 @@ function getSession(callSid) {
       waTo: null,
       tableDisplayId: null,
       tableLocks: [],
+      calendarEventId: null,
       tableNotes: null,
       durationMinutes: null,
       bookingType: "restaurant",
@@ -240,11 +242,15 @@ function isBackCommand(speech) {
     tt.includes("indietro") ||
     tt.includes("torna indietro") ||
     tt.includes("tornare indietro") ||
-    tt.includes("modifica") ||
     tt.includes("errore") ||
     tt.includes("ho sbagliato") ||
     tt.includes("sbagliato")
   );
+}
+
+function isCancelCommand(speech) {
+  const tt = normalizeText(speech);
+  return CANCEL_WORDS.some((word) => tt.includes(word));
 }
 
 function goBack(session) {
@@ -387,11 +393,158 @@ function buildCalendarClient() {
   return google.calendar({ version: "v3", auth });
 }
 
+function getTimeRangeForDate(dateISO) {
+  const start = new Date(`${dateISO}T00:00:00`);
+  const end = new Date(`${dateISO}T23:59:59`);
+  return { start, end };
+}
+
+function isDateClosedByCalendar(events) {
+  return events.some((event) => {
+    const summary = String(event.summary || "").toLowerCase();
+    const description = String(event.description || "").toLowerCase();
+    return summary.includes("locale chiuso") || description.includes("locale chiuso");
+  });
+}
+
+function extractTablesFromEvent(event) {
+  const description = String(event.description || "");
+  const match = description.match(/Tavolo:\s*([^\n]+)/i);
+  if (!match) return [];
+  return match[1]
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function getEventTimeRange(event) {
+  const start = event.start?.dateTime || event.start?.date;
+  const end = event.end?.dateTime || event.end?.date;
+  if (!start || !end) return null;
+  return {
+    start: new Date(start),
+    end: new Date(end),
+  };
+}
+
+function overlapsRange(a, b) {
+  return a.start < b.end && b.start < a.end;
+}
+
+function expandTableLocks(tableId) {
+  const combo = TABLE_COMBINATIONS.find((c) => c.displayId === tableId);
+  if (combo) return combo.replaces;
+  return [tableId];
+}
+
+function buildAvailableTables(occupied) {
+  return TABLES.filter((table) => !occupied.has(table.id));
+}
+
+function pickTableForParty(people, occupied) {
+  const availableTables = buildAvailableTables(occupied);
+  const direct = availableTables.find((table) => people >= table.min && people <= table.max);
+  if (direct) return { displayId: direct.id, locks: [direct.id], notes: direct.notes || null };
+
+  for (const combo of TABLE_COMBINATIONS) {
+    if (people < combo.min || people > combo.max) continue;
+    const unavailable = combo.replaces.some((id) => occupied.has(id));
+    if (!unavailable) {
+      return { displayId: combo.displayId, locks: combo.replaces, notes: combo.notes || null };
+    }
+  }
+  return null;
+}
+
+async function listCalendarEvents(dateISO) {
+  if (!GOOGLE_CALENDAR_ID) return [];
+  const calendar = buildCalendarClient();
+  if (!calendar) return [];
+  const { start, end } = getTimeRangeForDate(dateISO);
+  try {
+    const result = await calendar.events.list({
+      calendarId: GOOGLE_CALENDAR_ID,
+      timeMin: start.toISOString(),
+      timeMax: end.toISOString(),
+      singleEvents: true,
+      orderBy: "startTime",
+    });
+    return result?.data?.items || [];
+  } catch (err) {
+    console.error("[GOOGLE] Calendar list failed:", err);
+    return [];
+  }
+}
+
+async function reserveTableForSession(session) {
+  const events = await listCalendarEvents(session.dateISO);
+  if (isDateClosedByCalendar(events)) {
+    return { status: "closed" };
+  }
+
+  const bookingStart = new Date(`${session.dateISO}T${session.time24}:00`);
+  const bookingEnd = new Date(bookingStart.getTime() + 120 * 60 * 1000);
+  const bookingRange = { start: bookingStart, end: bookingEnd };
+  const occupied = new Set();
+
+  for (const event of events) {
+    const summary = String(event.summary || "").toLowerCase();
+    if (summary.startsWith("annullata")) continue;
+    const eventRange = getEventTimeRange(event);
+    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
+    const tableIds = extractTablesFromEvent(event);
+    tableIds.flatMap(expandTableLocks).forEach((id) => occupied.add(id));
+  }
+
+  const selection = pickTableForParty(session.people, occupied);
+  if (!selection) return { status: "unavailable" };
+  session.tableDisplayId = selection.displayId;
+  session.tableLocks = selection.locks;
+  session.tableNotes = selection.notes;
+  return { status: "ok", selection };
+}
+
+async function cancelCalendarEvent(session) {
+  if (!session?.calendarEventId) return null;
+  const calendar = buildCalendarClient();
+  if (!calendar) return null;
+  const summary = session.calendarEventSummary || "";
+  const updatedSummary = summary.startsWith("Annullata")
+    ? summary
+    : `Annullata - ${summary}`;
+
+  try {
+    const result = await calendar.events.patch({
+      calendarId: GOOGLE_CALENDAR_ID,
+      eventId: session.calendarEventId,
+      requestBody: {
+        summary: updatedSummary,
+        description: [
+          `Nome: ${session.name || ""}`,
+          `Persone: ${session.people || ""}`,
+          `Note: ${session.specialRequestsRaw || "nessuna"}`,
+          `Preordine: ${session.preorderLabel || "nessuno"}`,
+          "Tavolo: ",
+          `Telefono: ${session.phone || "non fornito"}`,
+        ].join("\n"),
+      },
+    });
+    return result?.data || null;
+  } catch (err) {
+    console.error("[GOOGLE] Calendar cancel update failed:", err);
+    return null;
+  }
+}
+
 async function createCalendarEvent(session) {
   if (!GOOGLE_CALENDAR_ID) return null;
   const calendar = buildCalendarClient();
   if (!calendar) return null;
   if (!session?.dateISO || !session?.time24 || !session?.name || !session?.people) return null;
+
+  const reservation = await reserveTableForSession(session);
+  if (reservation.status === "closed") return { status: "closed" };
+  if (reservation.status === "unavailable") return { status: "unavailable" };
 
   const startDateTime = `${session.dateISO}T${session.time24}:00`;
   const endDate = new Date(`${session.dateISO}T${session.time24}:00`);
@@ -409,7 +562,8 @@ async function createCalendarEvent(session) {
       `Persone: ${session.people}`,
       `Note: ${session.specialRequestsRaw || "nessuna"}`,
       `Preordine: ${session.preorderLabel || "nessuno"}`,
-      `WhatsApp: ${session.waTo || "non fornito"}`,
+      `Tavolo: ${session.tableDisplayId || "da assegnare"}`,
+      `Telefono: ${session.phone || "non fornito"}`,
     ].join("\n"),
     start: { dateTime: startDateTime, timeZone: GOOGLE_CALENDAR_TZ },
     end: { dateTime: endDateTime, timeZone: GOOGLE_CALENDAR_TZ },
@@ -420,7 +574,12 @@ async function createCalendarEvent(session) {
       calendarId: GOOGLE_CALENDAR_ID,
       requestBody: event,
     });
-    return result?.data || null;
+    const data = result?.data || null;
+    if (data?.id) {
+      session.calendarEventId = data.id;
+      session.calendarEventSummary = data.summary || event.summary;
+    }
+    return data;
   } catch (err) {
     console.error("[GOOGLE] Calendar insert failed:", err);
     return null;
@@ -445,6 +604,22 @@ app.post("/voice", async (req, res) => {
 
     const emptySpeech = !normalizeText(speech);
 
+    if (!emptySpeech && isCancelCommand(speech)) {
+      const canceled = await cancelCalendarEvent(session);
+      if (canceled) {
+        session.step = 1;
+        gatherSpeech(vr, "Ho annullato la prenotazione. Vuoi prenotare di nuovo?");
+      } else if (canForwardToHuman()) {
+        res.set("Content-Type", "text/xml; charset=utf-8");
+        return res.send(forwardToHumanTwiml());
+      } else {
+        session.step = 1;
+        gatherSpeech(vr, "Ok, mi occupo di annullare la prenotazione. Vuoi fare una nuova richiesta?");
+      }
+      res.set("Content-Type", "text/xml; charset=utf-8");
+      return res.send(vr.toString());
+    }
+
     if (!emptySpeech && isBackCommand(speech)) {
       resetRetries(session);
       goBack(session);
@@ -460,6 +635,7 @@ app.post("/voice", async (req, res) => {
           break;
         }
         session.name = speech.trim().slice(0, 60);
+        session.phone = req.body.From || session.phone;
         resetRetries(session);
         session.step = 2;
         gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name }));
@@ -579,6 +755,16 @@ app.post("/voice", async (req, res) => {
           break;
         }
         const calendarEvent = await createCalendarEvent(session);
+        if (calendarEvent?.status === "closed") {
+          session.step = 2;
+          gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
+          break;
+        }
+        if (calendarEvent?.status === "unavailable") {
+          session.step = 3;
+          gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
+          break;
+        }
         if (!calendarEvent && canForwardToHuman()) {
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(forwardToHumanTwiml());
