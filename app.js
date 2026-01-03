@@ -195,6 +195,7 @@ function getSession(callSid) {
       retries: 0,
       name: null,
       dateISO: null,
+      dateLabel: null,
       time24: null,
       people: null,
       specialRequestsRaw: null,
@@ -235,6 +236,34 @@ function toISODate(d) {
   return `${y}-${m}-${day}`;
 }
 
+function formatDateLabel(dateISO) {
+  const date = new Date(`${dateISO}T00:00:00`);
+  const weekdays = [
+    "domenica",
+    "lunedì",
+    "martedì",
+    "mercoledì",
+    "giovedì",
+    "venerdì",
+    "sabato",
+  ];
+  const months = [
+    "gennaio",
+    "febbraio",
+    "marzo",
+    "aprile",
+    "maggio",
+    "giugno",
+    "luglio",
+    "agosto",
+    "settembre",
+    "ottobre",
+    "novembre",
+    "dicembre",
+  ];
+  return `${weekdays[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
+}
+
 // ---- Back/edit commands
 function isBackCommand(speech) {
   const tt = normalizeText(speech);
@@ -270,7 +299,7 @@ function promptForStep(vr, session) {
   switch (session.step) {
     case 1: gatherSpeech(vr, t("step1_welcome_name.main")); return;
     case 2: gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" })); return;
-    case 3: gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateISO || "" })); return;
+    case 3: gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel || "" })); return;
     case 4: gatherSpeech(vr, t("step4_confirm_time_ask_party_size.main", { time: session.time24 || "" })); return;
     case 5: gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" })); return;
     case 6:
@@ -281,7 +310,7 @@ function promptForStep(vr, session) {
       return;
     case 7: gatherSpeech(vr, t("step8_summary_confirm.main", {
       name: session.name || "",
-      dateLabel: session.dateISO || "",
+      dateLabel: session.dateLabel || "",
       time: session.time24 || "",
       partySize: session.people || "",
     })); return;
@@ -410,8 +439,11 @@ function isDateClosedByCalendar(events) {
 function extractTablesFromEvent(event) {
   const description = String(event.description || "");
   const match = description.match(/Tavolo:\s*([^\n]+)/i);
-  if (!match) return [];
-  return match[1]
+  const summary = String(event.summary || "");
+  const summaryMatch = summary.match(/tav(?:olo)?\s*([^\-,]+)/i);
+  const tableText = match?.[1] || summaryMatch?.[1];
+  if (!tableText) return [];
+  return tableText
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean);
@@ -437,18 +469,27 @@ function expandTableLocks(tableId) {
   return [tableId];
 }
 
-function buildAvailableTables(occupied) {
-  return TABLES.filter((table) => !occupied.has(table.id));
+function buildAvailableTables(occupied, availableOverride) {
+  return TABLES.filter((table) => {
+    if (occupied.has(table.id)) return false;
+    if (availableOverride && !availableOverride.has(table.id)) return false;
+    return true;
+  });
 }
 
-function pickTableForParty(people, occupied) {
-  const availableTables = buildAvailableTables(occupied);
+function buildAvailableTableSet(availableTables) {
+  return new Set(availableTables.map((table) => table.id));
+}
+
+function pickTableForParty(people, occupied, availableOverride) {
+  const availableTables = buildAvailableTables(occupied, availableOverride);
+  const availableSet = buildAvailableTableSet(availableTables);
   const direct = availableTables.find((table) => people >= table.min && people <= table.max);
   if (direct) return { displayId: direct.id, locks: [direct.id], notes: direct.notes || null };
 
   for (const combo of TABLE_COMBINATIONS) {
     if (people < combo.min || people > combo.max) continue;
-    const unavailable = combo.replaces.some((id) => occupied.has(id));
+    const unavailable = combo.replaces.some((id) => occupied.has(id) || !availableSet.has(id));
     if (!unavailable) {
       return { displayId: combo.displayId, locks: combo.replaces, notes: combo.notes || null };
     }
@@ -476,7 +517,7 @@ async function listCalendarEvents(dateISO) {
   }
 }
 
-async function reserveTableForSession(session) {
+async function reserveTableForSession(session, { commit } = { commit: false }) {
   const events = await listCalendarEvents(session.dateISO);
   if (isDateClosedByCalendar(events)) {
     return { status: "closed" };
@@ -486,21 +527,63 @@ async function reserveTableForSession(session) {
   const bookingEnd = new Date(bookingStart.getTime() + 120 * 60 * 1000);
   const bookingRange = { start: bookingStart, end: bookingEnd };
   const occupied = new Set();
+  const eventoEvents = [];
 
   for (const event of events) {
     const summary = String(event.summary || "").toLowerCase();
     if (summary.startsWith("annullata")) continue;
+    if (summary.includes("evento")) {
+      eventoEvents.push(event);
+      continue;
+    }
     const eventRange = getEventTimeRange(event);
     if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
     const tableIds = extractTablesFromEvent(event);
     tableIds.flatMap(expandTableLocks).forEach((id) => occupied.add(id));
   }
 
-  const selection = pickTableForParty(session.people, occupied);
+  let availableOverride = null;
+  if (eventoEvents.length > 0) {
+    const eventTables = eventoEvents
+      .flatMap((event) => extractTablesFromEvent(event))
+      .flatMap((id) => expandTableLocks(id));
+    availableOverride = new Set(eventTables);
+  }
+
+  const selection = pickTableForParty(session.people, occupied, availableOverride);
   if (!selection) return { status: "unavailable" };
   session.tableDisplayId = selection.displayId;
   session.tableLocks = selection.locks;
   session.tableNotes = selection.notes;
+
+  if (commit && eventoEvents.length > 0) {
+    const calendar = buildCalendarClient();
+    if (calendar) {
+      for (const event of eventoEvents) {
+        const eventTables = extractTablesFromEvent(event);
+        const remaining = eventTables.filter((id) => !selection.locks.includes(id));
+        const availableCount = remaining.length;
+        const updatedSummary = `Evento - tavoli disponibili: ${availableCount}`;
+        const baseDescription = String(event.description || "");
+        const updatedDescription = baseDescription.match(/Tavolo:\s*/i)
+          ? baseDescription.replace(/Tavolo:\s*[^\n]*/i, `Tavolo: ${remaining.join(", ")}`)
+          : `${baseDescription}\nTavolo: ${remaining.join(", ")}`.trim();
+        try {
+          await calendar.events.patch({
+            calendarId: GOOGLE_CALENDAR_ID,
+            eventId: event.id,
+            requestBody: {
+              summary: updatedSummary,
+              description: updatedDescription,
+            },
+          });
+        } catch (err) {
+          console.error("[GOOGLE] Calendar event update failed:", err);
+        }
+      }
+    }
+  }
+
   return { status: "ok", selection };
 }
 
@@ -509,9 +592,10 @@ async function cancelCalendarEvent(session) {
   const calendar = buildCalendarClient();
   if (!calendar) return null;
   const summary = session.calendarEventSummary || "";
-  const updatedSummary = summary.startsWith("Annullata")
-    ? summary
-    : `Annullata - ${summary}`;
+  const summaryWithoutTable = summary.replace(/,\s*tav[^,]+/i, "").trim();
+  const updatedSummary = summaryWithoutTable.startsWith("Annullata")
+    ? summaryWithoutTable
+    : `Annullata - ${summaryWithoutTable}`;
 
   try {
     const result = await calendar.events.patch({
@@ -542,7 +626,7 @@ async function createCalendarEvent(session) {
   if (!calendar) return null;
   if (!session?.dateISO || !session?.time24 || !session?.name || !session?.people) return null;
 
-  const reservation = await reserveTableForSession(session);
+  const reservation = await reserveTableForSession(session, { commit: true });
   if (reservation.status === "closed") return { status: "closed" };
   if (reservation.status === "unavailable") return { status: "unavailable" };
 
@@ -555,14 +639,17 @@ async function createCalendarEvent(session) {
     endDate.getMinutes()
   ).padStart(2, "0")}:00`;
 
+  const tableLabel = session.tableLocks?.length
+    ? session.tableLocks.join(" e ")
+    : session.tableDisplayId || "da assegnare";
   const event = {
-    summary: `Prenotazione ${session.name} (${session.people} pax)`,
+    summary: `Ore ${session.time24}, tav ${tableLabel}, ${session.name}, ${session.people} pax`,
     description: [
       `Nome: ${session.name}`,
       `Persone: ${session.people}`,
       `Note: ${session.specialRequestsRaw || "nessuna"}`,
       `Preordine: ${session.preorderLabel || "nessuno"}`,
-      `Tavolo: ${session.tableDisplayId || "da assegnare"}`,
+      `Tavolo: ${tableLabel}`,
       `Telefono: ${session.phone || "non fornito"}`,
     ].join("\n"),
     start: { dateTime: startDateTime, timeZone: GOOGLE_CALENDAR_TZ },
@@ -655,7 +742,8 @@ app.post("/voice", async (req, res) => {
         session.dateISO = dateISO;
         resetRetries(session);
         session.step = 3;
-        gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateISO }));
+        session.dateLabel = formatDateLabel(dateISO);
+        gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel }));
         break;
       }
 
@@ -726,12 +814,23 @@ app.post("/voice", async (req, res) => {
             break;
           }
         }
+        const availability = await reserveTableForSession(session, { commit: false });
+        if (availability.status === "closed") {
+          session.step = 2;
+          gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
+          break;
+        }
+        if (availability.status === "unavailable") {
+          session.step = 3;
+          gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
+          break;
+        }
         resetRetries(session);
         session.step = 7;
         session.waTo = null;
         gatherSpeech(vr, t("step8_summary_confirm.main", {
           name: session.name || "",
-          dateLabel: session.dateISO || "",
+          dateLabel: session.dateLabel || "",
           time: session.time24 || "",
           partySize: session.people || "",
         }));
@@ -742,7 +841,7 @@ app.post("/voice", async (req, res) => {
         const confirmation = parseYesNo(speech);
         if (confirmation === null) {
           gatherSpeech(vr, t("step8_summary_confirm.short", {
-            dateLabel: session.dateISO || "",
+            dateLabel: session.dateLabel || "",
             time: session.time24 || "",
             partySize: session.people || "",
           }));
