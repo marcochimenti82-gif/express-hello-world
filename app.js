@@ -32,7 +32,6 @@ const BASE_URL = process.env.BASE_URL || "";
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || "";
 
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "";
 const GOOGLE_CALENDAR_TZ = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
@@ -172,9 +171,6 @@ function gatherSpeech(response, promptText) {
 function isValidPhoneE164(s) {
   return /^\+\d{8,15}$/.test(String(s || "").trim());
 }
-function hasValidWaAddress(s) {
-  return /^whatsapp:\+\d{8,15}$/.test(String(s || "").trim());
-}
 
 function canForwardToHuman() {
   return ENABLE_FORWARDING && Boolean(HUMAN_FORWARD_TO) && isValidPhoneE164(HUMAN_FORWARD_TO);
@@ -261,7 +257,6 @@ function goBack(session) {
   else if (session.step === 5) session.step = 4;
   else if (session.step === 6) session.step = 5;
   else if (session.step === 7) session.step = 6;
-  else if (session.step === 8) session.step = 7;
   else session.step = Math.max(1, session.step - 1);
 }
 
@@ -278,8 +273,7 @@ function promptForStep(vr, session) {
         "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
       );
       return;
-    case 7: gatherSpeech(vr, t("step7_whatsapp_number.main")); return;
-    case 8: gatherSpeech(vr, t("step8_summary_confirm.main", {
+    case 7: gatherSpeech(vr, t("step8_summary_confirm.main", {
       name: session.name || "",
       dateLabel: session.dateISO || "",
       time: session.time24 || "",
@@ -322,17 +316,6 @@ function parseYesNo(speech) {
   if (!tt) return null;
   if (YES_WORDS.some((w) => tt.includes(w))) return true;
   if (NO_WORDS.some((w) => tt.includes(w))) return false;
-  return null;
-}
-
-function parseWhatsAppNumber(speech) {
-  const digits = String(speech || "").replace(/[^\d+]/g, "");
-  if (hasValidWaAddress(digits)) return digits;
-  if (isValidPhoneE164(digits)) return `whatsapp:${digits}`;
-  const justNumbers = String(speech || "").replace(/[^\d]/g, "");
-  if (justNumbers.length >= 8 && justNumbers.length <= 15) {
-    return `whatsapp:+${justNumbers}`;
-  }
   return null;
 }
 
@@ -569,23 +552,7 @@ app.post("/voice", async (req, res) => {
         }
         resetRetries(session);
         session.step = 7;
-        gatherSpeech(vr, t("step7_whatsapp_number.main"));
-        break;
-      }
-
-      case 7: {
-        if (emptySpeech) {
-          gatherSpeech(vr, t("step7_whatsapp_number.error"));
-          break;
-        }
-        const waTo = parseWhatsAppNumber(speech);
-        if (!waTo) {
-          gatherSpeech(vr, t("step7_whatsapp_number.error"));
-          break;
-        }
-        session.waTo = waTo;
-        resetRetries(session);
-        session.step = 8;
+        session.waTo = null;
         gatherSpeech(vr, t("step8_summary_confirm.main", {
           name: session.name || "",
           dateLabel: session.dateISO || "",
@@ -595,7 +562,7 @@ app.post("/voice", async (req, res) => {
         break;
       }
 
-      case 8: {
+      case 7: {
         const confirmation = parseYesNo(speech);
         if (confirmation === null) {
           gatherSpeech(vr, t("step8_summary_confirm.short", {
@@ -611,7 +578,11 @@ app.post("/voice", async (req, res) => {
           promptForStep(vr, session);
           break;
         }
-        await createCalendarEvent(session);
+        const calendarEvent = await createCalendarEvent(session);
+        if (!calendarEvent && canForwardToHuman()) {
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(forwardToHumanTwiml());
+        }
         resetRetries(session);
         session.step = 1;
         gatherSpeech(vr, t("step9_success.main"));
