@@ -194,7 +194,6 @@ function getSession(callSid) {
       step: 1,
       retries: 0,
       name: null,
-      phoneRequested: false,
       dateISO: null,
       dateLabel: null,
       time24: null,
@@ -208,6 +207,8 @@ function getSession(callSid) {
       waTo: null,
       tableDisplayId: null,
       tableLocks: [],
+      splitRequired: false,
+      outsideRequired: false,
       calendarEventId: null,
       tableNotes: null,
       durationMinutes: null,
@@ -304,15 +305,22 @@ function promptForStep(vr, session) {
     case 2: gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" })); return;
     case 3: gatherSpeech(vr, "Perfetto. In quante persone siete?"); return;
     case 4: gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel || "" })); return;
-    case 5: gatherSpeech(vr, t("step4_confirm_time_ask_party_size.main", { time: session.time24 || "" })); return;
-    case 6: gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" })); return;
-    case 7:
+    case 5: gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" })); return;
+    case 6:
       gatherSpeech(
         vr,
         "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
       );
       return;
-    case 8: gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39."); return;
+    case 7:
+      gatherSpeech(
+        vr,
+        "Non abbiamo più disponibilità per un unico tavolo. Posso sistemarvi in tavoli separati?"
+      );
+      return;
+    case 8:
+      gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
+      return;
     case 9: gatherSpeech(vr, t("step8_summary_confirm.main", {
       name: session.name || "",
       dateLabel: session.dateLabel || "",
@@ -501,6 +509,10 @@ function buildAvailableTables(occupied, availableOverride) {
   });
 }
 
+function getTableById(id) {
+  return TABLES.find((table) => table.id === id) || null;
+}
+
 function buildAvailableTableSet(availableTables) {
   return new Set(availableTables.map((table) => table.id));
 }
@@ -521,10 +533,25 @@ function pickTableForParty(people, occupied, availableOverride) {
   return null;
 }
 
-function getNextDateISO(dateISO) {
-  const date = new Date(`${dateISO}T00:00:00`);
-  date.setDate(date.getDate() + 1);
-  return toISODate(date);
+function pickSplitTables(people, availableTables) {
+  const sorted = [...availableTables].sort((a, b) => b.max - a.max);
+  const selected = [];
+  let remaining = people;
+  let capacity = 0;
+
+  for (const table of sorted) {
+    if (remaining <= 0) break;
+    selected.push(table);
+    capacity += table.max;
+    remaining -= table.max;
+  }
+
+  if (capacity < people || selected.length === 0) return null;
+  return {
+    displayIds: selected.map((table) => table.id),
+    locks: selected.map((table) => table.id),
+    notes: "tavoli separati",
+  };
 }
 
 async function listCalendarEvents(dateISO) {
@@ -544,103 +571,6 @@ async function listCalendarEvents(dateISO) {
   } catch (err) {
     console.error("[GOOGLE] Calendar list failed:", err);
     return [];
-  }
-}
-
-function formatTimeSlot(date, startDate) {
-  if (!date) return "";
-  if (
-    startDate &&
-    date.getHours() === 0 &&
-    date.getMinutes() === 0 &&
-    date.getTime() > startDate.getTime()
-  ) {
-    return "24.00";
-  }
-  const hh = String(date.getHours()).padStart(2, "0");
-  const mm = String(date.getMinutes()).padStart(2, "0");
-  return `${hh}.${mm}`;
-}
-
-function buildAvailabilityDescription(dateISO, events) {
-  const tableIds = TABLES.map((table) => table.id);
-  const occupancy = new Map(tableIds.map((id) => [id, []]));
-  const bookingRange = {
-    start: new Date(`${dateISO}T00:00:00`),
-    end: new Date(`${dateISO}T23:59:59`),
-  };
-
-  for (const event of events) {
-    const summary = String(event.summary || "").toLowerCase();
-    if (summary.startsWith("annullata")) continue;
-    if (summary.includes("tavoli disponibili")) continue;
-    if (summary.includes("locale chiuso")) continue;
-    if (summary.includes("evento")) continue;
-    const eventRange = getEventTimeRange(event);
-    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
-    const tableIdsForEvent = extractTablesFromEvent(event)
-      .flatMap(expandTableLocks)
-      .filter((id) => occupancy.has(id));
-    for (const tableId of tableIdsForEvent) {
-      occupancy.get(tableId).push({
-        start: eventRange.start,
-        end: eventRange.end,
-      });
-    }
-  }
-
-  const lines = tableIds.map((tableId) => {
-    const slots = occupancy.get(tableId) || [];
-    slots.sort((a, b) => a.start - b.start);
-    if (slots.length === 0) {
-      return `${tableId}:`;
-    }
-    const slotText = slots
-      .map((slot) => {
-        const start = formatTimeSlot(slot.start);
-        const end = formatTimeSlot(slot.end, slot.start);
-        return `occupato dalle ${start} alle ${end};`;
-      })
-      .join(" ");
-    return `${tableId}: ${slotText}`;
-  });
-
-  return lines.join("\n");
-}
-
-async function upsertAvailabilityEvent(dateISO) {
-  if (!GOOGLE_CALENDAR_ID) return null;
-  const calendar = buildCalendarClient();
-  if (!calendar) return null;
-  const events = await listCalendarEvents(dateISO);
-  const availabilityEvent = events.find((event) =>
-    String(event.summary || "").toLowerCase().includes("tavoli disponibili")
-  );
-  const description = buildAvailabilityDescription(dateISO, events);
-  const requestBody = {
-    summary: "Tavoli disponibili",
-    description,
-    start: { date: dateISO, timeZone: GOOGLE_CALENDAR_TZ },
-    end: { date: getNextDateISO(dateISO), timeZone: GOOGLE_CALENDAR_TZ },
-  };
-
-  try {
-    if (availabilityEvent?.id) {
-      const result = await calendar.events.patch({
-        calendarId: GOOGLE_CALENDAR_ID,
-        eventId: availabilityEvent.id,
-        requestBody,
-      });
-      return result?.data || null;
-    }
-    const result = await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID,
-      requestBody,
-    });
-    return result?.data || null;
-  } catch (err) {
-    console.error("[GOOGLE] Availability event update failed:", err);
-    return null;
   }
 }
 
@@ -678,10 +608,36 @@ async function reserveTableForSession(session, { commit } = { commit: false }) {
   }
 
   const selection = pickTableForParty(session.people, occupied, availableOverride);
-  if (!selection) return { status: "unavailable" };
+  if (!selection) {
+    const availableTables = buildAvailableTables(occupied, availableOverride);
+    const insideTables = availableTables.filter((table) => table.area === "inside");
+    const insideSplit = pickSplitTables(session.people, insideTables);
+    if (insideSplit) {
+      session.tableDisplayId = insideSplit.displayIds.join(" e ");
+      session.tableLocks = insideSplit.locks;
+      session.tableNotes = insideSplit.notes;
+      session.splitRequired = true;
+      session.outsideRequired = false;
+      return { status: "needs_split" };
+    }
+
+    const anySplit = pickSplitTables(session.people, availableTables);
+    if (anySplit) {
+      session.tableDisplayId = anySplit.displayIds.join(" e ");
+      session.tableLocks = anySplit.locks;
+      session.tableNotes = anySplit.notes;
+      session.splitRequired = true;
+      session.outsideRequired = anySplit.locks.some((id) => getTableById(id)?.area === "outside");
+      return { status: "needs_outside" };
+    }
+
+    return { status: "unavailable" };
+  }
   session.tableDisplayId = selection.displayId;
   session.tableLocks = selection.locks;
   session.tableNotes = selection.notes;
+  session.splitRequired = false;
+  session.outsideRequired = selection.locks.some((id) => getTableById(id)?.area === "outside");
 
   if (commit && eventoEvents.length > 0) {
     const calendar = buildCalendarClient();
@@ -740,9 +696,6 @@ async function cancelCalendarEvent(session) {
         ].join("\n"),
       },
     });
-    if (session.dateISO) {
-      await upsertAvailabilityEvent(session.dateISO);
-    }
     return result?.data || null;
   } catch (err) {
     console.error("[GOOGLE] Calendar cancel update failed:", err);
@@ -796,7 +749,6 @@ async function createCalendarEvent(session) {
       session.calendarEventId = data.id;
       session.calendarEventSummary = data.summary || event.summary;
     }
-    await upsertAvailabilityEvent(session.dateISO);
     return data;
   } catch (err) {
     console.error("[GOOGLE] Calendar insert failed:", err);
@@ -916,7 +868,7 @@ app.post("/voice", async (req, res) => {
         session.time24 = time24;
         resetRetries(session);
         session.step = 5;
-        gatherSpeech(vr, t("step4_confirm_time_ask_party_size.main", { time: session.time24 }));
+        gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people }));
         break;
       }
 
@@ -964,28 +916,71 @@ app.post("/voice", async (req, res) => {
           gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
           break;
         }
+        if (availability.status === "needs_split" || availability.status === "needs_outside" || session.outsideRequired) {
+          session.step = 7;
+          if (session.outsideRequired) {
+            gatherSpeech(
+              vr,
+              "Abbiamo disponibilità solo all'esterno. La sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Vuoi confermare?"
+            );
+          } else {
+            gatherSpeech(
+              vr,
+              "Non abbiamo più disponibilità per un unico tavolo. Posso sistemarvi in tavoli separati?"
+            );
+          }
+          break;
+        }
         resetRetries(session);
-        session.step = 7;
-        session.waTo = null;
+        session.step = 8;
         gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
         break;
       }
 
       case 7: {
-        if (!session.phone) {
-          if (emptySpeech) {
-            gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?");
-            break;
+        const confirmation = parseYesNo(speech);
+        if (confirmation === null) {
+          if (session.outsideRequired) {
+            gatherSpeech(
+              vr,
+              "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
+            );
+          } else {
+            gatherSpeech(
+              vr,
+              "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore."
+            );
           }
-          const phone = parsePhoneNumber(speech);
-          if (!phone) {
-            gatherSpeech(vr, "Scusami, non ho capito il numero. Puoi ripeterlo?");
-            break;
+          break;
+        }
+        if (!confirmation) {
+          if (canForwardToHuman()) {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
           }
-          session.phone = phone;
+          sayIt(vr, t("step9_fallback_transfer_operator.main"));
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
         }
         resetRetries(session);
         session.step = 8;
+        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
+        break;
+      }
+
+      case 8: {
+        if (emptySpeech) {
+          gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?");
+          break;
+        }
+        const phone = parsePhoneNumber(speech);
+        if (!phone) {
+          gatherSpeech(vr, "Scusami, non ho capito il numero. Puoi ripeterlo?");
+          break;
+        }
+        session.phone = phone;
+        resetRetries(session);
+        session.step = 9;
         gatherSpeech(vr, t("step8_summary_confirm.main", {
           name: session.name || "",
           dateLabel: session.dateLabel || "",
@@ -995,12 +990,7 @@ app.post("/voice", async (req, res) => {
         break;
       }
 
-      case 8: {
-        if (!session.phone) {
-          session.step = 7;
-          gatherSpeech(vr, "Prima di confermare, mi serve il numero di telefono.");
-          break;
-        }
+      case 9: {
         const confirmation = parseYesNo(speech);
         if (confirmation === null) {
           gatherSpeech(vr, t("step8_summary_confirm.short", {
