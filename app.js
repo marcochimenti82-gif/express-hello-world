@@ -294,14 +294,15 @@ function goBack(session) {
   else if (session.step === 6) session.step = 5;
   else if (session.step === 7) session.step = 6;
   else if (session.step === 8) session.step = 7;
+  else if (session.step === 9) session.step = 8;
   else session.step = Math.max(1, session.step - 1);
 }
 
 function promptForStep(vr, session) {
   switch (session.step) {
     case 1: gatherSpeech(vr, t("step1_welcome_name.main")); return;
-    case 2: gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono?"); return;
-    case 3: gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" })); return;
+    case 2: gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" })); return;
+    case 3: gatherSpeech(vr, "Perfetto. In quante persone siete?"); return;
     case 4: gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel || "" })); return;
     case 5: gatherSpeech(vr, t("step4_confirm_time_ask_party_size.main", { time: session.time24 || "" })); return;
     case 6: gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" })); return;
@@ -311,7 +312,8 @@ function promptForStep(vr, session) {
         "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
       );
       return;
-    case 8: gatherSpeech(vr, t("step8_summary_confirm.main", {
+    case 8: gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39."); return;
+    case 9: gatherSpeech(vr, t("step8_summary_confirm.main", {
       name: session.name || "",
       dateLabel: session.dateLabel || "",
       time: session.time24 || "",
@@ -361,7 +363,10 @@ function parsePhoneNumber(speech) {
   if (!speech) return null;
   if (isValidPhoneE164(speech)) return speech.trim();
   const digits = String(speech).replace(/[^\d]/g, "");
-  if (digits.length >= 8 && digits.length <= 15) return `+${digits}`;
+  if (digits.length >= 8 && digits.length <= 15) {
+    if (digits.length <= 10) return `+39${digits}`;
+    return `+${digits}`;
+  }
   return null;
 }
 
@@ -850,28 +855,11 @@ app.post("/voice", async (req, res) => {
         session.name = speech.trim().slice(0, 60);
         resetRetries(session);
         session.step = 2;
-        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono?");
-        break;
-      }
-
-      case 2: {
-        if (emptySpeech) {
-          gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?");
-          break;
-        }
-        const phone = parsePhoneNumber(speech);
-        if (!phone) {
-          gatherSpeech(vr, "Scusami, non ho capito il numero. Puoi ripeterlo?");
-          break;
-        }
-        session.phone = phone;
-        resetRetries(session);
-        session.step = 3;
         gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name }));
         break;
       }
 
-      case 3: {
+      case 2: {
         if (emptySpeech) {
           gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
           break;
@@ -883,8 +871,34 @@ app.post("/voice", async (req, res) => {
         }
         session.dateISO = dateISO;
         resetRetries(session);
-        session.step = 4;
+        session.step = 3;
         session.dateLabel = formatDateLabel(dateISO);
+        gatherSpeech(vr, "Perfetto. In quante persone siete?");
+        break;
+      }
+
+      case 3: {
+        if (emptySpeech) {
+          gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
+          break;
+        }
+        const people = parsePeopleIT(speech);
+        if (!people) {
+          gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
+          break;
+        }
+        session.people = people;
+        const events = await listCalendarEvents(session.dateISO);
+        const date = new Date(`${session.dateISO}T00:00:00`);
+        const isHoliday = HOLIDAYS_SET.has(session.dateISO);
+        const isClosedDay = date.getDay() === OPENING.closedDay;
+        if (isHoliday || isClosedDay || isDateClosedByCalendar(events)) {
+          session.step = 2;
+          gatherSpeech(vr, "Mi dispiace, il locale risulta chiuso quel giorno. Vuoi scegliere un'altra data?");
+          break;
+        }
+        resetRetries(session);
+        session.step = 4;
         gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel }));
         break;
       }
@@ -907,26 +921,9 @@ app.post("/voice", async (req, res) => {
       }
 
       case 5: {
-        if (emptySpeech) {
-          gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
-          break;
-        }
-        const people = parsePeopleIT(speech);
-        if (!people) {
-          gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
-          break;
-        }
-        session.people = people;
-        resetRetries(session);
-        session.step = 6;
-        gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people }));
-        break;
-      }
-
-      case 6: {
         session.specialRequestsRaw = emptySpeech ? "nessuna" : speech.trim().slice(0, 200);
         resetRetries(session);
-        session.step = 7;
+        session.step = 6;
         gatherSpeech(
           vr,
           "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
@@ -934,7 +931,7 @@ app.post("/voice", async (req, res) => {
         break;
       }
 
-      case 7: {
+      case 6: {
         if (emptySpeech) {
           promptForStep(vr, session);
           break;
@@ -956,14 +953,9 @@ app.post("/voice", async (req, res) => {
             break;
           }
         }
-        if (!session.phone) {
-          session.step = 2;
-          gatherSpeech(vr, "Mi manca il numero di telefono. Me lo dici?");
-          break;
-        }
         const availability = await reserveTableForSession(session, { commit: false });
         if (availability.status === "closed") {
-          session.step = 3;
+          session.step = 2;
           gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
           break;
         }
@@ -973,8 +965,27 @@ app.post("/voice", async (req, res) => {
           break;
         }
         resetRetries(session);
-        session.step = 8;
+        session.step = 7;
         session.waTo = null;
+        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
+        break;
+      }
+
+      case 7: {
+        if (!session.phone) {
+          if (emptySpeech) {
+            gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?");
+            break;
+          }
+          const phone = parsePhoneNumber(speech);
+          if (!phone) {
+            gatherSpeech(vr, "Scusami, non ho capito il numero. Puoi ripeterlo?");
+            break;
+          }
+          session.phone = phone;
+        }
+        resetRetries(session);
+        session.step = 8;
         gatherSpeech(vr, t("step8_summary_confirm.main", {
           name: session.name || "",
           dateLabel: session.dateLabel || "",
@@ -986,7 +997,7 @@ app.post("/voice", async (req, res) => {
 
       case 8: {
         if (!session.phone) {
-          session.step = 2;
+          session.step = 7;
           gatherSpeech(vr, "Prima di confermare, mi serve il numero di telefono.");
           break;
         }
@@ -1007,7 +1018,7 @@ app.post("/voice", async (req, res) => {
         }
         const calendarEvent = await createCalendarEvent(session);
         if (calendarEvent?.status === "closed") {
-          session.step = 3;
+          session.step = 2;
           gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
           break;
         }
