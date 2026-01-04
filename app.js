@@ -160,7 +160,7 @@ function sayIt(response, text) {
 }
 
 function gatherSpeech(response, promptText) {
-  const actionUrl = BASE_URL ? `${BASE_URL}/voice` : "/voice";
+  const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice` : "/twilio/voice";
   const gather = response.gather({
     input: "speech",
     language: "it-IT",
@@ -444,11 +444,23 @@ function parseDateIT(speech) {
     }
   }
 
-  const m = tt.match(/\b(\d{1,2})\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)(?:\s+(\d{2,4}))?\b/);
+  const m = tt.match(
+    /\b(\d{1,2})\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)(?:\s+(\d{2,4}))?\b/
+  );
   if (m) {
     const months = {
-      gennaio: 1, febbraio: 2, marzo: 3, aprile: 4, maggio: 5, giugno: 6,
-      luglio: 7, agosto: 8, settembre: 9, ottobre: 10, novembre: 11, dicembre: 12,
+      gennaio: 1,
+      febbraio: 2,
+      marzo: 3,
+      aprile: 4,
+      maggio: 5,
+      giugno: 6,
+      luglio: 7,
+      agosto: 8,
+      settembre: 9,
+      ottobre: 10,
+      novembre: 11,
+      dicembre: 12,
     };
     const dd = Number(m[1]);
     const mm = months[m[2]];
@@ -956,7 +968,7 @@ app.post("/twilio/voice/outbound", (req, res) => {
   }
 });
 
-app.post("/voice", async (req, res) => {
+async function handleVoiceRequest(req, res) {
   const callSid = req.body.CallSid || "";
   const speech = req.body.SpeechResult || "";
   const session = getSession(callSid);
@@ -1272,13 +1284,32 @@ app.post("/voice", async (req, res) => {
     res.set("Content-Type", "text/xml; charset=utf-8");
     return res.send(vr.toString());
   }
+}
+
+app.all("/twilio/voice", async (req, res) => {
+  console.log(`[VOICE] ${req.method} /twilio/voice`);
+  if (req.method !== "POST") {
+    const vr = buildTwiml();
+    vr.say(
+      { language: "it-IT", voice: "alice" },
+      xmlEscape("Test Twilio Voice: endpoint attivo.")
+    );
+    res.set("Content-Type", "text/xml; charset=utf-8");
+    return res.send(vr.toString());
+  }
+  return handleVoiceRequest(req, res);
+});
+
+app.all("/voice", (req, res) => {
+  const targetUrl = BASE_URL ? `${BASE_URL}/twilio/voice` : "/twilio/voice";
+  return res.redirect(307, targetUrl);
 });
 
 // NOTA: /finalize lo rimettiamo dopo, quando confermi che non cade più allo step 5.
 // (non serve per risolvere il crash delle intolleranze)
 
 app.get("/", (req, res) => {
-  res.send("TuttiBrilli Voice Booking is running. Use POST /voice from Twilio.");
+  res.send("OK - backend running");
 });
 
 app.listen(PORT, () => {
