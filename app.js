@@ -179,6 +179,13 @@ function canForwardToHuman() {
   return ENABLE_FORWARDING && Boolean(HUMAN_FORWARD_TO) && isValidPhoneE164(HUMAN_FORWARD_TO);
 }
 
+function requireTwilioVoiceFrom() {
+  if (!TWILIO_VOICE_FROM) {
+    throw new Error("TWILIO_VOICE_FROM is not set");
+  }
+  return TWILIO_VOICE_FROM;
+}
+
 function forwardToHumanTwiml() {
   const vr = buildTwiml();
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
@@ -189,9 +196,10 @@ function forwardToHumanTwiml() {
 async function notifyCriticalReservation(phone, summary) {
   if (!twilioClient) return null;
   try {
+    const fromNumber = requireTwilioVoiceFrom();
     return await twilioClient.calls.create({
       to: "+393881669661",
-      from: TWILIO_VOICE_FROM || HUMAN_FORWARD_TO,
+      from: fromNumber,
       twiml: new twilio.twiml.VoiceResponse()
         .say({ language: "it-IT" }, xmlEscape(`Prenotazione con criticità. ${summary || ""}`))
         .toString(),
@@ -320,11 +328,21 @@ function goBack(session) {
 
 function promptForStep(vr, session) {
   switch (session.step) {
-    case 1: gatherSpeech(vr, t("step1_welcome_name.main")); return;
-    case 2: gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" })); return;
-    case 3: gatherSpeech(vr, "Perfetto. In quante persone siete?"); return;
-    case 4: gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel || "" })); return;
-    case 5: gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" })); return;
+    case 1:
+      gatherSpeech(vr, t("step1_welcome_name.main"));
+      return;
+    case 2:
+      gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" }));
+      return;
+    case 3:
+      gatherSpeech(vr, "Perfetto. In quante persone siete?");
+      return;
+    case 4:
+      gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel || "" }));
+      return;
+    case 5:
+      gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" }));
+      return;
     case 6:
       gatherSpeech(
         vr,
@@ -340,13 +358,20 @@ function promptForStep(vr, session) {
     case 8:
       gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
       return;
-    case 9: gatherSpeech(vr, t("step8_summary_confirm.main", {
-      name: session.name || "",
-      dateLabel: session.dateLabel || "",
-      time: session.time24 || "",
-      partySize: session.people || "",
-    })); return;
-    default: gatherSpeech(vr, t("step1_welcome_name.short")); return;
+    case 9:
+      gatherSpeech(
+        vr,
+        t("step8_summary_confirm.main", {
+          name: session.name || "",
+          dateLabel: session.dateLabel || "",
+          time: session.time24 || "",
+          partySize: session.people || "",
+        })
+      );
+      return;
+    default:
+      gatherSpeech(vr, t("step1_welcome_name.short"));
+      return;
   }
 }
 
@@ -894,21 +919,23 @@ app.post("/call/outbound", async (req, res) => {
     if (!to || !isValidPhoneE164(to)) {
       return res.status(400).json({ ok: false, error: "Invalid 'to' number" });
     }
-    if (!twilioClient || !TWILIO_VOICE_FROM) {
+    if (!twilioClient) {
       return res.status(500).json({ ok: false, error: "Twilio not configured" });
     }
-    const twimlUrl = BASE_URL
-      ? `${BASE_URL}/twilio/voice/outbound`
-      : "/twilio/voice/outbound";
+    const fromNumber = requireTwilioVoiceFrom();
+    const twimlUrl = BASE_URL ? `${BASE_URL}/twilio/voice/outbound` : "/twilio/voice/outbound";
     const call = await twilioClient.calls.create({
       to,
-      from: TWILIO_VOICE_FROM,
+      from: fromNumber,
       url: twimlUrl,
       method: "POST",
     });
     return res.json({ ok: true, callSid: call.sid });
   } catch (err) {
     console.error("[OUTBOUND] Error:", err);
+    if (err && err.message === "TWILIO_VOICE_FROM is not set") {
+      return res.status(500).json({ ok: false, error: "TWILIO_VOICE_FROM not set" });
+    }
     return res.status(500).json({ ok: false });
   }
 });
@@ -1063,7 +1090,9 @@ app.post("/voice", async (req, res) => {
           session.preorderChoiceKey = null;
           session.preorderLabel = "nessuno";
         } else {
-          const option = PREORDER_OPTIONS.find((o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " ")));
+          const option = PREORDER_OPTIONS.find(
+            (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
+          );
           if (option) {
             session.preorderChoiceKey = option.key;
             session.preorderLabel = option.label;
@@ -1110,10 +1139,7 @@ app.post("/voice", async (req, res) => {
               "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
             );
           } else {
-            gatherSpeech(
-              vr,
-              "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore."
-            );
+            gatherSpeech(vr, "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
           }
           break;
         }
@@ -1170,23 +1196,29 @@ app.post("/voice", async (req, res) => {
           break;
         }
         session.step = 9;
-        gatherSpeech(vr, t("step8_summary_confirm.main", {
-          name: session.name || "",
-          dateLabel: session.dateLabel || "",
-          time: session.time24 || "",
-          partySize: session.people || "",
-        }));
+        gatherSpeech(
+          vr,
+          t("step8_summary_confirm.main", {
+            name: session.name || "",
+            dateLabel: session.dateLabel || "",
+            time: session.time24 || "",
+            partySize: session.people || "",
+          })
+        );
         break;
       }
 
       case 9: {
         const confirmation = parseYesNo(speech);
         if (confirmation === null) {
-          gatherSpeech(vr, t("step8_summary_confirm.short", {
-            dateLabel: session.dateLabel || "",
-            time: session.time24 || "",
-            partySize: session.people || "",
-          }));
+          gatherSpeech(
+            vr,
+            t("step8_summary_confirm.short", {
+              dateLabel: session.dateLabel || "",
+              time: session.time24 || "",
+              partySize: session.people || "",
+            })
+          );
           break;
         }
         if (!confirmation) {
