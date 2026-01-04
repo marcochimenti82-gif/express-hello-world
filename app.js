@@ -32,6 +32,7 @@ const BASE_URL = process.env.BASE_URL || "";
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_VOICE_FROM = process.env.TWILIO_VOICE_FROM || "";
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "";
 const GOOGLE_CALENDAR_TZ = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
@@ -39,6 +40,7 @@ const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "
 
 const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "false").toLowerCase() === "true";
 const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || "";
+const CRITICAL_COLOR_ID = process.env.CRITICAL_COLOR_ID || "11";
 
 const HOLIDAYS_YYYY_MM_DD = process.env.HOLIDAYS_YYYY_MM_DD || "";
 const HOLIDAYS_SET = new Set(HOLIDAYS_YYYY_MM_DD.split(",").map((s) => s.trim()).filter(Boolean));
@@ -184,6 +186,22 @@ function forwardToHumanTwiml() {
   return vr.toString();
 }
 
+async function notifyCriticalReservation(phone, summary) {
+  if (!twilioClient) return null;
+  try {
+    return await twilioClient.calls.create({
+      to: "+393881669661",
+      from: TWILIO_VOICE_FROM || HUMAN_FORWARD_TO,
+      twiml: new twilio.twiml.VoiceResponse()
+        .say({ language: "it-IT" }, xmlEscape(`Prenotazione con criticità. ${summary || ""}`))
+        .toString(),
+    });
+  } catch (err) {
+    console.error("[TWILIO] Critical notify failed:", err);
+    return null;
+  }
+}
+
 // ======================= SESSION =======================
 const sessions = new Map();
 
@@ -209,6 +227,7 @@ function getSession(callSid) {
       tableLocks: [],
       splitRequired: false,
       outsideRequired: false,
+      criticalReservation: false,
       calendarEventId: null,
       tableNotes: null,
       durationMinutes: null,
@@ -554,6 +573,12 @@ function pickSplitTables(people, availableTables) {
   };
 }
 
+function getNextDateISO(dateISO) {
+  const date = new Date(`${dateISO}T00:00:00`);
+  date.setDate(date.getDate() + 1);
+  return toISODate(date);
+}
+
 async function listCalendarEvents(dateISO) {
   if (!GOOGLE_CALENDAR_ID) return [];
   const calendar = buildCalendarClient();
@@ -571,6 +596,103 @@ async function listCalendarEvents(dateISO) {
   } catch (err) {
     console.error("[GOOGLE] Calendar list failed:", err);
     return [];
+  }
+}
+
+function formatTimeSlot(date, startDate) {
+  if (!date) return "";
+  if (
+    startDate &&
+    date.getHours() === 0 &&
+    date.getMinutes() === 0 &&
+    date.getTime() > startDate.getTime()
+  ) {
+    return "24.00";
+  }
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  return `${hh}.${mm}`;
+}
+
+function buildAvailabilityDescription(dateISO, events) {
+  const tableIds = TABLES.map((table) => table.id);
+  const occupancy = new Map(tableIds.map((id) => [id, []]));
+  const bookingRange = {
+    start: new Date(`${dateISO}T00:00:00`),
+    end: new Date(`${dateISO}T23:59:59`),
+  };
+
+  for (const event of events) {
+    const summary = String(event.summary || "").toLowerCase();
+    if (summary.startsWith("annullata")) continue;
+    if (summary.includes("tavoli disponibili")) continue;
+    if (summary.includes("locale chiuso")) continue;
+    if (summary.includes("evento")) continue;
+    const eventRange = getEventTimeRange(event);
+    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
+    const tableIdsForEvent = extractTablesFromEvent(event)
+      .flatMap(expandTableLocks)
+      .filter((id) => occupancy.has(id));
+    for (const tableId of tableIdsForEvent) {
+      occupancy.get(tableId).push({
+        start: eventRange.start,
+        end: eventRange.end,
+      });
+    }
+  }
+
+  const lines = tableIds.map((tableId) => {
+    const slots = occupancy.get(tableId) || [];
+    slots.sort((a, b) => a.start - b.start);
+    if (slots.length === 0) {
+      return `${tableId}:`;
+    }
+    const slotText = slots
+      .map((slot) => {
+        const start = formatTimeSlot(slot.start);
+        const end = formatTimeSlot(slot.end, slot.start);
+        return `occupato dalle ${start} alle ${end};`;
+      })
+      .join(" ");
+    return `${tableId}: ${slotText}`;
+  });
+
+  return lines.join("\n");
+}
+
+async function upsertAvailabilityEvent(dateISO) {
+  if (!GOOGLE_CALENDAR_ID) return null;
+  const calendar = buildCalendarClient();
+  if (!calendar) return null;
+  const events = await listCalendarEvents(dateISO);
+  const availabilityEvent = events.find((event) =>
+    String(event.summary || "").toLowerCase().includes("tavoli disponibili")
+  );
+  const description = buildAvailabilityDescription(dateISO, events);
+  const requestBody = {
+    summary: "Tavoli disponibili",
+    description,
+    start: { date: dateISO, timeZone: GOOGLE_CALENDAR_TZ },
+    end: { date: getNextDateISO(dateISO), timeZone: GOOGLE_CALENDAR_TZ },
+  };
+
+  try {
+    if (availabilityEvent?.id) {
+      const result = await calendar.events.patch({
+        calendarId: GOOGLE_CALENDAR_ID,
+        eventId: availabilityEvent.id,
+        requestBody,
+      });
+      return result?.data || null;
+    }
+    const result = await calendar.events.insert({
+      calendarId: GOOGLE_CALENDAR_ID,
+      requestBody,
+    });
+    return result?.data || null;
+  } catch (err) {
+    console.error("[GOOGLE] Availability event update failed:", err);
+    return null;
   }
 }
 
@@ -696,6 +818,9 @@ async function cancelCalendarEvent(session) {
         ].join("\n"),
       },
     });
+    if (session.dateISO) {
+      await upsertAvailabilityEvent(session.dateISO);
+    }
     return result?.data || null;
   } catch (err) {
     console.error("[GOOGLE] Calendar cancel update failed:", err);
@@ -738,6 +863,9 @@ async function createCalendarEvent(session) {
     start: { dateTime: startDateTime, timeZone: GOOGLE_CALENDAR_TZ },
     end: { dateTime: endDateTime, timeZone: GOOGLE_CALENDAR_TZ },
   };
+  if (session.criticalReservation) {
+    event.colorId = CRITICAL_COLOR_ID;
+  }
 
   try {
     const result = await calendar.events.insert({
@@ -749,6 +877,7 @@ async function createCalendarEvent(session) {
       session.calendarEventId = data.id;
       session.calendarEventSummary = data.summary || event.summary;
     }
+    await upsertAvailabilityEvent(session.dateISO);
     return data;
   } catch (err) {
     console.error("[GOOGLE] Calendar insert failed:", err);
@@ -917,18 +1046,12 @@ app.post("/voice", async (req, res) => {
           break;
         }
         if (availability.status === "needs_split" || availability.status === "needs_outside" || session.outsideRequired) {
-          session.step = 7;
-          if (session.outsideRequired) {
-            gatherSpeech(
-              vr,
-              "Abbiamo disponibilità solo all'esterno. La sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Vuoi confermare?"
-            );
-          } else {
-            gatherSpeech(
-              vr,
-              "Non abbiamo più disponibilità per un unico tavolo. Posso sistemarvi in tavoli separati?"
-            );
-          }
+          session.criticalReservation = true;
+          session.step = 8;
+          gatherSpeech(
+            vr,
+            "La prenotazione è stata effettuata con criticità. Ti richiamerà un operatore. Intanto mi lasci un numero di telefono? Se è italiano, aggiungo io il +39."
+          );
           break;
         }
         resetRetries(session);
@@ -980,6 +1103,31 @@ app.post("/voice", async (req, res) => {
         }
         session.phone = phone;
         resetRetries(session);
+        if (session.criticalReservation) {
+          const calendarEvent = await createCalendarEvent(session);
+          const summary = `Data ${session.dateLabel || session.dateISO || ""}, ore ${session.time24 || ""}, ${session.people || ""} persone.`;
+          await notifyCriticalReservation(session.phone, summary);
+          if (calendarEvent?.status === "closed") {
+            session.step = 2;
+            session.criticalReservation = false;
+            gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
+            break;
+          }
+          if (calendarEvent?.status === "unavailable") {
+            session.step = 4;
+            session.criticalReservation = false;
+            gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
+            break;
+          }
+          resetRetries(session);
+          session.step = 1;
+          session.criticalReservation = false;
+          gatherSpeech(
+            vr,
+            "La prenotazione è stata effettuata. Verrai richiamato da un operatore per confermare i dettagli."
+          );
+          break;
+        }
         session.step = 9;
         gatherSpeech(vr, t("step8_summary_confirm.main", {
           name: session.name || "",
