@@ -888,6 +888,47 @@ async function createCalendarEvent(session) {
 // ======================= ROUTES =======================
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+app.post("/call/outbound", async (req, res) => {
+  try {
+    const to = String(req.body?.to || "").trim();
+    if (!to || !isValidPhoneE164(to)) {
+      return res.status(400).json({ ok: false, error: "Invalid 'to' number" });
+    }
+    if (!twilioClient || !TWILIO_VOICE_FROM) {
+      return res.status(500).json({ ok: false, error: "Twilio not configured" });
+    }
+    const twimlUrl = BASE_URL
+      ? `${BASE_URL}/twilio/voice/outbound`
+      : "/twilio/voice/outbound";
+    const call = await twilioClient.calls.create({
+      to,
+      from: TWILIO_VOICE_FROM,
+      url: twimlUrl,
+      method: "POST",
+    });
+    return res.json({ ok: true, callSid: call.sid });
+  } catch (err) {
+    console.error("[OUTBOUND] Error:", err);
+    return res.status(500).json({ ok: false });
+  }
+});
+
+app.post("/twilio/voice/outbound", (req, res) => {
+  try {
+    const vr = buildTwiml();
+    vr.say(
+      { language: "it-IT", voice: "alice" },
+      xmlEscape("Ciao! Ti chiamiamo da TuttiBrilli per un aggiornamento sulla tua prenotazione. Grazie.")
+    );
+    vr.hangup();
+    res.set("Content-Type", "text/xml; charset=utf-8");
+    return res.send(vr.toString());
+  } catch (err) {
+    console.error("[OUTBOUND_TWIML] Error:", err);
+    return res.status(500).send("Error");
+  }
+});
+
 app.post("/voice", async (req, res) => {
   const callSid = req.body.CallSid || "";
   const speech = req.body.SpeechResult || "";
