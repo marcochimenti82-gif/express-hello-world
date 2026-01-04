@@ -1,0 +1,140 @@
+// ==============================
+// DATASOURCE & GENERATOR
+// ==============================
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ==============================
+// ENUM
+// ==============================
+enum Role {
+  OWNER
+  ADMIN
+  SALA
+  CUCINA
+}
+
+enum BookingStatus {
+  REQUESTED
+  CONFIRMED
+  CANCELLED
+}
+
+enum SaleCategory {
+  VINO
+  FOOD
+  BIBITE
+}
+
+// ==============================
+// MODELS
+// ==============================
+
+model Locale {
+  id           String        @id @default(uuid())
+  name         String
+  createdAt   DateTime      @default(now())
+
+  users        User[]
+  businessDays BusinessDay[]
+  bookings     Booking[]
+}
+
+model User {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  passwordHash String
+  role         Role
+  isActive     Boolean    @default(true)
+
+  localeId     String
+  locale       Locale     @relation(fields: [localeId], references: [id])
+
+  createdAt    DateTime   @default(now())
+}
+
+model BusinessDay {
+  id           String        @id @default(uuid())
+  localeId     String
+  locale       Locale        @relation(fields: [localeId], references: [id])
+
+  dateISO      String        // es: 2026-03-18
+  isClosed     Boolean       @default(false)
+  notes        String?
+
+  bookings     Booking[]
+  sales        Sale[]
+  presences    Presence[]
+  rating       ServiceRating?
+
+  createdAt    DateTime      @default(now())
+
+  @@unique([localeId, dateISO])
+}
+
+model Booking {
+  id              String        @id @default(uuid())
+  localeId        String
+  businessDayId   String
+
+  locale          Locale        @relation(fields: [localeId], references: [id])
+  businessDay     BusinessDay   @relation(fields: [businessDayId], references: [id])
+
+  name            String
+  time24          String        // HH:MM
+  people          Int
+  status          BookingStatus @default(REQUESTED)
+
+  phone           String?
+  whatsapp        String?
+  notes           String?
+
+  calendarEventId String?       // Google Calendar event ID
+  createdBy       String        // user | assistant
+
+  createdAt       DateTime      @default(now())
+}
+
+model Presence {
+  id              String      @id @default(uuid())
+  businessDayId   String
+  businessDay     BusinessDay @relation(fields: [businessDayId], references: [id])
+
+  timeSlot        String      // es: 19-20
+  expectedPeople  Int
+  actualPeople    Int
+
+  createdAt       DateTime    @default(now())
+}
+
+model Sale {
+  id              String        @id @default(uuid())
+  businessDayId   String
+  businessDay     BusinessDay   @relation(fields: [businessDayId], references: [id])
+
+  category        SaleCategory
+  productName     String
+  quantity        Int
+  totalAmount     Float
+
+  createdAt       DateTime     @default(now())
+}
+
+model ServiceRating {
+  id                     String      @id @default(uuid())
+  businessDayId          String      @unique
+  businessDay            BusinessDay @relation(fields: [businessDayId], references: [id])
+
+  customerSatisfaction   Int         // 1–5
+  serviceEfficiency      Int         // 1–5
+  kitchenEfficiency      Int         // 1–5
+  notes                  String?
+
+  createdAt              DateTime    @default(now())
+}
