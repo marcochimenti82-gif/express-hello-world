@@ -1,22 +1,23 @@
 {
-  "name": "ai-backoffice-tuttibrilli",
+  "name": "express-hello-world",
   "version": "1.0.0",
-  "description": "Assistente vocale AI per TuttiBrilli (Twilio + Google Calendar)",
+  "description": "Express + Prisma + Twilio + Google Calendar backend for Render",
   "main": "app.js",
+  "repository": "https://github.com/render-examples/express-hello-world",
+  "author": "Render Developers",
+  "license": "MIT",
   "scripts": {
     "start": "node app.js",
-    "build": "prisma generate"
-  },
-  "engines": {
-    "node": ">=18"
+    "postinstall": "prisma generate",
+    "migrate": "prisma migrate deploy",
+    "prisma:generate": "prisma generate"
   },
   "dependencies": {
-    "@prisma/client": "^5.22.0",
-    "express": "^4.19.2",
-    "googleapis": "^169.0.0",
-    "twilio": "^5.11.1"
-  },
-  "devDependencies": {
-    "prisma": "^5.22.0"
+    "@prisma/client": "^5.18.0",
+    "dotenv": "^16.4.5",
+    "express": "^5.0.0",
+    "googleapis": "^140.0.1",
+    "prisma": "^5.18.0",
+    "twilio": "^5.2.2"
   }
 }
