@@ -155,7 +155,6 @@ function buildTwiml() {
 }
 
 function sayIt(response, text) {
-  // ESCAPE per evitare XML rotto (’ ecc)
   response.say({ language: "it-IT" }, xmlEscape(text));
 }
 
@@ -168,7 +167,6 @@ function gatherSpeech(response, promptText) {
     action: actionUrl,
     method: "POST",
   });
-  // Anche qui escape
   gather.say({ language: "it-IT" }, xmlEscape(promptText));
 }
 
@@ -206,6 +204,21 @@ async function notifyCriticalReservation(phone, summary) {
     });
   } catch (err) {
     console.error("[TWILIO] Critical notify failed:", err);
+    return null;
+  }
+}
+
+async function sendCriticalReservationSms(summary) {
+  if (!twilioClient) return null;
+  try {
+    const fromNumber = requireTwilioVoiceFrom();
+    return await twilioClient.messages.create({
+      to: "+393881669661",
+      from: fromNumber,
+      body: `Prenotazione con criticità. ${summary || ""}`.trim(),
+    });
+  } catch (err) {
+    console.error("[TWILIO] Critical SMS failed:", err);
     return null;
   }
 }
@@ -1186,6 +1199,7 @@ async function handleVoiceRequest(req, res) {
           const calendarEvent = await createCalendarEvent(session);
           const summary = `Data ${session.dateLabel || session.dateISO || ""}, ore ${session.time24 || ""}, ${session.people || ""} persone.`;
           await notifyCriticalReservation(session.phone, summary);
+          await sendCriticalReservationSms(summary);
           if (calendarEvent?.status === "closed") {
             session.step = 2;
             session.criticalReservation = false;
@@ -1288,16 +1302,18 @@ async function handleVoiceRequest(req, res) {
 
 app.all("/twilio/voice", async (req, res) => {
   console.log(`[VOICE] ${req.method} /twilio/voice`);
-  if (req.method !== "POST") {
-    const vr = buildTwiml();
-    vr.say(
-      { language: "it-IT", voice: "alice" },
-      xmlEscape("Test Twilio Voice: endpoint attivo.")
-    );
-    res.set("Content-Type", "text/xml; charset=utf-8");
-    return res.send(vr.toString());
+  const payload = req.method === "POST" ? req.body : req.query;
+  if (payload && Object.keys(payload).length > 0) {
+    req.body = payload;
+    return handleVoiceRequest(req, res);
   }
-  return handleVoiceRequest(req, res);
+  const vr = buildTwiml();
+  vr.say(
+    { language: "it-IT", voice: "alice" },
+    xmlEscape("Test Twilio Voice: endpoint attivo.")
+  );
+  res.set("Content-Type", "text/xml; charset=utf-8");
+  return res.send(vr.toString());
 });
 
 app.all("/voice", (req, res) => {
