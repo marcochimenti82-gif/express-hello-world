@@ -51,6 +51,7 @@ const twilioClient =
 const YES_WORDS = ["si", "sì", "certo", "confermo", "ok", "va bene", "perfetto", "esatto"];
 const NO_WORDS = ["no", "non", "annulla", "cancella", "negativo"];
 const CANCEL_WORDS = ["annulla", "annullare", "cancella", "modifica"];
+const MAX_NO_SPEECH_RETRIES = 2;
 
 // ======================= OPENING HOURS =======================
 const OPENING = {
@@ -386,6 +387,22 @@ function promptForStep(vr, session) {
       gatherSpeech(vr, t("step1_welcome_name.short"));
       return;
   }
+}
+
+function handleNoSpeech(vr, session, overridePrompt) {
+  const retries = bumpRetries(session);
+  if (retries <= MAX_NO_SPEECH_RETRIES) {
+    if (overridePrompt) {
+      gatherSpeech(vr, overridePrompt);
+      return false;
+    }
+    sayIt(vr, "Scusami, non ho sentito una risposta.");
+    promptForStep(vr, session);
+    return false;
+  }
+  sayIt(vr, "Non ho ricevuto risposta. Ti saluto.");
+  vr.hangup();
+  return true;
 }
 
 // ====== parsing basilari (per arrivare al punto: FIX crash step 5) ======
@@ -1023,7 +1040,7 @@ async function handleVoiceRequest(req, res) {
     switch (session.step) {
       case 1: {
         if (emptySpeech) {
-          gatherSpeech(vr, t("step1_welcome_name.main"));
+          handleNoSpeech(vr, session);
           break;
         }
         session.name = speech.trim().slice(0, 60);
@@ -1035,7 +1052,7 @@ async function handleVoiceRequest(req, res) {
 
       case 2: {
         if (emptySpeech) {
-          gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
+          handleNoSpeech(vr, session);
           break;
         }
         const dateISO = parseDateIT(speech);
@@ -1053,7 +1070,7 @@ async function handleVoiceRequest(req, res) {
 
       case 3: {
         if (emptySpeech) {
-          gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
+          handleNoSpeech(vr, session);
           break;
         }
         const people = parsePeopleIT(speech);
@@ -1079,7 +1096,7 @@ async function handleVoiceRequest(req, res) {
 
       case 4: {
         if (emptySpeech) {
-          gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"));
+          handleNoSpeech(vr, session);
           break;
         }
         const time24 = parseTimeIT(speech);
@@ -1107,7 +1124,7 @@ async function handleVoiceRequest(req, res) {
 
       case 6: {
         if (emptySpeech) {
-          promptForStep(vr, session);
+          handleNoSpeech(vr, session);
           break;
         }
         const normalized = normalizeText(speech);
@@ -1156,6 +1173,10 @@ async function handleVoiceRequest(req, res) {
       }
 
       case 7: {
+        if (emptySpeech) {
+          handleNoSpeech(vr, session);
+          break;
+        }
         const confirmation = parseYesNo(speech);
         if (confirmation === null) {
           if (session.outsideRequired) {
@@ -1185,7 +1206,7 @@ async function handleVoiceRequest(req, res) {
 
       case 8: {
         if (emptySpeech) {
-          gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?");
+          handleNoSpeech(vr, session, "Scusami, non ho sentito il numero. Me lo ripeti?");
           break;
         }
         const phone = parsePhoneNumber(speech);
@@ -1235,6 +1256,10 @@ async function handleVoiceRequest(req, res) {
       }
 
       case 9: {
+        if (emptySpeech) {
+          handleNoSpeech(vr, session);
+          break;
+        }
         const confirmation = parseYesNo(speech);
         if (confirmation === null) {
           gatherSpeech(
