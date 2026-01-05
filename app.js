@@ -230,7 +230,9 @@ function getSession(callSid) {
   if (!callSid) return null;
   if (!sessions.has(callSid)) {
     sessions.set(callSid, {
-      step: 1,
+      step: "intent",
+      intent: null,
+      intentRetries: 0,
       retries: 0,
       name: null,
       dateISO: null,
@@ -594,194 +596,188 @@ function pickTableForParty(people, occupied, availableOverride) {
 
   for (const combo of TABLE_COMBINATIONS) {
     if (people < combo.min || people > combo.max) continue;
-    const unavailable = combo.replaces.some((id) => occupied.has(id) || !availableSet.has(id));
-    if (!unavailable) {
+    if (combo.replaces.every((id) => availableSet.has(id))) {
       return { displayId: combo.displayId, locks: combo.replaces, notes: combo.notes || null };
     }
   }
+
   return null;
 }
 
+// ======================= SPLIT TABLES =======================
 function pickSplitTables(people, availableTables) {
-  const sorted = [...availableTables].sort((a, b) => b.max - a.max);
-  const selected = [];
-  let remaining = people;
-  let capacity = 0;
+  if (people < 5) return null;
 
-  for (const table of sorted) {
-    if (remaining <= 0) break;
-    selected.push(table);
-    capacity += table.max;
-    remaining -= table.max;
+  const tables = availableTables.slice().sort((a, b) => b.max - a.max);
+
+  for (let i = 0; i < tables.length; i += 1) {
+    for (let j = i + 1; j < tables.length; j += 1) {
+      const t1 = tables[i];
+      const t2 = tables[j];
+      const combinedMin = (t1.min || 0) + (t2.min || 0);
+      const combinedMax = (t1.max || 0) + (t2.max || 0);
+      if (people < combinedMin || people > combinedMax) continue;
+      return {
+        displayIds: [t1.id, t2.id],
+        locks: [t1.id, t2.id],
+        notes: [t1.notes, t2.notes].filter(Boolean).join(" e "),
+      };
+    }
   }
 
-  if (capacity < people || selected.length === 0) return null;
-  return {
-    displayIds: selected.map((table) => table.id),
-    locks: selected.map((table) => table.id),
-    notes: "tavoli separati",
-  };
-}
-
-function getNextDateISO(dateISO) {
-  const date = new Date(`${dateISO}T00:00:00`);
-  date.setDate(date.getDate() + 1);
-  return toISODate(date);
+  return null;
 }
 
 async function listCalendarEvents(dateISO) {
-  if (!GOOGLE_CALENDAR_ID) return [];
   const calendar = buildCalendarClient();
-  if (!calendar) return [];
-  const { start, end } = getTimeRangeForDate(dateISO);
+  if (!calendar || !GOOGLE_CALENDAR_ID || !dateISO) return [];
   try {
-    const result = await calendar.events.list({
+    const { start, end } = getTimeRangeForDate(dateISO);
+    const res = await calendar.events.list({
       calendarId: GOOGLE_CALENDAR_ID,
       timeMin: start.toISOString(),
       timeMax: end.toISOString(),
       singleEvents: true,
       orderBy: "startTime",
     });
-    return result?.data?.items || [];
+    return res.data.items || [];
   } catch (err) {
     console.error("[GOOGLE] Calendar list failed:", err);
     return [];
   }
 }
 
-function formatTimeSlot(date, startDate) {
-  if (!date) return "";
-  if (
-    startDate &&
-    date.getHours() === 0 &&
-    date.getMinutes() === 0 &&
-    date.getTime() > startDate.getTime()
-  ) {
-    return "24.00";
+function getOpeningHoursForDate(dateISO, bookingType) {
+  const date = new Date(`${dateISO}T00:00:00`);
+  const dow = date.getDay();
+  const isMusicNight = OPENING.musicNights.days.includes(dow);
+  if (bookingType === "drinks") {
+    return OPENING.drinksOnly;
   }
-  const hh = String(date.getHours()).padStart(2, "0");
-  const mm = String(date.getMinutes()).padStart(2, "0");
-  return `${hh}.${mm}`;
+  if (bookingType === "restaurant") {
+    return dow === 5 || dow === 6 ? OPENING.restaurant.friSat : OPENING.restaurant.default;
+  }
+  if (bookingType === "music") {
+    return isMusicNight ? OPENING.drinksOnly : OPENING.restaurant.default;
+  }
+  return OPENING.restaurant.default;
 }
 
-function buildAvailabilityDescription(dateISO, events) {
-  const tableIds = TABLES.map((table) => table.id);
-  const occupancy = new Map(tableIds.map((id) => [id, []]));
-  const bookingRange = {
-    start: new Date(`${dateISO}T00:00:00`),
-    end: new Date(`${dateISO}T23:59:59`),
-  };
+function timeToMinutes(time) {
+  if (!time || !time.includes(":")) return null;
+  const [h, m] = time.split(":").map((n) => Number(n));
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+  return h * 60 + m;
+}
 
-  for (const event of events) {
-    const summary = String(event.summary || "").toLowerCase();
-    if (summary.startsWith("annullata")) continue;
-    if (summary.includes("tavoli disponibili")) continue;
-    if (summary.includes("locale chiuso")) continue;
-    if (summary.includes("evento")) continue;
-    const eventRange = getEventTimeRange(event);
-    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
-    const tableIdsForEvent = extractTablesFromEvent(event)
-      .flatMap(expandTableLocks)
-      .filter((id) => occupancy.has(id));
-    for (const tableId of tableIdsForEvent) {
-      occupancy.get(tableId).push({
-        start: eventRange.start,
-        end: eventRange.end,
-      });
-    }
-  }
+function isTimeInRange(time, range) {
+  if (!range?.start || !range?.end) return true;
+  const t = timeToMinutes(time);
+  const start = timeToMinutes(range.start);
+  const end = timeToMinutes(range.end);
+  if (t === null || start === null || end === null) return true;
+  return t >= start && t <= end;
+}
 
-  const lines = tableIds.map((tableId) => {
-    const slots = occupancy.get(tableId) || [];
-    slots.sort((a, b) => a.start - b.start);
-    if (slots.length === 0) {
-      return `${tableId}:`;
-    }
-    const slotText = slots
-      .map((slot) => {
-        const start = formatTimeSlot(slot.start);
-        const end = formatTimeSlot(slot.end, slot.start);
-        return `occupato dalle ${start} alle ${end};`;
-      })
-      .join(" ");
-    return `${tableId}: ${slotText}`;
-  });
-
-  return lines.join("\n");
+function getTimeRangeForBooking(session) {
+  if (!session?.dateISO || !session?.time24) return null;
+  const start = new Date(`${session.dateISO}T${session.time24}:00`);
+  const end = new Date(start.getTime() + 2 * 60 * 60 * 1000);
+  return { start, end };
 }
 
 async function upsertAvailabilityEvent(dateISO) {
   if (!GOOGLE_CALENDAR_ID) return null;
   const calendar = buildCalendarClient();
   if (!calendar) return null;
+
   const events = await listCalendarEvents(dateISO);
-  const availabilityEvent = events.find((event) =>
-    String(event.summary || "").toLowerCase().includes("tavoli disponibili")
-  );
-  const description = buildAvailabilityDescription(dateISO, events);
-  const requestBody = {
-    summary: "Tavoli disponibili",
-    description,
-    start: { date: dateISO, timeZone: GOOGLE_CALENDAR_TZ },
-    end: { date: getNextDateISO(dateISO), timeZone: GOOGLE_CALENDAR_TZ },
-  };
+  const availabilityEvent = events.find((event) => {
+    const summary = String(event.summary || "").toLowerCase();
+    return summary.includes("tavoli disponibili");
+  });
+
+  const occupied = new Set();
+  events.forEach((event) => {
+    const summary = String(event.summary || "").toLowerCase();
+    if (summary.includes("tavoli disponibili")) return;
+    const tables = extractTablesFromEvent(event);
+    tables.forEach((tableId) => occupied.add(tableId));
+  });
+
+  const availableTables = buildAvailableTables(occupied, null);
+  const availableCount = availableTables.length;
+  const summary = `Tavoli disponibili: ${availableCount}`;
+  const description = `Tavolo: ${availableTables.map((table) => table.id).join(", ")}`;
 
   try {
-    if (availabilityEvent?.id) {
-      const result = await calendar.events.patch({
+    if (availabilityEvent) {
+      return await calendar.events.patch({
         calendarId: GOOGLE_CALENDAR_ID,
         eventId: availabilityEvent.id,
-        requestBody,
+        requestBody: { summary, description },
       });
-      return result?.data || null;
     }
-    const result = await calendar.events.insert({
+    const { start, end } = getTimeRangeForDate(dateISO);
+    return await calendar.events.insert({
       calendarId: GOOGLE_CALENDAR_ID,
-      requestBody,
+      requestBody: {
+        summary,
+        description,
+        start: { dateTime: start.toISOString() },
+        end: { dateTime: end.toISOString() },
+      },
     });
-    return result?.data || null;
   } catch (err) {
     console.error("[GOOGLE] Availability event update failed:", err);
     return null;
   }
 }
 
-async function reserveTableForSession(session, { commit } = { commit: false }) {
+async function reserveTableForSession(session, { commit = false } = {}) {
   const events = await listCalendarEvents(session.dateISO);
-  if (isDateClosedByCalendar(events)) {
-    return { status: "closed" };
+  const date = new Date(`${session.dateISO}T00:00:00`);
+  const isHoliday = HOLIDAYS_SET.has(session.dateISO);
+  const isClosedDay = date.getDay() === OPENING.closedDay;
+  if (isHoliday || isClosedDay || isDateClosedByCalendar(events)) return { status: "closed" };
+
+  if (!isTimeInRange(session.time24, getOpeningHoursForDate(session.dateISO, session.bookingType))) {
+    return { status: "unavailable" };
   }
 
-  const bookingStart = new Date(`${session.dateISO}T${session.time24}:00`);
-  const bookingEnd = new Date(bookingStart.getTime() + 120 * 60 * 1000);
-  const bookingRange = { start: bookingStart, end: bookingEnd };
   const occupied = new Set();
-  const eventoEvents = [];
-
-  for (const event of events) {
-    const summary = String(event.summary || "").toLowerCase();
-    if (summary.startsWith("annullata")) continue;
-    if (summary.includes("evento")) {
-      eventoEvents.push(event);
-      continue;
-    }
-    const eventRange = getEventTimeRange(event);
-    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
-    const tableIds = extractTablesFromEvent(event);
-    tableIds.flatMap(expandTableLocks).forEach((id) => occupied.add(id));
-  }
-
   let availableOverride = null;
-  if (eventoEvents.length > 0) {
-    const eventTables = eventoEvents
-      .flatMap((event) => extractTablesFromEvent(event))
-      .flatMap((id) => expandTableLocks(id));
-    availableOverride = new Set(eventTables);
-  }
+  const eventoEvents = [];
+  const bookingRange = getTimeRangeForBooking(session);
+
+  events.forEach((event) => {
+    const summary = String(event.summary || "").toLowerCase();
+    const description = String(event.description || "");
+    const isAvailabilityEvent = summary.includes("tavoli disponibili");
+    const isEvento = summary.includes("evento");
+    const eventTime = getEventTimeRange(event);
+    if (!eventTime || !bookingRange || !overlapsRange(eventTime, bookingRange)) return;
+
+    if (isAvailabilityEvent) {
+      availableOverride = new Set(extractTablesFromEvent(event));
+      return;
+    }
+
+    if (isEvento) {
+      eventoEvents.push(event);
+    }
+
+    const tables = extractTablesFromEvent(event);
+    tables.forEach((tableId) => {
+      expandTableLocks(tableId).forEach((lock) => occupied.add(lock));
+    });
+  });
 
   const selection = pickTableForParty(session.people, occupied, availableOverride);
+
   if (!selection) {
     const availableTables = buildAvailableTables(occupied, availableOverride);
+
     const insideTables = availableTables.filter((table) => table.area === "inside");
     const insideSplit = pickSplitTables(session.people, insideTables);
     if (insideSplit) {
@@ -996,7 +992,7 @@ async function handleVoiceRequest(req, res) {
 
     const emptySpeech = !normalizeText(speech);
 
-    if (!emptySpeech && isCancelCommand(speech)) {
+    if (session.step !== "intent" && !emptySpeech && isCancelCommand(speech)) {
       const canceled = await cancelCalendarEvent(session);
       if (canceled) {
         session.step = 1;
@@ -1012,7 +1008,7 @@ async function handleVoiceRequest(req, res) {
       return res.send(vr.toString());
     }
 
-    if (!emptySpeech && isBackCommand(speech)) {
+    if (session.step !== "intent" && !emptySpeech && isBackCommand(speech)) {
       resetRetries(session);
       goBack(session);
       promptForStep(vr, session);
@@ -1021,6 +1017,82 @@ async function handleVoiceRequest(req, res) {
     }
 
     switch (session.step) {
+      case "intent": {
+        if (emptySpeech) {
+          session.intentRetries += 1;
+          if (session.intentRetries >= 2) {
+            if (canForwardToHuman()) {
+              res.set("Content-Type", "text/xml; charset=utf-8");
+              return res.send(forwardToHumanTwiml());
+            }
+            sayIt(vr, "Mi dispiace, non ho capito. Riprova più tardi.");
+            vr.hangup();
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
+          gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni o prenotare un evento?");
+          break;
+        }
+
+        const normalized = normalizeText(speech);
+        let intent = null;
+        if (normalized.includes("tavolo") || normalized.includes("prenot")) {
+          intent = "table";
+        } else if (
+          normalized.includes("info") ||
+          normalized.includes("informazioni") ||
+          normalized.includes("orari") ||
+          normalized.includes("menu")
+        ) {
+          intent = "info";
+        } else if (
+          normalized.includes("evento") ||
+          normalized.includes("festa") ||
+          normalized.includes("compleanno")
+        ) {
+          intent = "event";
+        }
+
+        if (!intent) {
+          session.intentRetries += 1;
+          if (session.intentRetries >= 2) {
+            if (canForwardToHuman()) {
+              res.set("Content-Type", "text/xml; charset=utf-8");
+              return res.send(forwardToHumanTwiml());
+            }
+            sayIt(vr, "Mi dispiace, non ho capito. Riprova più tardi.");
+            vr.hangup();
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
+          gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni o prenotare un evento?");
+          break;
+        }
+
+        session.intent = intent;
+        session.intentRetries = 0;
+
+        if (intent === "table") {
+          session.step = 1;
+          gatherSpeech(vr, t("step1_welcome_name.main"));
+          break;
+        }
+
+        if (intent === "info") {
+          sayIt(vr, "Per informazioni puoi consultare il nostro sito o richiedere un operatore.");
+          vr.hangup();
+          break;
+        }
+
+        sayIt(vr, "Per eventi e feste ti metto in contatto con un operatore.");
+        if (canForwardToHuman()) {
+          vr.dial({}, HUMAN_FORWARD_TO);
+        } else {
+          vr.hangup();
+        }
+        break;
+      }
+
       case 1: {
         if (emptySpeech) {
           gatherSpeech(vr, t("step1_welcome_name.main"));
