@@ -164,10 +164,12 @@ function gatherSpeech(response, promptText) {
     input: "speech",
     language: "it-IT",
     speechTimeout: "auto",
+    timeout: 6,
     action: actionUrl,
     method: "POST",
   });
   gather.say({ language: "it-IT" }, xmlEscape(promptText));
+  response.redirect({ method: "POST" }, actionUrl);
 }
 
 function isValidPhoneE164(s) {
