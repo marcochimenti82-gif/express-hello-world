@@ -143,17 +143,36 @@ app.get('/debug/db', async (req, res) => {
   }
 });
 
-app.post('/debug/calendar-test', async (req, res) => {
+// =======================
+// DEBUG CALENDAR TEST
+// =======================
+app.get('/debug/calendar-test', async (req, res) => {
   try {
-    const event = await createBookingEvent({
-      bookingKey: `debug-${Date.now()}`,
-      summary: 'Debug Calendar Test',
-      description: 'Evento di test creato dal debug endpoint',
-      startDateTimeISO: new Date().toISOString()
+    const { createBookingEvent: createDebugBookingEvent } = require('./lib/calendar');
+    const bookingKey = 'DEBUG-CALENDAR-TEST';
+    const dateISO = '2026-01-10';
+    const time24 = '20:00';
+
+    const startDateTimeISO = buildStartDateTime(dateISO, time24);
+    const result = await createDebugBookingEvent({
+      bookingKey,
+      summary: 'Test Calendar',
+      description: `Evento di test per ${bookingKey}`,
+      startDateTimeISO
     });
-    res.json({ ok: true, eventId: event.id, htmlLink: event.htmlLink });
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
+
+    res.json({
+      ok: true,
+      message: 'Evento creato con successo',
+      result
+    });
+  } catch (err) {
+    console.error('DEBUG CALENDAR ERROR:', err);
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+      details: err
+    });
   }
 });
 
