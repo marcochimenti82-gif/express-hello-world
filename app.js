@@ -244,18 +244,29 @@ app.post('/voice/step', async (req, res) => {
       }
     });
 
-    if (!session.data.whatsapp) {
-      throw new Error('Numero WhatsApp mancante');
+    let whatsappSent = false;
+    if (session.data.whatsapp) {
+      try {
+        await sendWhatsAppMessage(
+          session.data.whatsapp,
+          `Ciao ${session.data.name}, prenotazione ricevuta per ${session.data.people} persone alle ${session.data.time}. Evento creato: ${event.htmlLink}`
+        );
+        whatsappSent = true;
+      } catch (whatsappError) {
+        console.error('WhatsApp send error:', whatsappError);
+      }
+    } else {
+      console.warn('Missing WhatsApp number for call:', callSid);
     }
 
-    await sendWhatsAppMessage(
-      session.data.whatsapp,
-      `Ciao ${session.data.name}, prenotazione ricevuta per ${session.data.people} persone alle ${session.data.time}. Evento creato: ${event.htmlLink}`
-    );
-    response.say({ language: 'it-IT' }, 'Prenotazione confermata. Ti ho inviato un messaggio WhatsApp. A presto!');
+    if (whatsappSent) {
+      response.say({ language: 'it-IT' }, 'Prenotazione confermata. Ti ho inviato un messaggio WhatsApp. A presto!');
+    } else {
+      response.say({ language: 'it-IT' }, 'Prenotazione confermata. A presto!');
+    }
   } catch (error) {
-    console.error('Calendar/WhatsApp error:', error);
-    response.say({ language: 'it-IT' }, 'C’è un problema tecnico sul calendario. Ti ricontatteremo presto.');
+    console.error('Calendar error:', error);
+    response.say({ language: 'it-IT' }, 'Ho registrato la prenotazione, ma c’è un problema tecnico sul calendario. Ti ricontatteremo presto.');
   }
 
   sessions.delete(callSid);
