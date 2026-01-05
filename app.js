@@ -257,6 +257,8 @@ function getSession(callSid) {
       calendarEventId: null,
       tableNotes: null,
       durationMinutes: null,
+      divanettiNotice: false,
+      divanettiNoticeSpoken: false,
       bookingType: "restaurant",
       autoConfirm: true,
       promoEligible: null,
@@ -460,6 +462,19 @@ function hasGlutenIntolerance(text) {
   return tt.includes("celiachia") || tt.includes("glutine") || tt.includes("senza glutine");
 }
 
+function isDivanettiTableId(id) {
+  return id === "T14" || id === "T15";
+}
+
+function isHighTableId(id) {
+  return id === "T16" || id === "T17";
+}
+
+function isDivanettiPreferred(session) {
+  const choice = session?.preorderChoiceKey || "";
+  return choice === "apericena" || choice === "dopocena";
+}
+
 function parsePhoneNumber(speech) {
   if (!speech) return null;
   if (isValidPhoneE164(speech)) return speech.trim();
@@ -622,24 +637,54 @@ function buildAvailableTableSet(availableTables) {
   return new Set(availableTables.map((table) => table.id));
 }
 
-function pickTableForParty(people, occupied, availableOverride) {
+function getTablePenalty(tableId, session) {
+  let penalty = 0;
+  if (isHighTableId(tableId)) penalty += 20;
+  if (isDivanettiTableId(tableId) && !isDivanettiPreferred(session)) penalty += 10;
+  return penalty;
+}
+
+function pickTableForParty(people, occupied, availableOverride, session) {
   const availableTables = buildAvailableTables(occupied, availableOverride);
   const availableSet = buildAvailableTableSet(availableTables);
-  const direct = availableTables.find((table) => people >= table.min && people <= table.max);
-  if (direct) return { displayId: direct.id, locks: [direct.id], notes: direct.notes || null };
+  const directCandidates = availableTables.filter((table) => people >= table.min && people <= table.max);
+  if (directCandidates.length > 0) {
+    directCandidates.sort((a, b) => {
+      const penaltyA = getTablePenalty(a.id, session);
+      const penaltyB = getTablePenalty(b.id, session);
+      if (penaltyA !== penaltyB) return penaltyA - penaltyB;
+      return a.max - b.max;
+    });
+    const direct = directCandidates[0];
+    return { displayId: direct.id, locks: [direct.id], notes: direct.notes || null };
+  }
 
+  const comboCandidates = [];
   for (const combo of TABLE_COMBINATIONS) {
     if (people < combo.min || people > combo.max) continue;
     const unavailable = combo.replaces.some((id) => occupied.has(id) || !availableSet.has(id));
-    if (!unavailable) {
-      return { displayId: combo.displayId, locks: combo.replaces, notes: combo.notes || null };
-    }
+    if (!unavailable) comboCandidates.push(combo);
+  }
+  if (comboCandidates.length > 0) {
+    comboCandidates.sort((a, b) => {
+      const penaltyA = a.replaces.reduce((sum, id) => sum + getTablePenalty(id, session), 0);
+      const penaltyB = b.replaces.reduce((sum, id) => sum + getTablePenalty(id, session), 0);
+      if (penaltyA !== penaltyB) return penaltyA - penaltyB;
+      return a.max - b.max;
+    });
+    const combo = comboCandidates[0];
+    return { displayId: combo.displayId, locks: combo.replaces, notes: combo.notes || null };
   }
   return null;
 }
 
-function pickSplitTables(people, availableTables) {
-  const sorted = [...availableTables].sort((a, b) => b.max - a.max);
+function pickSplitTables(people, availableTables, session) {
+  const sorted = [...availableTables].sort((a, b) => {
+    const penaltyA = getTablePenalty(a.id, session);
+    const penaltyB = getTablePenalty(b.id, session);
+    if (penaltyA !== penaltyB) return penaltyA - penaltyB;
+    return b.max - a.max;
+  });
   const selected = [];
   let remaining = people;
   let capacity = 0;
@@ -698,6 +743,51 @@ function formatTimeSlot(date, startDate) {
   const hh = String(date.getHours()).padStart(2, "0");
   const mm = String(date.getMinutes()).padStart(2, "0");
   return `${hh}:${mm}`;
+}
+
+function timeToMinutes(time) {
+  if (!time || !time.includes(":")) return null;
+  const [h, m] = time.split(":").map((n) => Number(n));
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+  return h * 60 + m;
+}
+
+function getBaseDurationMinutes(people) {
+  if (!Number.isFinite(people)) return 120;
+  if (people <= 4) return 120;
+  if (people <= 8) return 150;
+  if (people <= 15) return 180;
+  return 180;
+}
+
+function hasLiveMusicEvent(events) {
+  return events.some((event) => {
+    const summary = String(event.summary || "").toLowerCase();
+    const description = String(event.description || "").toLowerCase();
+    return (
+      summary.includes("live music") ||
+      description.includes("live music") ||
+      summary.includes("dj set") ||
+      description.includes("dj set")
+    );
+  });
+}
+
+function computeDurationMinutes(session, events) {
+  const baseMinutes = getBaseDurationMinutes(session?.people);
+  const startMinutes = timeToMinutes(session?.time24);
+  if (!events || events.length === 0) return baseMinutes;
+  if (!Number.isFinite(startMinutes)) return baseMinutes;
+  if (startMinutes < 20 * 60) return baseMinutes;
+  if ((session?.people || 0) > 8) return baseMinutes;
+  if (!hasLiveMusicEvent(events)) return baseMinutes;
+  return baseMinutes + 30;
+}
+
+function maybeSayDivanettiNotice(vr, session) {
+  if (!session?.divanettiNotice || session.divanettiNoticeSpoken) return;
+  sayIt(vr, "Ti abbiamo riservato l’area divanetti, ideale per aperitivo e dopocena.");
+  session.divanettiNoticeSpoken = true;
 }
 
 function buildAvailabilityDescription(dateISO, events) {
@@ -783,105 +873,65 @@ async function upsertAvailabilityEvent(dateISO) {
   }
 }
 
-function getOpeningHoursForDate(dateISO, bookingType) {
-  const date = new Date(`${dateISO}T00:00:00`);
-  const dow = date.getDay();
-  const isMusicNight = OPENING.musicNights.days.includes(dow);
-  if (bookingType === "drinks") {
-    return OPENING.drinksOnly;
-  }
-  if (bookingType === "restaurant") {
-    return dow === 5 || dow === 6 ? OPENING.restaurant.friSat : OPENING.restaurant.default;
-  }
-  if (bookingType === "music") {
-    return isMusicNight ? OPENING.drinksOnly : OPENING.restaurant.default;
-  }
-  return OPENING.restaurant.default;
-}
-
-function timeToMinutes(time) {
-  if (!time || !time.includes(":")) return null;
-  const [h, m] = time.split(":").map((n) => Number(n));
-  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
-  return h * 60 + m;
-}
-
-function isTimeInRange(time, range) {
-  if (!range?.start || !range?.end) return true;
-  const t = timeToMinutes(time);
-  const start = timeToMinutes(range.start);
-  const end = timeToMinutes(range.end);
-  if (t === null || start === null || end === null) return true;
-  return t >= start && t <= end;
-}
-
-function getTimeRangeForBooking(session) {
-  if (!session?.dateISO || !session?.time24) return null;
-  const start = new Date(`${session.dateISO}T${session.time24}:00`);
-  const end = new Date(start.getTime() + 2 * 60 * 60 * 1000);
-  return { start, end };
-}
-
-async function reserveTableForSession(session, { commit = false } = {}) {
+async function reserveTableForSession(session, { commit } = { commit: false }) {
   const events = await listCalendarEvents(session.dateISO);
-  const date = new Date(`${session.dateISO}T00:00:00`);
-  const isHoliday = HOLIDAYS_SET.has(session.dateISO);
-  const isClosedDay = date.getDay() === OPENING.closedDay;
-  if (isHoliday || isClosedDay || isDateClosedByCalendar(events)) return { status: "closed" };
-
-  if (!isTimeInRange(session.time24, getOpeningHoursForDate(session.dateISO, session.bookingType))) {
-    return { status: "unavailable" };
+  if (isDateClosedByCalendar(events)) {
+    return { status: "closed" };
   }
 
+  session.divanettiNotice = false;
+  session.divanettiNoticeSpoken = false;
+  session.durationMinutes = computeDurationMinutes(session, events);
+  const bookingStart = new Date(`${session.dateISO}T${session.time24}:00`);
+  const bookingEnd = new Date(bookingStart.getTime() + (session.durationMinutes || 120) * 60 * 1000);
+  const bookingRange = { start: bookingStart, end: bookingEnd };
   const occupied = new Set();
-  let availableOverride = null;
   const eventoEvents = [];
-  const bookingRange = getTimeRangeForBooking(session);
 
   for (const event of events) {
     const summary = String(event.summary || "").toLowerCase();
-    const description = String(event.description || "");
-    const isAvailabilityEvent = summary.includes("tavoli disponibili");
-    const isEvento = summary.includes("evento");
-    const eventTime = getEventTimeRange(event);
-    if (!eventTime || !bookingRange || !overlapsRange(eventTime, bookingRange)) continue;
-
-    if (isAvailabilityEvent) {
-      availableOverride = new Set(extractTablesFromEvent(event));
+    if (summary.startsWith("annullata")) continue;
+    if (summary.includes("evento")) {
+      eventoEvents.push(event);
       continue;
     }
-
-    if (isEvento) {
-      eventoEvents.push(event);
-    }
-
-    const tables = extractTablesFromEvent(event);
-    tables.forEach((tableId) => {
-      expandTableLocks(tableId).forEach((lock) => occupied.add(lock));
-    });
+    const eventRange = getEventTimeRange(event);
+    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
+    const tableIds = extractTablesFromEvent(event);
+    tableIds.flatMap(expandTableLocks).forEach((id) => occupied.add(id));
   }
 
-  const selection = pickTableForParty(session.people, occupied, availableOverride);
+  let availableOverride = null;
+  if (eventoEvents.length > 0) {
+    const eventTables = eventoEvents
+      .flatMap((event) => extractTablesFromEvent(event))
+      .flatMap((id) => expandTableLocks(id));
+    availableOverride = new Set(eventTables);
+  }
 
+  const selection = pickTableForParty(session.people, occupied, availableOverride, session);
   if (!selection) {
     const availableTables = buildAvailableTables(occupied, availableOverride);
-
     const insideTables = availableTables.filter((table) => table.area === "inside");
-    const insideSplit = pickSplitTables(session.people, insideTables);
+    const insideSplit = pickSplitTables(session.people, insideTables, session);
     if (insideSplit) {
       session.tableDisplayId = insideSplit.displayIds.join(" e ");
       session.tableLocks = insideSplit.locks;
       session.tableNotes = insideSplit.notes;
+      session.divanettiNotice = insideSplit.locks.some((id) => isDivanettiTableId(id));
+      session.divanettiNoticeSpoken = false;
       session.splitRequired = true;
       session.outsideRequired = false;
       return { status: "needs_split" };
     }
 
-    const anySplit = pickSplitTables(session.people, availableTables);
+    const anySplit = pickSplitTables(session.people, availableTables, session);
     if (anySplit) {
       session.tableDisplayId = anySplit.displayIds.join(" e ");
       session.tableLocks = anySplit.locks;
       session.tableNotes = anySplit.notes;
+      session.divanettiNotice = anySplit.locks.some((id) => isDivanettiTableId(id));
+      session.divanettiNoticeSpoken = false;
       session.splitRequired = true;
       session.outsideRequired = anySplit.locks.some((id) => getTableById(id)?.area === "outside");
       return { status: "needs_outside" };
@@ -893,6 +943,8 @@ async function reserveTableForSession(session, { commit = false } = {}) {
   session.tableDisplayId = selection.displayId;
   session.tableLocks = selection.locks;
   session.tableNotes = selection.notes;
+  session.divanettiNotice = selection.locks.some((id) => isDivanettiTableId(id));
+  session.divanettiNoticeSpoken = false;
   session.splitRequired = false;
   session.outsideRequired = selection.locks.some((id) => getTableById(id)?.area === "outside");
 
@@ -975,7 +1027,7 @@ async function createCalendarEvent(session) {
 
   const startDateTime = `${session.dateISO}T${session.time24}:00`;
   const endDate = new Date(`${session.dateISO}T${session.time24}:00`);
-  endDate.setMinutes(endDate.getMinutes() + 120);
+  endDate.setMinutes(endDate.getMinutes() + (session.durationMinutes || 120));
   const endDateTime = `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, "0")}-${String(
     endDate.getDate()
   ).padStart(2, "0")}T${String(endDate.getHours()).padStart(2, "0")}:${String(
@@ -1456,19 +1508,19 @@ async function handleVoiceRequest(req, res) {
             session.preorderChoiceKey = option?.key || "apericena";
             session.preorderLabel = option?.label || "Apericena";
           } else {
-          const option = PREORDER_OPTIONS.find(
-            (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
-          );
-          if (option) {
-            session.preorderChoiceKey = option.key;
-            session.preorderLabel = option.label;
-          } else {
-            gatherSpeech(
-              vr,
-              "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+            const option = PREORDER_OPTIONS.find(
+              (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
             );
-            break;
-          }
+            if (option) {
+              session.preorderChoiceKey = option.key;
+              session.preorderLabel = option.label;
+            } else {
+              gatherSpeech(
+                vr,
+                "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+              );
+              break;
+            }
           }
         }
         const availability = await reserveTableForSession(session, { commit: false });
@@ -1485,6 +1537,7 @@ async function handleVoiceRequest(req, res) {
         if (availability.status === "needs_split" || availability.status === "needs_outside" || session.outsideRequired) {
           session.criticalReservation = true;
           session.step = 8;
+          maybeSayDivanettiNotice(vr, session);
           gatherSpeech(
             vr,
             "La prenotazione è stata effettuata con criticità. Ti richiamerà un operatore. Intanto mi lasci un numero di telefono? Se è italiano, aggiungo io il +39."
@@ -1493,6 +1546,7 @@ async function handleVoiceRequest(req, res) {
         }
         resetRetries(session);
         session.step = 8;
+        maybeSayDivanettiNotice(vr, session);
         gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
         break;
       }
