@@ -259,6 +259,8 @@ function getSession(callSid) {
       durationMinutes: null,
       divanettiNotice: false,
       divanettiNoticeSpoken: false,
+      glutenPiattoNotice: false,
+      promoRegistrationNotice: false,
       bookingType: "restaurant",
       autoConfirm: true,
       promoEligible: null,
@@ -459,7 +461,12 @@ function parseYesNo(speech) {
 function hasGlutenIntolerance(text) {
   const tt = normalizeText(text);
   if (!tt) return false;
-  return tt.includes("celiachia") || tt.includes("glutine") || tt.includes("senza glutine");
+  return (
+    tt.includes("celiachia") ||
+    tt.includes("glutine") ||
+    tt.includes("senza glutine") ||
+    tt.includes("intolleranza al glutine")
+  );
 }
 
 function isDivanettiTableId(id) {
@@ -473,6 +480,36 @@ function isHighTableId(id) {
 function isDivanettiPreferred(session) {
   const choice = session?.preorderChoiceKey || "";
   return choice === "apericena" || choice === "dopocena";
+}
+
+function getApericenaNoticeTexts(session) {
+  const notices = [];
+  if (session?.glutenPiattoNotice) {
+    notices.push(
+      "Ti informo che il piatto apericena e il piatto apericena promo non sono disponibili senza glutine. Il personale di sala potrà consigliarti alternative adatte."
+    );
+  }
+  if (session?.promoRegistrationNotice) {
+    notices.push(
+      "Se non hai ancora fatto la registrazione online, dovrai completarla in struttura per accedere alla promo."
+    );
+  }
+  return notices;
+}
+
+function maybeSayApericenaNotices(vr, session) {
+  const notices = getApericenaNoticeTexts(session);
+  if (notices.length === 0) return;
+  for (const notice of notices) {
+    sayIt(vr, notice);
+  }
+}
+
+function buildSpecialRequestsText(session) {
+  const base = session?.specialRequestsRaw || "nessuna";
+  const notices = getApericenaNoticeTexts(session);
+  if (notices.length === 0) return base;
+  return `${base} | ${notices.join(" ")}`;
 }
 
 function parsePhoneNumber(speech) {
@@ -998,7 +1035,7 @@ async function cancelCalendarEvent(session) {
         description: [
           `Nome: ${session.name || ""}`,
           `Persone: ${session.people || ""}`,
-          `Note: ${session.specialRequestsRaw || "nessuna"}`,
+          `Note: ${buildSpecialRequestsText(session)}`,
           `Preordine: ${session.preorderLabel || "nessuno"}`,
           "Tavolo: ",
           `Telefono: ${session.phone || "non fornito"}`,
@@ -1042,7 +1079,7 @@ async function createCalendarEvent(session) {
     description: [
       `Nome: ${session.name}`,
       `Persone: ${session.people}`,
-      `Note: ${session.specialRequestsRaw || "nessuna"}`,
+      `Note: ${buildSpecialRequestsText(session)}`,
       `Preordine: ${session.preorderLabel || "nessuno"}`,
       `Tavolo: ${tableLabel}`,
       `Telefono: ${session.phone || "non fornito"}`,
@@ -1470,6 +1507,8 @@ async function handleVoiceRequest(req, res) {
         const normalized = normalizeText(speech);
         const glutenIntolerance = hasGlutenIntolerance(session.specialRequestsRaw);
         const isFriday = session.dateISO ? new Date(`${session.dateISO}T00:00:00`).getDay() === 5 : false;
+        session.glutenPiattoNotice = false;
+        session.promoRegistrationNotice = false;
         if (normalized.includes("nessuno") || normalized.includes("niente") || normalized.includes("no")) {
           session.preorderChoiceKey = null;
           session.preorderLabel = "nessuno";
@@ -1483,19 +1522,13 @@ async function handleVoiceRequest(req, res) {
               );
               break;
             }
-            if (glutenIntolerance) {
-              gatherSpeech(
-                vr,
-                "L’apericena non è disponibile per celiaci o intolleranti al glutine. Puoi scegliere un’alternativa."
-              );
-              break;
-            }
             session.preorderChoiceKey = promoOption?.key || "piatto_apericena_promo";
             session.preorderLabel = promoOption?.label || "Piatto Apericena in promo (previa registrazione)";
-            sayIt(
-              vr,
-              "Per usufruire dell’apericena promo è necessaria la registrazione online. Se non l’hai ancora fatta, potrai completarla direttamente in struttura."
-            );
+            session.promoRegistrationNotice = true;
+            if (glutenIntolerance) {
+              session.glutenPiattoNotice = true;
+            }
+            maybeSayApericenaNotices(vr, session);
           } else if (normalized.includes("apericena")) {
             if (glutenIntolerance) {
               gatherSpeech(
@@ -1514,6 +1547,18 @@ async function handleVoiceRequest(req, res) {
             if (option) {
               session.preorderChoiceKey = option.key;
               session.preorderLabel = option.label;
+              let shouldSayNotice = false;
+              if ((option.key === "piatto_apericena" || option.key === "piatto_apericena_promo") && glutenIntolerance) {
+                session.glutenPiattoNotice = true;
+                shouldSayNotice = true;
+              }
+              if (option.key === "piatto_apericena_promo") {
+                session.promoRegistrationNotice = true;
+                shouldSayNotice = true;
+              }
+              if (shouldSayNotice) {
+                maybeSayApericenaNotices(vr, session);
+              }
             } else {
               gatherSpeech(
                 vr,
@@ -1635,6 +1680,7 @@ async function handleVoiceRequest(req, res) {
           break;
         }
         session.step = 9;
+        maybeSayApericenaNotices(vr, session);
         gatherSpeech(
           vr,
           t("step8_summary_confirm.main", {
