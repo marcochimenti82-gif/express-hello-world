@@ -454,6 +454,12 @@ function parseYesNo(speech) {
   return null;
 }
 
+function hasGlutenIntolerance(text) {
+  const tt = normalizeText(text);
+  if (!tt) return false;
+  return tt.includes("celiachia") || tt.includes("glutine") || tt.includes("senza glutine");
+}
+
 function parsePhoneNumber(speech) {
   if (!speech) return null;
   if (isValidPhoneE164(speech)) return speech.trim();
@@ -1410,10 +1416,46 @@ async function handleVoiceRequest(req, res) {
           break;
         }
         const normalized = normalizeText(speech);
+        const glutenIntolerance = hasGlutenIntolerance(session.specialRequestsRaw);
+        const isFriday = session.dateISO ? new Date(`${session.dateISO}T00:00:00`).getDay() === 5 : false;
         if (normalized.includes("nessuno") || normalized.includes("niente") || normalized.includes("no")) {
           session.preorderChoiceKey = null;
           session.preorderLabel = "nessuno";
         } else {
+          if (normalized.includes("apericena promo")) {
+            const promoOption = getPreorderOptionByKey("piatto_apericena_promo");
+            if (isFriday) {
+              gatherSpeech(
+                vr,
+                "L’apericena promo non è disponibile il venerdì. Puoi scegliere l’apericena standard oppure un altro piatto."
+              );
+              break;
+            }
+            if (glutenIntolerance) {
+              gatherSpeech(
+                vr,
+                "L’apericena non è disponibile per celiaci o intolleranti al glutine. Puoi scegliere un’alternativa."
+              );
+              break;
+            }
+            session.preorderChoiceKey = promoOption?.key || "piatto_apericena_promo";
+            session.preorderLabel = promoOption?.label || "Piatto Apericena in promo (previa registrazione)";
+            sayIt(
+              vr,
+              "Per usufruire dell’apericena promo è necessaria la registrazione online. Se non l’hai ancora fatta, potrai completarla direttamente in struttura."
+            );
+          } else if (normalized.includes("apericena")) {
+            if (glutenIntolerance) {
+              gatherSpeech(
+                vr,
+                "L’apericena non è disponibile per celiaci o intolleranti al glutine. Puoi scegliere un’alternativa."
+              );
+              break;
+            }
+            const option = getPreorderOptionByKey("apericena");
+            session.preorderChoiceKey = option?.key || "apericena";
+            session.preorderLabel = option?.label || "Apericena";
+          } else {
           const option = PREORDER_OPTIONS.find(
             (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
           );
@@ -1426,6 +1468,7 @@ async function handleVoiceRequest(req, res) {
               "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
             );
             break;
+          }
           }
         }
         const availability = await reserveTableForSession(session, { commit: false });
