@@ -234,6 +234,8 @@ function getSession(callSid) {
       intent: null,
       intentRetries: 0,
       intentWelcomed: false,
+      silenceStep: null,
+      silenceRetries: 0,
       retries: 0,
       name: null,
       dateISO: null,
@@ -258,6 +260,9 @@ function getSession(callSid) {
       bookingType: "restaurant",
       autoConfirm: true,
       promoEligible: null,
+      eventName: null,
+      eventDateISO: null,
+      eventTime24: null,
     });
   }
   return sessions.get(callSid);
@@ -269,6 +274,28 @@ function bumpRetries(session) {
 }
 function resetRetries(session) {
   session.retries = 0;
+  resetSilence(session);
+}
+
+function resetSilence(session) {
+  session.silenceStep = null;
+  session.silenceRetries = 0;
+}
+
+function handleSilence(session, vr, promptFn) {
+  if (session.silenceStep !== session.step) {
+    session.silenceStep = session.step;
+    session.silenceRetries = 0;
+  }
+  session.silenceRetries += 1;
+  if (session.silenceRetries >= 2) {
+    session.silenceRetries = 0;
+    if (canForwardToHuman()) {
+      return { action: "forward" };
+    }
+  }
+  promptFn();
+  return { action: "prompt" };
 }
 
 function normalizeText(s) {
@@ -597,54 +624,156 @@ function pickTableForParty(people, occupied, availableOverride) {
 
   for (const combo of TABLE_COMBINATIONS) {
     if (people < combo.min || people > combo.max) continue;
-    if (combo.replaces.every((id) => availableSet.has(id))) {
+    const unavailable = combo.replaces.some((id) => occupied.has(id) || !availableSet.has(id));
+    if (!unavailable) {
       return { displayId: combo.displayId, locks: combo.replaces, notes: combo.notes || null };
     }
   }
-
   return null;
 }
 
-// ======================= SPLIT TABLES =======================
 function pickSplitTables(people, availableTables) {
-  if (people < 5) return null;
+  const sorted = [...availableTables].sort((a, b) => b.max - a.max);
+  const selected = [];
+  let remaining = people;
+  let capacity = 0;
 
-  const tables = availableTables.slice().sort((a, b) => b.max - a.max);
-
-  for (let i = 0; i < tables.length; i += 1) {
-    for (let j = i + 1; j < tables.length; j += 1) {
-      const t1 = tables[i];
-      const t2 = tables[j];
-      const combinedMin = (t1.min || 0) + (t2.min || 0);
-      const combinedMax = (t1.max || 0) + (t2.max || 0);
-      if (people < combinedMin || people > combinedMax) continue;
-      return {
-        displayIds: [t1.id, t2.id],
-        locks: [t1.id, t2.id],
-        notes: [t1.notes, t2.notes].filter(Boolean).join(" e "),
-      };
-    }
+  for (const table of sorted) {
+    if (remaining <= 0) break;
+    selected.push(table);
+    capacity += table.max;
+    remaining -= table.max;
   }
 
-  return null;
+  if (capacity < people || selected.length === 0) return null;
+  return {
+    displayIds: selected.map((table) => table.id),
+    locks: selected.map((table) => table.id),
+    notes: "tavoli separati",
+  };
+}
+
+function getNextDateISO(dateISO) {
+  const date = new Date(`${dateISO}T00:00:00`);
+  date.setDate(date.getDate() + 1);
+  return toISODate(date);
 }
 
 async function listCalendarEvents(dateISO) {
+  if (!GOOGLE_CALENDAR_ID) return [];
   const calendar = buildCalendarClient();
-  if (!calendar || !GOOGLE_CALENDAR_ID || !dateISO) return [];
+  if (!calendar) return [];
+  const { start, end } = getTimeRangeForDate(dateISO);
   try {
-    const { start, end } = getTimeRangeForDate(dateISO);
-    const res = await calendar.events.list({
+    const result = await calendar.events.list({
       calendarId: GOOGLE_CALENDAR_ID,
       timeMin: start.toISOString(),
       timeMax: end.toISOString(),
       singleEvents: true,
       orderBy: "startTime",
     });
-    return res.data.items || [];
+    return result?.data?.items || [];
   } catch (err) {
     console.error("[GOOGLE] Calendar list failed:", err);
     return [];
+  }
+}
+
+function formatTimeSlot(date, startDate) {
+  if (!date) return "";
+  if (
+    startDate &&
+    date.getHours() === 0 &&
+    date.getMinutes() === 0 &&
+    date.getTime() > startDate.getTime()
+  ) {
+    return "24:00";
+  }
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function buildAvailabilityDescription(dateISO, events) {
+  const tableIds = TABLES.map((table) => table.id);
+  const occupancy = new Map(tableIds.map((id) => [id, []]));
+  const bookingRange = {
+    start: new Date(`${dateISO}T00:00:00`),
+    end: new Date(`${dateISO}T23:59:59`),
+  };
+
+  for (const event of events) {
+    const summary = String(event.summary || "").toLowerCase();
+    const eventType = event.extendedProperties?.private?.type || "";
+    if (summary.startsWith("annullata")) continue;
+    if (summary.includes("tavoli disponibili")) continue;
+    if (summary.includes("locale chiuso")) continue;
+    if (summary.includes("evento") || eventType === "evento") continue;
+    const eventRange = getEventTimeRange(event);
+    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
+    const tableIdsForEvent = extractTablesFromEvent(event)
+      .flatMap(expandTableLocks)
+      .filter((id) => occupancy.has(id));
+    for (const tableId of tableIdsForEvent) {
+      occupancy.get(tableId).push({
+        start: eventRange.start,
+        end: eventRange.end,
+      });
+    }
+  }
+
+  const lines = tableIds.map((tableId) => {
+    const slots = occupancy.get(tableId) || [];
+    slots.sort((a, b) => a.start - b.start);
+    if (slots.length === 0) {
+      return `${tableId}:`;
+    }
+    const slotText = slots
+      .map((slot) => {
+        const start = formatTimeSlot(slot.start);
+        const end = formatTimeSlot(slot.end, slot.start);
+        return `occupato dalle ${start} alle ${end};`;
+      })
+      .join(" ");
+    return `${tableId}: ${slotText}`;
+  });
+
+  return lines.join("\n");
+}
+
+async function upsertAvailabilityEvent(dateISO) {
+  if (!GOOGLE_CALENDAR_ID) return null;
+  const calendar = buildCalendarClient();
+  if (!calendar) return null;
+  const events = await listCalendarEvents(dateISO);
+  const availabilityEvent = events.find((event) =>
+    String(event.summary || "").toLowerCase().includes("tavoli disponibili")
+  );
+  const description = buildAvailabilityDescription(dateISO, events);
+  const requestBody = {
+    summary: "Tavoli disponibili",
+    description,
+    start: { date: dateISO, timeZone: GOOGLE_CALENDAR_TZ },
+    end: { date: getNextDateISO(dateISO), timeZone: GOOGLE_CALENDAR_TZ },
+  };
+
+  try {
+    if (availabilityEvent?.id) {
+      const result = await calendar.events.patch({
+        calendarId: GOOGLE_CALENDAR_ID,
+        eventId: availabilityEvent.id,
+        requestBody,
+      });
+      return result?.data || null;
+    }
+    const result = await calendar.events.insert({
+      calendarId: GOOGLE_CALENDAR_ID,
+      requestBody,
+    });
+    return result?.data || null;
+  } catch (err) {
+    console.error("[GOOGLE] Availability event update failed:", err);
+    return null;
   }
 }
 
@@ -687,54 +816,6 @@ function getTimeRangeForBooking(session) {
   return { start, end };
 }
 
-async function upsertAvailabilityEvent(dateISO) {
-  if (!GOOGLE_CALENDAR_ID) return null;
-  const calendar = buildCalendarClient();
-  if (!calendar) return null;
-
-  const events = await listCalendarEvents(dateISO);
-  const availabilityEvent = events.find((event) => {
-    const summary = String(event.summary || "").toLowerCase();
-    return summary.includes("tavoli disponibili");
-  });
-
-  const occupied = new Set();
-  events.forEach((event) => {
-    const summary = String(event.summary || "").toLowerCase();
-    if (summary.includes("tavoli disponibili")) return;
-    const tables = extractTablesFromEvent(event);
-    tables.forEach((tableId) => occupied.add(tableId));
-  });
-
-  const availableTables = buildAvailableTables(occupied, null);
-  const availableCount = availableTables.length;
-  const summary = `Tavoli disponibili: ${availableCount}`;
-  const description = `Tavolo: ${availableTables.map((table) => table.id).join(", ")}`;
-
-  try {
-    if (availabilityEvent) {
-      return await calendar.events.patch({
-        calendarId: GOOGLE_CALENDAR_ID,
-        eventId: availabilityEvent.id,
-        requestBody: { summary, description },
-      });
-    }
-    const { start, end } = getTimeRangeForDate(dateISO);
-    return await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID,
-      requestBody: {
-        summary,
-        description,
-        start: { dateTime: start.toISOString() },
-        end: { dateTime: end.toISOString() },
-      },
-    });
-  } catch (err) {
-    console.error("[GOOGLE] Availability event update failed:", err);
-    return null;
-  }
-}
-
 async function reserveTableForSession(session, { commit = false } = {}) {
   const events = await listCalendarEvents(session.dateISO);
   const date = new Date(`${session.dateISO}T00:00:00`);
@@ -751,17 +832,17 @@ async function reserveTableForSession(session, { commit = false } = {}) {
   const eventoEvents = [];
   const bookingRange = getTimeRangeForBooking(session);
 
-  events.forEach((event) => {
+  for (const event of events) {
     const summary = String(event.summary || "").toLowerCase();
     const description = String(event.description || "");
     const isAvailabilityEvent = summary.includes("tavoli disponibili");
     const isEvento = summary.includes("evento");
     const eventTime = getEventTimeRange(event);
-    if (!eventTime || !bookingRange || !overlapsRange(eventTime, bookingRange)) return;
+    if (!eventTime || !bookingRange || !overlapsRange(eventTime, bookingRange)) continue;
 
     if (isAvailabilityEvent) {
       availableOverride = new Set(extractTablesFromEvent(event));
-      return;
+      continue;
     }
 
     if (isEvento) {
@@ -772,7 +853,7 @@ async function reserveTableForSession(session, { commit = false } = {}) {
     tables.forEach((tableId) => {
       expandTableLocks(tableId).forEach((lock) => occupied.add(lock));
     });
-  });
+  }
 
   const selection = pickTableForParty(session.people, occupied, availableOverride);
 
@@ -802,6 +883,7 @@ async function reserveTableForSession(session, { commit = false } = {}) {
 
     return { status: "unavailable" };
   }
+
   session.tableDisplayId = selection.displayId;
   session.tableLocks = selection.locks;
   session.tableNotes = selection.notes;
@@ -932,6 +1014,49 @@ async function createCalendarEvent(session) {
   }
 }
 
+async function createEventCalendarEvent(session) {
+  if (!GOOGLE_CALENDAR_ID) return null;
+  const calendar = buildCalendarClient();
+  if (!calendar) return null;
+  if (!session?.eventDateISO || !session?.eventTime24 || !session?.eventName) return null;
+
+  const startDateTime = `${session.eventDateISO}T${session.eventTime24}:00`;
+  const endDate = new Date(`${session.eventDateISO}T${session.eventTime24}:00`);
+  endDate.setMinutes(endDate.getMinutes() + 120);
+  const endDateTime = `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, "0")}-${String(
+    endDate.getDate()
+  ).padStart(2, "0")}T${String(endDate.getHours()).padStart(2, "0")}:${String(
+    endDate.getMinutes()
+  ).padStart(2, "0")}:00`;
+
+  const event = {
+    summary: `Evento - ${session.eventName}`,
+    description: [
+      `Nome evento: ${session.eventName}`,
+      `Data: ${session.eventDateISO}`,
+      `Ora: ${session.eventTime24}`,
+    ].join("\n"),
+    start: { dateTime: startDateTime, timeZone: GOOGLE_CALENDAR_TZ },
+    end: { dateTime: endDateTime, timeZone: GOOGLE_CALENDAR_TZ },
+    extendedProperties: {
+      private: {
+        type: "evento",
+      },
+    },
+  };
+
+  try {
+    const result = await calendar.events.insert({
+      calendarId: GOOGLE_CALENDAR_ID,
+      requestBody: event,
+    });
+    return result?.data || null;
+  } catch (err) {
+    console.error("[GOOGLE] Event insert failed:", err);
+    return null;
+  }
+}
+
 // ======================= ROUTES =======================
 app.get("/health", (req, res) => res.json({ ok: true }));
 
@@ -1020,22 +1145,17 @@ async function handleVoiceRequest(req, res) {
     switch (session.step) {
       case "intent": {
         if (!session.intentWelcomed) {
-          sayIt(vr, "Ciao e benvenuto da Tutti Brilli.");
+          sayIt(vr, "Benvenuto da Tuttibrilli.");
           session.intentWelcomed = true;
         }
         if (emptySpeech) {
-          session.intentRetries += 1;
-          if (session.intentRetries >= 2) {
-            if (canForwardToHuman()) {
-              res.set("Content-Type", "text/xml; charset=utf-8");
-              return res.send(forwardToHumanTwiml());
-            }
-            sayIt(vr, "Mi dispiace, non ho capito. Riprova più tardi.");
-            vr.hangup();
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni, oppure prenotare un evento?")
+          );
+          if (silenceResult.action === "forward") {
             res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
+            return res.send(forwardToHumanTwiml());
           }
-          gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni o prenotare un evento?");
           break;
         }
 
@@ -1065,17 +1185,15 @@ async function handleVoiceRequest(req, res) {
               res.set("Content-Type", "text/xml; charset=utf-8");
               return res.send(forwardToHumanTwiml());
             }
-            sayIt(vr, "Mi dispiace, non ho capito. Riprova più tardi.");
-            vr.hangup();
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
+            session.intentRetries = 0;
           }
-          gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni o prenotare un evento?");
+          gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni, oppure prenotare un evento?");
           break;
         }
 
         session.intent = intent;
         session.intentRetries = 0;
+        resetRetries(session);
 
         if (intent === "table") {
           session.step = 1;
@@ -1089,18 +1207,90 @@ async function handleVoiceRequest(req, res) {
           break;
         }
 
-        sayIt(vr, "Per eventi e feste ti metto in contatto con un operatore.");
-        if (canForwardToHuman()) {
-          vr.dial({}, HUMAN_FORWARD_TO);
-        } else {
-          vr.hangup();
+        session.step = "event_name";
+        gatherSpeech(vr, "Perfetto. Come si chiama l'evento?");
+        break;
+      }
+
+      case "event_name": {
+        if (emptySpeech) {
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, "Perfetto. Come si chiama l'evento?")
+          );
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
         }
+        session.eventName = speech.trim().slice(0, 80);
+        resetRetries(session);
+        session.step = "event_date";
+        gatherSpeech(vr, "Per quale data vuoi prenotare l'evento?");
+        break;
+      }
+
+      case "event_date": {
+        if (emptySpeech) {
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, "Per quale data vuoi prenotare l'evento?")
+          );
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
+        }
+        const eventDateISO = parseDateIT(speech);
+        if (!eventDateISO) {
+          gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
+          break;
+        }
+        session.eventDateISO = eventDateISO;
+        resetRetries(session);
+        session.step = "event_time";
+        gatherSpeech(vr, "A che ora vuoi prenotare l'evento?");
+        break;
+      }
+
+      case "event_time": {
+        if (emptySpeech) {
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, "A che ora vuoi prenotare l'evento?")
+          );
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
+        }
+        const eventTime24 = parseTimeIT(speech);
+        if (!eventTime24) {
+          gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
+          break;
+        }
+        session.eventTime24 = eventTime24;
+        resetRetries(session);
+        const createdEvent = await createEventCalendarEvent(session);
+        if (!createdEvent && canForwardToHuman()) {
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(forwardToHumanTwiml());
+        }
+        sayIt(vr, "Grazie. Ho registrato la tua richiesta per l'evento. Ti contatteremo presto.");
+        vr.hangup();
+        session.step = 1;
         break;
       }
 
       case 1: {
         if (emptySpeech) {
-          gatherSpeech(vr, t("step1_welcome_name.main"));
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, t("step1_welcome_name.main"))
+          );
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
           break;
         }
         session.name = speech.trim().slice(0, 60);
@@ -1112,7 +1302,13 @@ async function handleVoiceRequest(req, res) {
 
       case 2: {
         if (emptySpeech) {
-          gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, t("step3_confirm_date_ask_time.error"))
+          );
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
           break;
         }
         const dateISO = parseDateIT(speech);
@@ -1130,7 +1326,13 @@ async function handleVoiceRequest(req, res) {
 
       case 3: {
         if (emptySpeech) {
-          gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, t("step5_party_size_ask_notes.error"))
+          );
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
           break;
         }
         const people = parsePeopleIT(speech);
@@ -1156,7 +1358,13 @@ async function handleVoiceRequest(req, res) {
 
       case 4: {
         if (emptySpeech) {
-          gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"));
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"))
+          );
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
           break;
         }
         const time24 = parseTimeIT(speech);
@@ -1172,6 +1380,16 @@ async function handleVoiceRequest(req, res) {
       }
 
       case 5: {
+        if (emptySpeech) {
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people }))
+          );
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
+        }
         session.specialRequestsRaw = emptySpeech ? "nessuna" : speech.trim().slice(0, 200);
         resetRetries(session);
         session.step = 6;
@@ -1184,7 +1402,11 @@ async function handleVoiceRequest(req, res) {
 
       case 6: {
         if (emptySpeech) {
-          promptForStep(vr, session);
+          const silenceResult = handleSilence(session, vr, () => promptForStep(vr, session));
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
           break;
         }
         const normalized = normalizeText(speech);
@@ -1233,6 +1455,17 @@ async function handleVoiceRequest(req, res) {
       }
 
       case 7: {
+        if (emptySpeech) {
+          const promptText = session.outsideRequired
+            ? "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
+            : "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.";
+          const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, promptText));
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
+        }
         const confirmation = parseYesNo(speech);
         if (confirmation === null) {
           if (session.outsideRequired) {
@@ -1262,7 +1495,13 @@ async function handleVoiceRequest(req, res) {
 
       case 8: {
         if (emptySpeech) {
-          gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?");
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?")
+          );
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
           break;
         }
         const phone = parsePhoneNumber(speech);
@@ -1312,6 +1551,23 @@ async function handleVoiceRequest(req, res) {
       }
 
       case 9: {
+        if (emptySpeech) {
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(
+              vr,
+              t("step8_summary_confirm.short", {
+                dateLabel: session.dateLabel || "",
+                time: session.time24 || "",
+                partySize: session.people || "",
+              })
+            )
+          );
+          if (silenceResult.action === "forward") {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
+        }
         const confirmation = parseYesNo(speech);
         if (confirmation === null) {
           gatherSpeech(
