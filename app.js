@@ -233,6 +233,7 @@ function getSession(callSid) {
       step: "intent",
       intent: null,
       intentRetries: 0,
+      intentWelcomed: false,
       retries: 0,
       name: null,
       dateISO: null,
@@ -1018,6 +1019,10 @@ async function handleVoiceRequest(req, res) {
 
     switch (session.step) {
       case "intent": {
+        if (!session.intentWelcomed) {
+          sayIt(vr, "Ciao e benvenuto da Tutti Brilli.");
+          session.intentWelcomed = true;
+        }
         if (emptySpeech) {
           session.intentRetries += 1;
           if (session.intentRetries >= 2) {
