@@ -18,6 +18,7 @@ if (hasDotenv) {
 const express = require("express");
 const twilio = require("twilio");
 const bodyParser = require("body-parser");
+const nodemailer = require("nodemailer");
 const { google } = require("googleapis");
 
 const { PROMPTS } = require("./prompts");
@@ -37,6 +38,14 @@ const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "";
 const GOOGLE_CALENDAR_TZ = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
+
+const SMTP_HOST = process.env.SMTP_HOST || "";
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.SMTP_PASS || "";
+const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true";
+const FALLBACK_EMAIL_TO = process.env.FALLBACK_EMAIL_TO || "tuttibrillienoteca@gmail.com";
+const FALLBACK_EMAIL_FROM = process.env.FALLBACK_EMAIL_FROM || "no-reply@tuttibrilli.local";
 
 const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "false").toLowerCase() === "true";
 const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || "";
@@ -193,6 +202,67 @@ function forwardToHumanTwiml() {
   return vr.toString();
 }
 
+function buildFallbackEmailPayload(session, req, reason) {
+  const caller = req?.body?.From || "";
+  const timestamp = new Date().toISOString();
+  const state = session?.step || "unknown";
+  const data = {
+    name: session?.name || "",
+    dateISO: session?.dateISO || "",
+    time24: session?.time24 || "",
+    people: session?.people || "",
+    specialRequestsRaw: session?.specialRequestsRaw || "",
+    preorderChoiceKey: session?.preorderChoiceKey || "",
+    preorderLabel: session?.preorderLabel || "",
+    phone: session?.phone || "",
+    tableDisplayId: session?.tableDisplayId || "",
+    tableLocks: session?.tableLocks || [],
+    criticalReservation: session?.criticalReservation || false,
+    eventName: session?.eventName || "",
+    eventDateISO: session?.eventDateISO || "",
+    eventTime24: session?.eventTime24 || "",
+  };
+  return {
+    subject: "Fallback richiesta prenotazione",
+    text: [
+      `Numero chiamante: ${caller}`,
+      `Timestamp: ${timestamp}`,
+      `Stato flusso: ${state}`,
+      `Motivo fallback: ${reason || "non specificato"}`,
+      `Dati raccolti: ${JSON.stringify(data)}`,
+    ].join("\n"),
+  };
+}
+
+async function sendFallbackEmail(session, req, reason) {
+  const payload = buildFallbackEmailPayload(session, req, reason);
+  try {
+    let transporter = null;
+    if (SMTP_HOST) {
+      transporter = nodemailer.createTransport({
+        host: SMTP_HOST,
+        port: SMTP_PORT,
+        secure: SMTP_SECURE,
+        auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+      });
+    } else {
+      transporter = nodemailer.createTransport({
+        sendmail: true,
+        newline: "unix",
+        path: "/usr/sbin/sendmail",
+      });
+    }
+    await transporter.sendMail({
+      from: FALLBACK_EMAIL_FROM,
+      to: FALLBACK_EMAIL_TO,
+      subject: payload.subject,
+      text: payload.text,
+    });
+  } catch (err) {
+    console.error("[EMAIL] Fallback email failed:", err);
+  }
+}
+
 async function notifyCriticalReservation(phone, summary) {
   if (!twilioClient) return null;
   try {
@@ -296,9 +366,7 @@ function handleSilence(session, vr, promptFn) {
   session.silenceRetries += 1;
   if (session.silenceRetries >= 2) {
     session.silenceRetries = 0;
-    if (canForwardToHuman()) {
-      return { action: "forward" };
-    }
+    return { action: "forward" };
   }
   promptFn();
   return { action: "prompt" };
@@ -306,6 +374,17 @@ function handleSilence(session, vr, promptFn) {
 
 function normalizeText(s) {
   return String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function isOperatorRequest(speech) {
+  const tt = normalizeText(speech);
+  return (
+    tt.includes("operatore") ||
+    tt.includes("parlare con qualcuno") ||
+    tt.includes("persona") ||
+    tt.includes("assistenza") ||
+    tt.includes("aiuto")
+  );
 }
 function toISODate(d) {
   const y = d.getFullYear();
@@ -978,7 +1057,6 @@ async function reserveTableForSession(session, { commit } = { commit: false }) {
 
     return { status: "unavailable" };
   }
-
   session.tableDisplayId = selection.displayId;
   session.tableLocks = selection.locks;
   session.tableNotes = selection.notes;
@@ -1024,7 +1102,7 @@ async function cancelCalendarEvent(session) {
   if (!calendar) return null;
   const summary = session.calendarEventSummary || "";
   const summaryWithoutTable = summary.replace(/,\s*tav[^,]+/i, "").trim();
-  const updatedSummary = summaryWithoutTable.startsWith("Annullata")
+    const updatedSummary = summaryWithoutTable.startsWith("Annullata")
     ? summaryWithoutTable
     : `Annullata - ${summaryWithoutTable}`;
 
@@ -1208,12 +1286,28 @@ async function handleVoiceRequest(req, res) {
 
   try {
     if (!session) {
-      sayIt(vr, "Errore di sessione. Riprova tra poco.");
+      await sendFallbackEmail(session, req, "session_error");
+      if (canForwardToHuman()) {
+        res.set("Content-Type", "text/xml; charset=utf-8");
+        return res.send(forwardToHumanTwiml());
+      }
+      sayIt(vr, "Ti passo un operatore per completare la richiesta.");
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(vr.toString());
     }
 
     const emptySpeech = !normalizeText(speech);
+
+    if (!emptySpeech && isOperatorRequest(speech)) {
+      await sendFallbackEmail(session, req, "operator_request");
+      if (canForwardToHuman()) {
+        res.set("Content-Type", "text/xml; charset=utf-8");
+        return res.send(forwardToHumanTwiml());
+      }
+      sayIt(vr, "Ti passo un operatore per completare la richiesta.");
+      res.set("Content-Type", "text/xml; charset=utf-8");
+      return res.send(vr.toString());
+    }
 
     if (session.step !== "intent" && !emptySpeech && isCancelCommand(speech)) {
       const canceled = await cancelCalendarEvent(session);
@@ -1221,6 +1315,7 @@ async function handleVoiceRequest(req, res) {
         session.step = 1;
         gatherSpeech(vr, "Ho annullato la prenotazione. Vuoi prenotare di nuovo?");
       } else if (canForwardToHuman()) {
+        await sendFallbackEmail(session, req, "cancel_request_forward");
         res.set("Content-Type", "text/xml; charset=utf-8");
         return res.send(forwardToHumanTwiml());
       } else {
@@ -1250,6 +1345,7 @@ async function handleVoiceRequest(req, res) {
             gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni, oppure prenotare un evento?")
           );
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_intent");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1278,11 +1374,9 @@ async function handleVoiceRequest(req, res) {
         if (!intent) {
           session.intentRetries += 1;
           if (session.intentRetries >= 2) {
-            if (canForwardToHuman()) {
-              res.set("Content-Type", "text/xml; charset=utf-8");
-              return res.send(forwardToHumanTwiml());
-            }
-            session.intentRetries = 0;
+            await sendFallbackEmail(session, req, "intent_retry_exhausted");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
           }
           gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni, oppure prenotare un evento?");
           break;
@@ -1299,8 +1393,12 @@ async function handleVoiceRequest(req, res) {
         }
 
         if (intent === "info") {
+          await sendFallbackEmail(session, req, "info_request");
+          if (canForwardToHuman()) {
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
           sayIt(vr, "Per informazioni puoi consultare il nostro sito o richiedere un operatore.");
-          vr.hangup();
           break;
         }
 
@@ -1315,6 +1413,7 @@ async function handleVoiceRequest(req, res) {
             gatherSpeech(vr, "Perfetto. Come si chiama l'evento?")
           );
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_event_name");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1333,6 +1432,7 @@ async function handleVoiceRequest(req, res) {
             gatherSpeech(vr, "Per quale data vuoi prenotare l'evento?")
           );
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_event_date");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1356,6 +1456,7 @@ async function handleVoiceRequest(req, res) {
             gatherSpeech(vr, "A che ora vuoi prenotare l'evento?")
           );
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_event_time");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1370,11 +1471,16 @@ async function handleVoiceRequest(req, res) {
         resetRetries(session);
         const createdEvent = await createEventCalendarEvent(session);
         if (!createdEvent && canForwardToHuman()) {
+          await sendFallbackEmail(session, req, "event_calendar_failed");
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(forwardToHumanTwiml());
         }
         sayIt(vr, "Grazie. Ho registrato la tua richiesta per l'evento. Ti contatteremo presto.");
-        vr.hangup();
+        await sendFallbackEmail(session, req, "event_request_completed");
+        if (canForwardToHuman()) {
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(forwardToHumanTwiml());
+        }
         session.step = 1;
         break;
       }
@@ -1385,6 +1491,7 @@ async function handleVoiceRequest(req, res) {
             gatherSpeech(vr, t("step1_welcome_name.main"))
           );
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step1");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1403,6 +1510,7 @@ async function handleVoiceRequest(req, res) {
             gatherSpeech(vr, t("step3_confirm_date_ask_time.error"))
           );
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step2");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1427,6 +1535,7 @@ async function handleVoiceRequest(req, res) {
             gatherSpeech(vr, t("step5_party_size_ask_notes.error"))
           );
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step3");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1459,6 +1568,7 @@ async function handleVoiceRequest(req, res) {
             gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"))
           );
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step4");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1482,6 +1592,7 @@ async function handleVoiceRequest(req, res) {
             gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people }))
           );
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step5");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1501,6 +1612,7 @@ async function handleVoiceRequest(req, res) {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () => promptForStep(vr, session));
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step6");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1543,31 +1655,31 @@ async function handleVoiceRequest(req, res) {
             session.preorderChoiceKey = option?.key || "apericena";
             session.preorderLabel = option?.label || "Apericena";
           } else {
-            const option = PREORDER_OPTIONS.find(
-              (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
-            );
-            if (option) {
-              session.preorderChoiceKey = option.key;
-              session.preorderLabel = option.label;
-              let shouldSayNotice = false;
-              if ((option.key === "piatto_apericena" || option.key === "piatto_apericena_promo") && glutenIntolerance) {
-                session.glutenPiattoNotice = true;
-                shouldSayNotice = true;
-              }
-              if (option.key === "piatto_apericena_promo") {
-                session.promoRegistrationNotice = true;
-                shouldSayNotice = true;
-              }
-              if (shouldSayNotice) {
-                maybeSayApericenaNotices(vr, session);
-              }
-            } else {
-              gatherSpeech(
-                vr,
-                "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
-              );
-              break;
+          const option = PREORDER_OPTIONS.find(
+            (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
+          );
+          if (option) {
+            session.preorderChoiceKey = option.key;
+            session.preorderLabel = option.label;
+            let shouldSayNotice = false;
+            if ((option.key === "piatto_apericena" || option.key === "piatto_apericena_promo") && glutenIntolerance) {
+              session.glutenPiattoNotice = true;
+              shouldSayNotice = true;
             }
+            if (option.key === "piatto_apericena_promo") {
+              session.promoRegistrationNotice = true;
+              shouldSayNotice = true;
+            }
+            if (shouldSayNotice) {
+              maybeSayApericenaNotices(vr, session);
+            }
+          } else {
+            gatherSpeech(
+              vr,
+              "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+            );
+            break;
+          }
           }
         }
         const availability = await reserveTableForSession(session, { commit: false });
@@ -1605,6 +1717,7 @@ async function handleVoiceRequest(req, res) {
             : "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.";
           const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, promptText));
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step7");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1618,12 +1731,13 @@ async function handleVoiceRequest(req, res) {
               "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
             );
           } else {
-            gatherSpeech(vr, "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
+            gatherSpeech(vr, "Posco sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
           }
           break;
         }
         if (!confirmation) {
           if (canForwardToHuman()) {
+            await sendFallbackEmail(session, req, "split_declined");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1643,6 +1757,7 @@ async function handleVoiceRequest(req, res) {
             gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?")
           );
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step8");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1708,6 +1823,7 @@ async function handleVoiceRequest(req, res) {
             )
           );
           if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step9");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
@@ -1743,6 +1859,7 @@ async function handleVoiceRequest(req, res) {
           break;
         }
         if (!calendarEvent && canForwardToHuman()) {
+          await sendFallbackEmail(session, req, "calendar_insert_failed");
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(forwardToHumanTwiml());
         }
@@ -1754,6 +1871,7 @@ async function handleVoiceRequest(req, res) {
 
       default: {
         if (canForwardToHuman()) {
+          await sendFallbackEmail(session, req, "unknown_step");
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(forwardToHumanTwiml());
         }
@@ -1768,6 +1886,7 @@ async function handleVoiceRequest(req, res) {
     return res.send(vr.toString());
   } catch (err) {
     console.error("[VOICE] Error:", err);
+    await sendFallbackEmail(session, req, "exception");
     if (canForwardToHuman()) {
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(forwardToHumanTwiml());
