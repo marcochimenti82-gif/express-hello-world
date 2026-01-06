@@ -173,7 +173,7 @@ function gatherSpeech(response, promptText) {
     input: "speech",
     language: "it-IT",
     speechTimeout: "auto",
-    timeout: 6,
+    timeout: 3,
     action: actionUrl,
     method: "POST",
   });
@@ -339,6 +339,10 @@ function getSession(callSid) {
       eventName: null,
       eventDateISO: null,
       eventTime24: null,
+      wantsOutside: false,
+      extraRequestsRaw: null,
+      liveMusicNoticePending: false,
+      liveMusicNoticeSpoken: false,
     });
   }
   return sessions.get(callSid);
@@ -451,6 +455,7 @@ function goBack(session) {
   else if (session.step === 7) session.step = 6;
   else if (session.step === 8) session.step = 7;
   else if (session.step === 9) session.step = 8;
+  else if (session.step === 10) session.step = 9;
   else session.step = Math.max(1, session.step - 1);
 }
 
@@ -487,6 +492,9 @@ function promptForStep(vr, session) {
       gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
       return;
     case 9:
+      gatherSpeech(vr, "Hai altre richieste particolari? Ad esempio sala esterna.");
+      return;
+    case 10:
       gatherSpeech(
         vr,
         t("step8_summary_confirm.main", {
@@ -602,6 +610,31 @@ function parsePhoneNumber(speech) {
     return `+${digits}`;
   }
   return null;
+}
+
+function isOutsideRequest(text) {
+  const tt = normalizeText(text);
+  if (!tt) return false;
+  return (
+    tt.includes("sala esterna") ||
+    tt.includes("esterno") ||
+    tt.includes("all'aperto") ||
+    tt.includes("fuori") ||
+    tt.includes("outdoor")
+  );
+}
+
+function maybeSayOutsideWarning(vr) {
+  sayIt(
+    vr,
+    "La sala esterna non è coperta: in caso di pioggia o brutto tempo il posto interno non è garantito. Se vuoi, ti consiglio la sala interna."
+  );
+}
+
+function maybeSayLiveMusicNotice(vr, session) {
+  if (!session?.liveMusicNoticePending || session.liveMusicNoticeSpoken) return;
+  sayIt(vr, "Ti informo che quella sera è prevista musica live o dj set.");
+  session.liveMusicNoticeSpoken = true;
 }
 
 // ---- Date: user-friendly (stesso parser robusto, qui versione breve per stabilità)
@@ -739,10 +772,11 @@ function expandTableLocks(tableId) {
   return [tableId];
 }
 
-function buildAvailableTables(occupied, availableOverride) {
+function buildAvailableTables(occupied, availableOverride, session) {
   return TABLES.filter((table) => {
     if (occupied.has(table.id)) return false;
     if (availableOverride && !availableOverride.has(table.id)) return false;
+    if (!session?.wantsOutside && table.area === "outside") return false;
     return true;
   });
 }
@@ -763,7 +797,7 @@ function getTablePenalty(tableId, session) {
 }
 
 function pickTableForParty(people, occupied, availableOverride, session) {
-  const availableTables = buildAvailableTables(occupied, availableOverride);
+  const availableTables = buildAvailableTables(occupied, availableOverride, session);
   const availableSet = buildAvailableTableSet(availableTables);
   const directCandidates = availableTables.filter((table) => people >= table.min && people <= table.max);
   if (directCandidates.length > 0) {
@@ -1029,7 +1063,7 @@ async function reserveTableForSession(session, { commit } = { commit: false }) {
 
   const selection = pickTableForParty(session.people, occupied, availableOverride, session);
   if (!selection) {
-    const availableTables = buildAvailableTables(occupied, availableOverride);
+    const availableTables = buildAvailableTables(occupied, availableOverride, session);
     const insideTables = availableTables.filter((table) => table.area === "inside");
     const insideSplit = pickSplitTables(session.people, insideTables, session);
     if (insideSplit) {
@@ -1102,7 +1136,7 @@ async function cancelCalendarEvent(session) {
   if (!calendar) return null;
   const summary = session.calendarEventSummary || "";
   const summaryWithoutTable = summary.replace(/,\s*tav[^,]+/i, "").trim();
-    const updatedSummary = summaryWithoutTable.startsWith("Annullata")
+  const updatedSummary = summaryWithoutTable.startsWith("Annullata")
     ? summaryWithoutTable
     : `Annullata - ${summaryWithoutTable}`;
 
@@ -1556,6 +1590,8 @@ async function handleVoiceRequest(req, res) {
           gatherSpeech(vr, "Mi dispiace, il locale risulta chiuso quel giorno. Vuoi scegliere un'altra data?");
           break;
         }
+        session.liveMusicNoticePending = hasLiveMusicEvent(events);
+        session.liveMusicNoticeSpoken = false;
         resetRetries(session);
         session.step = 4;
         gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel }));
@@ -1655,31 +1691,31 @@ async function handleVoiceRequest(req, res) {
             session.preorderChoiceKey = option?.key || "apericena";
             session.preorderLabel = option?.label || "Apericena";
           } else {
-          const option = PREORDER_OPTIONS.find(
-            (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
-          );
-          if (option) {
-            session.preorderChoiceKey = option.key;
-            session.preorderLabel = option.label;
-            let shouldSayNotice = false;
-            if ((option.key === "piatto_apericena" || option.key === "piatto_apericena_promo") && glutenIntolerance) {
-              session.glutenPiattoNotice = true;
-              shouldSayNotice = true;
-            }
-            if (option.key === "piatto_apericena_promo") {
-              session.promoRegistrationNotice = true;
-              shouldSayNotice = true;
-            }
-            if (shouldSayNotice) {
-              maybeSayApericenaNotices(vr, session);
-            }
-          } else {
-            gatherSpeech(
-              vr,
-              "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+            const option = PREORDER_OPTIONS.find(
+              (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
             );
-            break;
-          }
+            if (option) {
+              session.preorderChoiceKey = option.key;
+              session.preorderLabel = option.label;
+              let shouldSayNotice = false;
+              if ((option.key === "piatto_apericena" || option.key === "piatto_apericena_promo") && glutenIntolerance) {
+                session.glutenPiattoNotice = true;
+                shouldSayNotice = true;
+              }
+              if (option.key === "piatto_apericena_promo") {
+                session.promoRegistrationNotice = true;
+                shouldSayNotice = true;
+              }
+              if (shouldSayNotice) {
+                maybeSayApericenaNotices(vr, session);
+              }
+            } else {
+              gatherSpeech(
+                vr,
+                "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+              );
+              break;
+            }
           }
         }
         const availability = await reserveTableForSession(session, { commit: false });
@@ -1731,7 +1767,7 @@ async function handleVoiceRequest(req, res) {
               "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
             );
           } else {
-            gatherSpeech(vr, "Posco sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
+            gatherSpeech(vr, "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
           }
           break;
         }
@@ -1798,19 +1834,62 @@ async function handleVoiceRequest(req, res) {
         }
         session.step = 9;
         maybeSayApericenaNotices(vr, session);
-        gatherSpeech(
-          vr,
-          t("step8_summary_confirm.main", {
-            name: session.name || "",
-            dateLabel: session.dateLabel || "",
-            time: session.time24 || "",
-            partySize: session.people || "",
-          })
-        );
+        maybeSayLiveMusicNotice(vr, session);
+        gatherSpeech(vr, "Hai altre richieste particolari? Ad esempio sala esterna.");
         break;
       }
 
       case 9: {
+        if (emptySpeech) {
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, "Hai altre richieste particolari? Ad esempio sala esterna.")
+          );
+          if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step9");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
+        }
+        const confirmation = parseYesNo(speech);
+        if (confirmation === null) {
+          session.extraRequestsRaw = speech.trim().slice(0, 200);
+          if (isOutsideRequest(session.extraRequestsRaw)) {
+            session.wantsOutside = true;
+            maybeSayOutsideWarning(vr);
+            await reserveTableForSession(session, { commit: false });
+          }
+          session.step = 10;
+          gatherSpeech(
+            vr,
+            t("step8_summary_confirm.main", {
+              name: session.name || "",
+              dateLabel: session.dateLabel || "",
+              time: session.time24 || "",
+              partySize: session.people || "",
+            })
+          );
+          break;
+        }
+        if (!confirmation) {
+          session.extraRequestsRaw = "nessuna";
+          session.step = 10;
+          gatherSpeech(
+            vr,
+            t("step8_summary_confirm.main", {
+              name: session.name || "",
+              dateLabel: session.dateLabel || "",
+              time: session.time24 || "",
+              partySize: session.people || "",
+            })
+          );
+          break;
+        }
+        gatherSpeech(vr, "Dimmi pure la richiesta.");
+        break;
+      }
+
+      case 10: {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
             gatherSpeech(
@@ -1823,7 +1902,7 @@ async function handleVoiceRequest(req, res) {
             )
           );
           if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_step9");
+            await sendFallbackEmail(session, req, "silence_step10");
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
