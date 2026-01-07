@@ -22,7 +22,6 @@ const nodemailer = require("nodemailer");
 const { google } = require("googleapis");
 
 const { PROMPTS } = require("./prompts");
-const { getInfoResponse } = require("./services/infoMatcher");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -159,6 +158,204 @@ function pickPrompt(path, fallback = "") {
 
 function t(path, vars = {}, fallback = "") {
   return renderTemplate(pickPrompt(path, fallback), vars);
+}
+
+// ======================= INFO SHEETS (OPTIONAL) =======================
+const SHEETS_CACHE_TTL_MS = 5 * 60 * 1000;
+const SHEETS_NAMES = ["INFO", "EVENTI", "MENU", "CONFIG"];
+let sheetsCache = {
+  expiresAt: 0,
+  data: null,
+};
+
+function sheetsNormalizeLocale(locale) {
+  const raw = String(locale || "").trim().toLowerCase();
+  if (!raw) return "it-it";
+  return raw;
+}
+
+function sheetsToBoolean(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  return raw === "true" || raw === "1" || raw === "si" || raw === "sì" || raw === "yes";
+}
+
+function sheetsParseKeywords(value) {
+  return String(value || "")
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function sheetsParsePriority(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 9999;
+  return parsed;
+}
+
+function getSheetsCredentials() {
+  const jsonRaw = process.env.GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON || "";
+  const jsonB64 = process.env.GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON_B64 || "";
+  if (jsonB64) {
+    try {
+      const decoded = Buffer.from(jsonB64, "base64").toString("utf8");
+      return JSON.parse(decoded);
+    } catch (err) {
+      console.error("[SHEETS] Invalid base64 credentials:", err);
+    }
+  }
+  if (jsonRaw) {
+    try {
+      return JSON.parse(jsonRaw);
+    } catch (err) {
+      console.error("[SHEETS] Invalid JSON credentials:", err);
+    }
+  }
+  return null;
+}
+
+function getSheetsClient() {
+  const credentials = getSheetsCredentials();
+  if (!credentials) return null;
+  try {
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    });
+    return google.sheets({ version: "v4", auth });
+  } catch (err) {
+    console.error("[SHEETS] Failed to create client:", err);
+    return null;
+  }
+}
+
+function resetSheetsCache() {
+  sheetsCache = {
+    expiresAt: 0,
+    data: null,
+  };
+}
+
+async function fetchSheetValues(sheetsClient, spreadsheetId, sheetName) {
+  const range = `${sheetName}!A:Z`;
+  const response = await sheetsClient.spreadsheets.values.get({
+    spreadsheetId,
+    range,
+    majorDimension: "ROWS",
+  });
+  return response?.data?.values || [];
+}
+
+function rowsToObjects(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const [headerRow, ...dataRows] = rows;
+  const headers = headerRow.map((cell) => String(cell || "").trim());
+  return dataRows
+    .map((row) => {
+      const item = {};
+      headers.forEach((header, idx) => {
+        if (!header) return;
+        item[header] = row[idx];
+      });
+      return item;
+    })
+    .filter((item) => Object.keys(item).length > 0);
+}
+
+async function loadSheetsData() {
+  const now = Date.now();
+  if (sheetsCache.data && sheetsCache.expiresAt > now) {
+    return sheetsCache.data;
+  }
+
+  const spreadsheetId = process.env.GOOGLE_SHEET_ID || "";
+  if (!spreadsheetId) return null;
+
+  const sheetsClient = getSheetsClient();
+  if (!sheetsClient) return null;
+
+  try {
+    const data = {};
+    for (const sheetName of SHEETS_NAMES) {
+      const rows = await fetchSheetValues(sheetsClient, spreadsheetId, sheetName);
+      data[sheetName] = rowsToObjects(rows);
+    }
+    sheetsCache = {
+      expiresAt: now + SHEETS_CACHE_TTL_MS,
+      data,
+    };
+    return data;
+  } catch (err) {
+    console.error("[SHEETS] Failed to load sheets:", err);
+    resetSheetsCache();
+    return null;
+  }
+}
+
+function normalizeInfoRow(row = {}) {
+  return {
+    locale: sheetsNormalizeLocale(row.locale),
+    keywords: sheetsParseKeywords(row.keywords),
+    text: String(row.text || "").trim(),
+    priority: sheetsParsePriority(row.priority),
+    active: sheetsToBoolean(row.attivo),
+    fallback: sheetsToBoolean(row.fallback),
+  };
+}
+
+function findMatchingInfo(rows, speech, locale) {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const normalizedLocale = sheetsNormalizeLocale(locale);
+  const normalizedSpeech = String(speech || "").trim().toLowerCase();
+  if (!normalizedSpeech) return null;
+
+  const candidates = rows.map((row) => normalizeInfoRow(row)).filter((row) => row.active && row.text);
+  const localeMatches = candidates.filter((row) => row.locale === normalizedLocale);
+  const pool = localeMatches.length > 0 ? localeMatches : candidates;
+  const matches = pool.filter((row) =>
+    row.keywords.some((keyword) => keyword && normalizedSpeech.includes(keyword))
+  );
+  if (matches.length === 0) return null;
+  matches.sort((a, b) => a.priority - b.priority);
+  return matches[0];
+}
+
+function normalizeFallbackRow(row = {}) {
+  return {
+    locale: sheetsNormalizeLocale(row.locale),
+    fallback: sheetsToBoolean(row.fallback),
+    text: String(row.text || "").trim(),
+  };
+}
+
+function getFallbackEntry(rows, locale) {
+  if (!Array.isArray(rows)) return null;
+  const normalizedLocale = sheetsNormalizeLocale(locale);
+  const normalizedRows = rows.map((row) => normalizeFallbackRow(row));
+  const localeMatch = normalizedRows.find((row) => row.locale === normalizedLocale);
+  const anyMatch = normalizedRows.find((row) => row.locale);
+  const fallback = localeMatch || anyMatch;
+  if (!fallback || !fallback.text) return null;
+  return fallback;
+}
+
+async function getInfoResponse({ speech, locale }) {
+  const sheets = await loadSheetsData();
+  if (!sheets) return null;
+  const infoRows = sheets.INFO || [];
+  const matched = findMatchingInfo(infoRows, speech, locale);
+  if (matched) {
+    return {
+      text: matched.text,
+      fallback: matched.fallback,
+    };
+  }
+  const configRows = sheets.CONFIG || [];
+  const fallback = getFallbackEntry(configRows, locale);
+  if (!fallback) return null;
+  return {
+    text: fallback.text,
+    fallback: fallback.fallback,
+  };
 }
 
 // ======================= TWILIO HELPERS =======================
