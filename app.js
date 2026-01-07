@@ -41,8 +41,8 @@ const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "
 
 const SMTP_HOST = process.env.SMTP_HOST || "";
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-const SMTP_USER = process.env.SMTP_USER || "";
-const SMTP_PASS = process.env.SMTP_PASS || "";
+const SMTP_USER = process.env.EMAIL_USER || "";
+const SMTP_PASS = process.env.EMAIL_PASS || "";
 const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true";
 const EMAIL_TO = process.env.EMAIL_TO || "tuttibrillienoteca@gmail.com";
 const EMAIL_FROM = process.env.EMAIL_FROM || "no-reply@tuttibrilli.local";
