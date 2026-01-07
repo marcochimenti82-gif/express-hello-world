@@ -380,6 +380,14 @@ function normalizeText(s) {
   return String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+function isPureConsent(speech) {
+  const tt = normalizeText(speech);
+  if (!tt) return false;
+  if (YES_WORDS.includes(tt)) return true;
+  const words = tt.split(" ").filter(Boolean);
+  return words.length > 0 && words.every((word) => YES_WORDS.includes(word));
+}
+
 function isOperatorRequest(speech) {
   const tt = normalizeText(speech);
   return (
@@ -399,37 +407,158 @@ function toISODate(d) {
 }
 
 function formatDateLabel(dateISO) {
-  const d = new Date(`${dateISO}T00:00:00`);
-  return d.toLocaleDateString("it-IT", { weekday: "long", month: "long", day: "numeric" });
+  const date = new Date(`${dateISO}T00:00:00`);
+  const weekdays = [
+    "domenica",
+    "lunedì",
+    "martedì",
+    "mercoledì",
+    "giovedì",
+    "venerdì",
+    "sabato",
+  ];
+  const months = [
+    "gennaio",
+    "febbraio",
+    "marzo",
+    "aprile",
+    "maggio",
+    "giugno",
+    "luglio",
+    "agosto",
+    "settembre",
+    "ottobre",
+    "novembre",
+    "dicembre",
+  ];
+  return `${weekdays[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
 }
 
-function parseYesNo(speech) {
+// ---- Back/edit commands
+function isBackCommand(speech) {
   const tt = normalizeText(speech);
-  if (!tt) return null;
-  if (YES_WORDS.some((w) => tt.includes(w))) return true;
-  if (NO_WORDS.some((w) => tt.includes(w))) return false;
-  return null;
+  return (
+    tt.includes("indietro") ||
+    tt.includes("torna indietro") ||
+    tt.includes("tornare indietro") ||
+    tt.includes("errore") ||
+    tt.includes("ho sbagliato") ||
+    tt.includes("sbagliato")
+  );
 }
 
 function isCancelCommand(speech) {
   const tt = normalizeText(speech);
-  return CANCEL_WORDS.some((w) => tt.includes(w));
+  return CANCEL_WORDS.some((word) => tt.includes(word));
 }
 
-function isBackCommand(speech) {
+function goBack(session) {
+  if (!session || typeof session.step !== "number") return;
+  if (session.step <= 1) return;
+
+  if (session.step === 2) session.step = 1;
+  else if (session.step === 3) session.step = 2;
+  else if (session.step === 4) session.step = 3;
+  else if (session.step === 5) session.step = 4;
+  else if (session.step === 6) session.step = 5;
+  else if (session.step === 7) session.step = 6;
+  else if (session.step === 8) session.step = 7;
+  else if (session.step === 9) session.step = 8;
+  else if (session.step === 10) session.step = 9;
+  else session.step = Math.max(1, session.step - 1);
+}
+
+function promptForStep(vr, session) {
+  switch (session.step) {
+    case 1:
+      gatherSpeech(vr, t("step1_welcome_name.main"));
+      return;
+    case 2:
+      gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" }));
+      return;
+    case 3:
+      gatherSpeech(vr, "Perfetto. In quante persone siete?");
+      return;
+    case 4:
+      gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel || "" }));
+      return;
+    case 5:
+      gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" }));
+      return;
+    case 6:
+      gatherSpeech(
+        vr,
+        "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+      );
+      return;
+    case 7:
+      gatherSpeech(
+        vr,
+        "Non abbiamo più disponibilità per un unico tavolo. Posso sistemarvi in tavoli separati?"
+      );
+      return;
+    case 8:
+      gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
+      return;
+    case 9:
+      gatherSpeech(vr, "Hai altre richieste particolari? Ad esempio sala esterna.");
+      return;
+    case 10:
+      gatherSpeech(
+        vr,
+        t("step8_summary_confirm.main", {
+          name: session.name || "",
+          dateLabel: session.dateLabel || "",
+          time: session.time24 || "",
+          partySize: session.people || "",
+        })
+      );
+      return;
+    default:
+      gatherSpeech(vr, t("step1_welcome_name.short"));
+      return;
+  }
+}
+
+function isValidTime24(t) {
+  return /^\d{2}:\d{2}$/.test(String(t || ""));
+}
+
+function parseTimeIT(speech) {
   const tt = normalizeText(speech);
-  return tt.includes("indietro") || tt.includes("torna");
+  if (!tt) return null;
+
+  if (tt.includes("mezza")) {
+    const hourMatch = tt.match(/\b(\d{1,2})\b/);
+    if (hourMatch) {
+      let h = Number(hourMatch[1]);
+      if (tt.includes("sera") && h < 12) h += 12;
+      return `${String(h).padStart(2, "0")}:30`;
+    }
+  }
+
+  const match = tt.match(/\b(\d{1,2})(?:[:\.](\d{2}))?\b/);
+  if (!match) return null;
+
+  let hours = Number(match[1]);
+  let minutes = match[2] ? Number(match[2]) : 0;
+
+  if (tt.includes("sera") && hours < 12) hours += 12;
+  if (tt.includes("pomeriggio") && hours < 12) hours += 12;
+
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
 }
 
 function parsePeopleIT(speech) {
   const tt = normalizeText(speech);
-  const digits = tt.match(/\d+/);
-  if (digits) {
-    const value = Number(digits[0]);
-    if (value > 0 && value <= 30) return value;
+  const match = tt.match(/\d+/);
+  if (match) {
+    const n = Number(match[0]);
+    if (n >= 1 && n <= 30) return n;
   }
-
-  const words = {
+  const mapping = {
     uno: 1,
     due: 2,
     tre: 3,
@@ -443,71 +572,17 @@ function parsePeopleIT(speech) {
     undici: 11,
     dodici: 12,
   };
-
-  const foundWord = Object.keys(words).find((word) => tt.includes(word));
-  return foundWord ? words[foundWord] : null;
+  for (const [word, value] of Object.entries(mapping)) {
+    if (tt.includes(word)) return value;
+  }
+  return null;
 }
 
-function parseTimeIT(speech) {
+function parseYesNo(speech) {
   const tt = normalizeText(speech);
-  const match = tt.match(/(\d{1,2})[^\d]?(\d{2})?/);
-  if (!match) return null;
-
-  let hours = Number(match[1]);
-  let minutes = Number(match[2] || 0);
-
-  if (tt.includes("mezza")) minutes = 30;
-  if (tt.includes("sera") && hours < 12) hours += 12;
-  if (tt.includes("pomeriggio") && hours < 12) hours += 12;
-
-  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
-
-  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
-}
-
-function parseDateIT(speech) {
-  const tt = normalizeText(speech);
-  const today = new Date();
-
-  if (tt.includes("oggi")) return toISODate(today);
-  if (tt.includes("domani")) {
-    const next = new Date();
-    next.setDate(today.getDate() + 1);
-    return toISODate(next);
-  }
-
-  const match = tt.match(/(\d{1,2})\s*(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)/);
-  if (match) {
-    const day = Number(match[1]);
-    const months = {
-      gennaio: 0,
-      febbraio: 1,
-      marzo: 2,
-      aprile: 3,
-      maggio: 4,
-      giugno: 5,
-      luglio: 6,
-      agosto: 7,
-      settembre: 8,
-      ottobre: 9,
-      novembre: 10,
-      dicembre: 11,
-    };
-    const month = months[match[2]];
-    const date = new Date(today.getFullYear(), month, day);
-    return toISODate(date);
-  }
-
-  const numeric = tt.match(/(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/);
-  if (numeric) {
-    const day = Number(numeric[1]);
-    const month = Number(numeric[2]) - 1;
-    let year = numeric[3] ? Number(numeric[3]) : today.getFullYear();
-    if (year < 100) year += 2000;
-    const date = new Date(year, month, day);
-    return toISODate(date);
-  }
-
+  if (!tt) return null;
+  if (YES_WORDS.some((word) => tt.includes(word))) return true;
+  if (NO_WORDS.some((word) => tt.includes(word))) return false;
   return null;
 }
 
@@ -576,6 +651,17 @@ function buildSpecialRequestsText(session) {
   return parts.join(" | ");
 }
 
+function parsePhoneNumber(speech) {
+  const tt = normalizeText(speech);
+  if (!tt) return null;
+  const digits = String(tt).replace(/[^\d]/g, "");
+  if (digits.length >= 8 && digits.length <= 15) {
+    if (digits.length <= 10) return `+39${digits}`;
+    return `+${digits}`;
+  }
+  return null;
+}
+
 function computeDurationMinutes(session, events) {
   if (session.bookingType === "drinks") return 90;
   if (session.preorderChoiceKey === "dopocena") return 120;
@@ -583,16 +669,6 @@ function computeDurationMinutes(session, events) {
   const isLiveMusic = session?.liveMusicNoticePending || hasLiveMusicEvent(events);
   if (isLiveMusic) return 180;
   return 120;
-}
-
-function parsePhoneNumber(speech) {
-  const tt = normalizeText(speech);
-  const digits = tt.replace(/[^\d]/g, "");
-  if (digits.length >= 8 && digits.length <= 15) {
-    if (digits.length <= 10) return `+39${digits}`;
-    return `+${digits}`;
-  }
-  return null;
 }
 
 // ======================= CALENDAR HELPERS =======================
@@ -629,41 +705,55 @@ function buildCalendarClient() {
 async function listCalendarEvents(dateISO) {
   const calendar = buildCalendarClient();
   if (!calendar) return [];
+  const timeMin = `${dateISO}T00:00:00Z`;
+  const timeMax = `${getNextDateISO(dateISO)}T00:00:00Z`;
   try {
     const result = await calendar.events.list({
       calendarId: GOOGLE_CALENDAR_ID,
-      timeMin: `${dateISO}T00:00:00Z`,
-      timeMax: `${dateISO}T23:59:59Z`,
+      timeMin,
+      timeMax,
       maxResults: 2500,
       singleEvents: true,
       orderBy: "startTime",
     });
-    return result.data.items || [];
+    return result?.data?.items || [];
   } catch (err) {
-    console.error("[GOOGLE] list events failed:", err);
+    console.error("[GOOGLE] Calendar events list failed:", err);
     return [];
   }
+}
+
+function isDateClosedByCalendar(events) {
+  return events.some((event) => {
+    const summary = String(event.summary || "").toLowerCase();
+    const description = String(event.description || "").toLowerCase();
+    return summary.includes("locale chiuso") || description.includes("locale chiuso");
+  });
+}
+
+function extractTablesFromEvent(event) {
+  const description = String(event.description || "");
+  const match = description.match(/Tavolo:\s*([^\n]+)/i);
+  if (!match) return [];
+  const tableText = match[1] || "";
+  return tableText
+    .split(/,| e /i)
+    .map((entry) => normalizeTableId(entry))
+    .filter(Boolean);
 }
 
 function getEventTimeRange(event) {
   const start = event.start?.dateTime || event.start?.date;
   const end = event.end?.dateTime || event.end?.date;
   if (!start || !end) return null;
-  return { start: new Date(start), end: new Date(end) };
+  return {
+    start: new Date(start),
+    end: new Date(end),
+  };
 }
 
 function overlapsRange(a, b) {
   return a.start < b.end && b.start < a.end;
-}
-
-function extractTablesFromEvent(event) {
-  const description = event.description || "";
-  const match = description.match(/Tavolo:\s*([^\n]+)/i);
-  if (!match) return [];
-  return match[1]
-    .split(/,| e /i)
-    .map((item) => item.trim())
-    .filter(Boolean);
 }
 
 function normalizeTableId(raw) {
@@ -696,19 +786,6 @@ function getTableById(id) {
 
 function buildAvailableTableSet(availableTables) {
   return new Set(availableTables.map((table) => table.id));
-}
-
-function isDivanettiTableId(id) {
-  return id === "T14" || id === "T15";
-}
-
-function isHighTableId(id) {
-  return id === "T16" || id === "T17";
-}
-
-function isDivanettiPreferred(session) {
-  const choice = session?.preorderChoiceKey || "";
-  return choice === "apericena" || choice === "dopocena";
 }
 
 function getTablePenalty(tableId, session) {
@@ -774,6 +851,19 @@ function pickSplitTables(people, availableTables, session) {
   return null;
 }
 
+function isDivanettiTableId(id) {
+  return id === "T14" || id === "T15";
+}
+
+function isHighTableId(id) {
+  return id === "T16" || id === "T17";
+}
+
+function isDivanettiPreferred(session) {
+  const choice = session?.preorderChoiceKey || "";
+  return choice === "apericena" || choice === "dopocena";
+}
+
 function getNextDateISO(dateISO) {
   const d = new Date(`${dateISO}T00:00:00`);
   d.setDate(d.getDate() + 1);
@@ -789,14 +879,6 @@ function buildAvailabilityDescription(dateISO, events) {
     `Tavoli: ${tableSummary}`,
     `Eventi: ${eventsSummary}`,
   ].join("\n");
-}
-
-function isDateClosedByCalendar(events) {
-  return events.some((event) => {
-    const summary = String(event.summary || "").toLowerCase();
-    const description = String(event.description || "").toLowerCase();
-    return summary.includes("locale chiuso") || description.includes("locale chiuso");
-  });
 }
 
 function hasLiveMusicEvent(events) {
@@ -1507,7 +1589,11 @@ async function handleVoiceRequest(req, res) {
           }
           break;
         }
-        session.specialRequestsRaw = speech.trim().slice(0, 200);
+        if (isPureConsent(speech)) {
+          gatherSpeech(vr, "Va bene, puoi dirmi quale richiesta / intolleranza?");
+          break;
+        }
+        session.specialRequestsRaw = emptySpeech ? "nessuna" : speech.trim().slice(0, 200);
         resetRetries(session);
         session.step = 6;
         gatherSpeech(
@@ -1519,12 +1605,7 @@ async function handleVoiceRequest(req, res) {
 
       case 6: {
         if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(
-              vr,
-              "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
-            )
-          );
+          const silenceResult = handleSilence(session, vr, () => promptForStep(vr, session));
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step6");
             res.set("Content-Type", "text/xml; charset=utf-8");
@@ -1532,71 +1613,70 @@ async function handleVoiceRequest(req, res) {
           }
           break;
         }
-
         const normalized = normalizeText(speech);
         const glutenIntolerance = hasGlutenIntolerance(session.specialRequestsRaw);
         const isFriday = session.dateISO ? new Date(`${session.dateISO}T00:00:00`).getDay() === 5 : false;
         session.glutenPiattoNotice = false;
         session.promoRegistrationNotice = false;
-
         if (normalized.includes("nessuno") || normalized.includes("niente") || normalized.includes("no")) {
           session.preorderChoiceKey = null;
           session.preorderLabel = "nessuno";
-        } else if (normalized.includes("apericena promo")) {
-          const promoOption = getPreorderOptionByKey("piatto_apericena_promo");
-          if (isFriday) {
-            gatherSpeech(
-              vr,
-              "L’apericena promo non è disponibile il venerdì. Puoi scegliere l’apericena standard oppure un altro piatto."
-            );
-            break;
-          }
-          session.preorderChoiceKey = promoOption?.key || "piatto_apericena_promo";
-          session.preorderLabel = promoOption?.label || "Piatto Apericena in promo (previa registrazione)";
-          session.promoRegistrationNotice = true;
-          if (glutenIntolerance) {
-            session.glutenPiattoNotice = true;
-          }
-          maybeSayApericenaNotices(vr, session);
-        } else if (normalized.includes("apericena")) {
-          if (glutenIntolerance) {
-            gatherSpeech(
-              vr,
-              "L’apericena non è disponibile per celiaci o intolleranti al glutine. Puoi scegliere un’alternativa."
-            );
-            break;
-          }
-          const option = getPreorderOptionByKey("apericena");
-          session.preorderChoiceKey = option?.key || "apericena";
-          session.preorderLabel = option?.label || "Apericena";
         } else {
-          const option = PREORDER_OPTIONS.find(
-            (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
-          );
-          if (option) {
-            session.preorderChoiceKey = option.key;
-            session.preorderLabel = option.label;
-            let shouldSayNotice = false;
-            if ((option.key === "piatto_apericena" || option.key === "piatto_apericena_promo") && glutenIntolerance) {
+          if (normalized.includes("apericena promo")) {
+            const promoOption = getPreorderOptionByKey("piatto_apericena_promo");
+            if (isFriday) {
+              gatherSpeech(
+                vr,
+                "L’apericena promo non è disponibile il venerdì. Puoi scegliere l’apericena standard oppure un altro piatto."
+              );
+              break;
+            }
+            session.preorderChoiceKey = promoOption?.key || "piatto_apericena_promo";
+            session.preorderLabel = promoOption?.label || "Piatto Apericena in promo (previa registrazione)";
+            session.promoRegistrationNotice = true;
+            if (glutenIntolerance) {
               session.glutenPiattoNotice = true;
-              shouldSayNotice = true;
             }
-            if (option.key === "piatto_apericena_promo") {
-              session.promoRegistrationNotice = true;
-              shouldSayNotice = true;
+            maybeSayApericenaNotices(vr, session);
+          } else if (normalized.includes("apericena")) {
+            if (glutenIntolerance) {
+              gatherSpeech(
+                vr,
+                "L’apericena non è disponibile per celiaci o intolleranti al glutine. Puoi scegliere un’alternativa."
+              );
+              break;
             }
-            if (shouldSayNotice) {
-              maybeSayApericenaNotices(vr, session);
-            }
+            const option = getPreorderOptionByKey("apericena");
+            session.preorderChoiceKey = option?.key || "apericena";
+            session.preorderLabel = option?.label || "Apericena";
           } else {
-            gatherSpeech(
-              vr,
-              "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+            const option = PREORDER_OPTIONS.find(
+              (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
             );
-            break;
+            if (option) {
+              session.preorderChoiceKey = option.key;
+              session.preorderLabel = option.label;
+              let shouldSayNotice = false;
+              if ((option.key === "piatto_apericena" || option.key === "piatto_apericena_promo") && glutenIntolerance) {
+                session.glutenPiattoNotice = true;
+                shouldSayNotice = true;
+              }
+              if (option.key === "piatto_apericena_promo") {
+                session.promoRegistrationNotice = true;
+                shouldSayNotice = true;
+              }
+              if (shouldSayNotice) {
+                maybeSayApericenaNotices(vr, session);
+              }
+            } else {
+              gatherSpeech(
+                vr,
+                "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+              );
+              break;
+            }
           }
         }
-
         const availability = await reserveTableForSession(session, { commit: false });
         if (availability.status === "closed") {
           session.step = 2;
@@ -1730,6 +1810,10 @@ async function handleVoiceRequest(req, res) {
           }
           break;
         }
+        if (isPureConsent(speech)) {
+          gatherSpeech(vr, "Va bene, puoi dirmi quale richiesta / intolleranza?");
+          break;
+        }
         const confirmation = parseYesNo(speech);
         if (confirmation === null) {
           session.extraRequestsRaw = speech.trim().slice(0, 200);
@@ -1855,72 +1939,6 @@ async function handleVoiceRequest(req, res) {
   }
 }
 
-function promptForStep(vr, session) {
-  switch (session.step) {
-    case 1:
-      gatherSpeech(vr, t("step1_welcome_name.short"));
-      break;
-    case 2:
-      gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" }));
-      break;
-    case 3:
-      gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel || "" }));
-      break;
-    case 4:
-      gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"));
-      break;
-    case 5:
-      gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" }));
-      break;
-    case 6:
-      gatherSpeech(
-        vr,
-        "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
-      );
-      break;
-    case 7:
-      gatherSpeech(vr, "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
-      break;
-    case 8:
-      gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
-      break;
-    case 9:
-      gatherSpeech(vr, "Hai altre richieste particolari? Ad esempio sala esterna.");
-      break;
-    case 10:
-      gatherSpeech(
-        vr,
-        t("step8_summary_confirm.short", {
-          dateLabel: session.dateLabel || "",
-          time: session.time24 || "",
-          partySize: session.people || "",
-        })
-      );
-      break;
-    case 11:
-      gatherSpeech(vr, "Mi dici il numero di telefono associato alla prenotazione?");
-      break;
-    case 12:
-      gatherSpeech(vr, "Ho trovato questa prenotazione. Vuoi annullarla?");
-      break;
-    default:
-      gatherSpeech(vr, t("step1_welcome_name.short"));
-      break;
-  }
-}
-
-function goBack(session) {
-  if (session.step === 2) session.step = 1;
-  if (session.step === 3) session.step = 2;
-  if (session.step === 4) session.step = 3;
-  if (session.step === 5) session.step = 4;
-  if (session.step === 6) session.step = 5;
-  if (session.step === 7) session.step = 6;
-  if (session.step === 8) session.step = 6;
-  if (session.step === 9) session.step = 8;
-  if (session.step === 10) session.step = 9;
-}
-
 app.all("/twilio/voice", async (req, res) => {
   console.log(`[VOICE] ${req.method} /twilio/voice`);
   const payload = req.method === "POST" ? req.body : req.query;
@@ -1929,10 +1947,7 @@ app.all("/twilio/voice", async (req, res) => {
     return handleVoiceRequest(req, res);
   }
   const vr = buildTwiml();
-  vr.say(
-    { language: "it-IT", voice: "alice" },
-    xmlEscape("Test Twilio Voice: endpoint attivo.")
-  );
+  vr.say({ language: "it-IT", voice: "alice" }, xmlEscape("Test Twilio Voice: endpoint attivo."));
   res.set("Content-Type", "text/xml; charset=utf-8");
   return res.send(vr.toString());
 });
