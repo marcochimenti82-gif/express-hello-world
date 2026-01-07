@@ -415,6 +415,7 @@ function getSession(callSid) {
       extraRequestsRaw: null,
       liveMusicNoticePending: false,
       liveMusicNoticeSpoken: false,
+      forceOperatorFallback: false,
     });
   }
   return sessions.get(callSid);
@@ -862,6 +863,19 @@ function expandTableLocks(tableId) {
   return [tableId];
 }
 
+function isValidTableSelection(selection) {
+  if (!selection || !Array.isArray(selection.locks) || selection.locks.length === 0) return false;
+  const locks = [...selection.locks].sort();
+  if (locks.length === 1) {
+    return selection.displayId === locks[0] && Boolean(getTableById(locks[0]));
+  }
+  const combo = TABLE_COMBINATIONS.find((c) => c.displayId === selection.displayId);
+  if (!combo) return false;
+  const comboLocks = [...combo.replaces].sort();
+  if (comboLocks.length !== locks.length) return false;
+  return comboLocks.every((id, idx) => id === locks[idx]);
+}
+
 function buildAvailableTables(occupied, availableOverride, session) {
   return TABLES.filter((table) => {
     if (occupied.has(table.id)) return false;
@@ -891,7 +905,9 @@ function pickTableForParty(people, occupied, availableOverride, session) {
   const availableSet = buildAvailableTableSet(availableTables);
   const directCandidates = availableTables.filter((table) => people >= table.min && people <= table.max);
   if (directCandidates.length > 0) {
-    const twoTopCandidates = people === 2 ? directCandidates.filter((table) => table.max === 2) : [];
+    const preferredTwoTopIds = new Set(["T5", "T10", "T13"]);
+    const twoTopCandidates =
+      people === 2 ? directCandidates.filter((table) => preferredTwoTopIds.has(table.id)) : [];
     const directPool = twoTopCandidates.length > 0 ? twoTopCandidates : directCandidates;
     const exactCandidates = directPool.filter((table) => table.max === people);
     const directOptions = exactCandidates.length > 0 ? exactCandidates : directPool;
@@ -1133,6 +1149,7 @@ async function reserveTableForSession(session, { commit } = { commit: false }) {
     return { status: "closed" };
   }
 
+  session.forceOperatorFallback = false;
   session.divanettiNotice = false;
   session.divanettiNoticeSpoken = false;
   session.durationMinutes = computeDurationMinutes(session, events);
@@ -1191,6 +1208,13 @@ async function reserveTableForSession(session, { commit } = { commit: false }) {
       return { status: "needs_outside" };
     }
 
+    return { status: "unavailable" };
+  }
+  if (!isValidTableSelection(selection)) {
+    session.forceOperatorFallback = true;
+    session.tableDisplayId = null;
+    session.tableLocks = [];
+    session.tableNotes = null;
     return { status: "unavailable" };
   }
   session.tableDisplayId = selection.displayId;
@@ -1841,6 +1865,12 @@ async function handleVoiceRequest(req, res) {
           break;
         }
         if (availability.status === "unavailable") {
+          if (session.forceOperatorFallback && canForwardToHuman()) {
+            await sendFallbackEmail(session, req, "invalid_table_combo");
+            void sendOperatorEmail(session, req, "invalid_table_combo");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
           session.step = 4;
           gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
           break;
@@ -2058,6 +2088,12 @@ async function handleVoiceRequest(req, res) {
           break;
         }
         if (calendarEvent?.status === "unavailable") {
+          if (session.forceOperatorFallback && canForwardToHuman()) {
+            await sendFallbackEmail(session, req, "invalid_table_combo");
+            void sendOperatorEmail(session, req, "invalid_table_combo");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
           session.step = 4;
           gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
           break;
