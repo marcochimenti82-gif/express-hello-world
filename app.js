@@ -100,7 +100,7 @@ const TABLES = [
   { id: "T10", area: "inside", min: 2, max: 2 },
   { id: "T11", area: "inside", min: 2, max: 4, notes: "vicino ingresso" },
   { id: "T12", area: "inside", min: 2, max: 4 },
-  { id: "T13", area: "inside", min: 2, max: 4 },
+  { id: "T13", area: "inside", min: 2, max: 2 },
   { id: "T14", area: "inside", min: 4, max: 8, notes: "divanetto con tavolino" },
   { id: "T15", area: "inside", min: 4, max: 8, notes: "divanetto con tavolino" },
   { id: "T16", area: "inside", min: 4, max: 5, notes: "tavolo alto con sgabelli" },
@@ -891,13 +891,20 @@ function pickTableForParty(people, occupied, availableOverride, session) {
   const availableSet = buildAvailableTableSet(availableTables);
   const directCandidates = availableTables.filter((table) => people >= table.min && people <= table.max);
   if (directCandidates.length > 0) {
-    directCandidates.sort((a, b) => {
+    const twoTopCandidates = people === 2 ? directCandidates.filter((table) => table.max === 2) : [];
+    const directPool = twoTopCandidates.length > 0 ? twoTopCandidates : directCandidates;
+    const exactCandidates = directPool.filter((table) => table.max === people);
+    const directOptions = exactCandidates.length > 0 ? exactCandidates : directPool;
+    directOptions.sort((a, b) => {
+      const sizeA = a.max;
+      const sizeB = b.max;
+      if (sizeA !== sizeB) return sizeA - sizeB;
       const penaltyA = getTablePenalty(a.id, session);
       const penaltyB = getTablePenalty(b.id, session);
       if (penaltyA !== penaltyB) return penaltyA - penaltyB;
-      return a.max - b.max;
+      return a.id.localeCompare(b.id);
     });
-    const direct = directCandidates[0];
+    const direct = directOptions[0];
     return { displayId: direct.id, locks: [direct.id], notes: direct.notes || null };
   }
 
@@ -908,13 +915,18 @@ function pickTableForParty(people, occupied, availableOverride, session) {
     if (!unavailable) comboCandidates.push(combo);
   }
   if (comboCandidates.length > 0) {
-    comboCandidates.sort((a, b) => {
+    const exactCombos = comboCandidates.filter((combo) => combo.max === people);
+    const comboOptions = exactCombos.length > 0 ? exactCombos : comboCandidates;
+    comboOptions.sort((a, b) => {
+      const sizeA = a.max;
+      const sizeB = b.max;
+      if (sizeA !== sizeB) return sizeA - sizeB;
       const penaltyA = a.replaces.reduce((sum, id) => sum + getTablePenalty(id, session), 0);
       const penaltyB = b.replaces.reduce((sum, id) => sum + getTablePenalty(id, session), 0);
       if (penaltyA !== penaltyB) return penaltyA - penaltyB;
-      return a.max - b.max;
+      return a.displayId.localeCompare(b.displayId);
     });
-    const combo = comboCandidates[0];
+    const combo = comboOptions[0];
     return { displayId: combo.displayId, locks: combo.replaces, notes: combo.notes || null };
   }
   return null;
