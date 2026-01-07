@@ -49,6 +49,7 @@ const FALLBACK_EMAIL_FROM = process.env.FALLBACK_EMAIL_FROM || "no-reply@tuttibr
 
 const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "false").toLowerCase() === "true";
 const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || "";
+const OPERATOR_PHONE = process.env.OPERATOR_PHONE || HUMAN_FORWARD_TO || "";
 const CRITICAL_COLOR_ID = process.env.CRITICAL_COLOR_ID || "11";
 
 const HOLIDAYS_YYYY_MM_DD = process.env.HOLIDAYS_YYYY_MM_DD || "";
@@ -185,7 +186,7 @@ function isValidPhoneE164(s) {
   return /^\+\d{8,15}$/.test(String(s || "").trim());
 }
 function canForwardToHuman() {
-  return ENABLE_FORWARDING && Boolean(HUMAN_FORWARD_TO) && isValidPhoneE164(HUMAN_FORWARD_TO);
+  return ENABLE_FORWARDING && Boolean(OPERATOR_PHONE) && isValidPhoneE164(OPERATOR_PHONE);
 }
 
 function requireTwilioVoiceFrom() {
@@ -198,7 +199,7 @@ function requireTwilioVoiceFrom() {
 function forwardToHumanTwiml() {
   const vr = buildTwiml();
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
-  vr.dial({}, HUMAN_FORWARD_TO);
+  vr.dial({}, OPERATOR_PHONE);
   return vr.toString();
 }
 
@@ -252,6 +253,27 @@ async function sendFallbackEmail(session, req, reason) {
         path: "/usr/sbin/sendmail",
       });
     }
+    await transporter.sendMail({
+      from: FALLBACK_EMAIL_FROM,
+      to: FALLBACK_EMAIL_TO,
+      subject: payload.subject,
+      text: payload.text,
+    });
+  } catch (err) {
+    console.error("[EMAIL] Fallback email failed:", err);
+  }
+}
+
+async function sendFallbackEmailSmtpOnly(session, req, reason) {
+  if (!SMTP_HOST) return;
+  const payload = buildFallbackEmailPayload(session, req, reason);
+  try {
+    const transporter = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_SECURE,
+      auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+    });
     await transporter.sendMail({
       from: FALLBACK_EMAIL_FROM,
       to: FALLBACK_EMAIL_TO,
@@ -589,7 +611,7 @@ function parseTimeIT(speech) {
 }
 
 function parseDateIT(speech) {
-  const tt = normalizeText(speech);
+  const tt = normalizeText(speech).replace(/[,\.]/g, " ").replace(/\s+/g, " ").trim();
   const today = new Date();
 
   if (tt.includes("oggi")) return toISODate(today);
@@ -755,32 +777,60 @@ function maybeSayLiveMusicNotice(vr, session) {
   session.liveMusicNoticeSpoken = true;
 }
 
-function computeDurationMinutes(session, events) {
-  if (session.bookingType === "drinks") return 90;
-  if (session.preorderChoiceKey === "dopocena") return 120;
-  if (session.preorderChoiceKey === "apericena") return 150;
-  const isLiveMusic = session?.liveMusicNoticePending || hasLiveMusicEvent(events);
-  if (isLiveMusic) return 180;
-  return 120;
+function getGoogleCredentials() {
+  if (GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
+    try {
+      const decoded = Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
+      return JSON.parse(decoded);
+    } catch (err) {
+      console.error("[GOOGLE] Invalid base64 credentials:", err);
+    }
+  }
+  if (GOOGLE_SERVICE_ACCOUNT_JSON) {
+    try {
+      return JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
+    } catch (err) {
+      console.error("[GOOGLE] Invalid JSON credentials:", err);
+    }
+  }
+  return null;
 }
 
-function isHighTableIdOrNear(id) {
-  return id === "T16" || id === "T17" || id === "T6" || id === "T7";
+function buildCalendarClient() {
+  const credentials = getGoogleCredentials();
+  if (!credentials) return null;
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ["https://www.googleapis.com/auth/calendar"],
+  });
+  return google.calendar({ version: "v3", auth });
 }
 
-function hasLiveMusicEvent(events) {
+function getTimeRangeForDate(dateISO) {
+  const start = new Date(`${dateISO}T00:00:00`);
+  const end = new Date(`${dateISO}T23:59:59`);
+  return { start, end };
+}
+
+function isDateClosedByCalendar(events) {
   return events.some((event) => {
     const summary = String(event.summary || "").toLowerCase();
     const description = String(event.description || "").toLowerCase();
-    return (
-      summary.includes("live music") ||
-      summary.includes("musica live") ||
-      summary.includes("dj set") ||
-      description.includes("live music") ||
-      description.includes("musica live") ||
-      description.includes("dj set")
-    );
+    return summary.includes("locale chiuso") || description.includes("locale chiuso");
   });
+}
+
+function extractTablesFromEvent(event) {
+  const description = String(event.description || "");
+  const match = description.match(/Tavolo:\s*([^\n]+)/i);
+  const summary = String(event.summary || "");
+  const summaryMatch = summary.match(/tav(?:olo)?\s*([^\-,]+)/i);
+  const tableText = match?.[1] || summaryMatch?.[1];
+  if (!tableText) return [];
+  return tableText
+    .split(/,| e /i)
+    .map((entry) => normalizeTableId(entry))
+    .filter(Boolean);
 }
 
 function getEventTimeRange(event) {
@@ -858,79 +908,175 @@ function pickTableForParty(people, occupied, availableOverride, session) {
     if (!unavailable) comboCandidates.push(combo);
   }
   if (comboCandidates.length > 0) {
-    comboCandidates.sort((a, b) => a.max - b.max);
-    const best = comboCandidates[0];
-    return { displayId: best.displayId, locks: best.replaces, notes: best.notes || null };
+    comboCandidates.sort((a, b) => {
+      const penaltyA = a.replaces.reduce((sum, id) => sum + getTablePenalty(id, session), 0);
+      const penaltyB = b.replaces.reduce((sum, id) => sum + getTablePenalty(id, session), 0);
+      if (penaltyA !== penaltyB) return penaltyA - penaltyB;
+      return a.max - b.max;
+    });
+    const combo = comboCandidates[0];
+    return { displayId: combo.displayId, locks: combo.replaces, notes: combo.notes || null };
   }
-
   return null;
 }
 
 function pickSplitTables(people, availableTables, session) {
-  const insideTables = availableTables.filter((t) => t.area === "inside");
-  if (insideTables.length === 0) return null;
-  const maxTable = insideTables.reduce((acc, t) => Math.max(acc, t.max), 0);
-  if (people > maxTable * 2) return null;
+  const sorted = [...availableTables].sort((a, b) => {
+    const penaltyA = getTablePenalty(a.id, session);
+    const penaltyB = getTablePenalty(b.id, session);
+    if (penaltyA !== penaltyB) return penaltyA - penaltyB;
+    return b.max - a.max;
+  });
+  const selected = [];
+  let remaining = people;
+  let capacity = 0;
 
-  const sorted = insideTables.slice().sort((a, b) => b.max - a.max);
-  for (let i = 0; i < sorted.length; i += 1) {
-    for (let j = i + 1; j < sorted.length; j += 1) {
-      const tableA = sorted[i];
-      const tableB = sorted[j];
-      if (tableA.id === tableB.id) continue;
-      if (people > tableA.max + tableB.max) continue;
-      const penaltyA = getTablePenalty(tableA.id, session);
-      const penaltyB = getTablePenalty(tableB.id, session);
-      if (penaltyA + penaltyB > 25) continue;
-      return {
-        displayIds: [tableA.id, tableB.id],
-        locks: [tableA.id, tableB.id],
-        notes: `${tableA.id} + ${tableB.id}`,
-      };
-    }
+  for (const table of sorted) {
+    if (remaining <= 0) break;
+    selected.push(table);
+    capacity += table.max;
+    remaining -= table.max;
   }
-  return null;
+
+  if (capacity < people || selected.length === 0) return null;
+  return {
+    displayIds: selected.map((table) => table.id),
+    locks: selected.map((table) => table.id),
+    notes: "tavoli separati",
+  };
+}
+
+function getNextDateISO(dateISO) {
+  const date = new Date(`${dateISO}T00:00:00`);
+  date.setDate(date.getDate() + 1);
+  return toISODate(date);
 }
 
 async function listCalendarEvents(dateISO) {
   if (!GOOGLE_CALENDAR_ID) return [];
   const calendar = buildCalendarClient();
   if (!calendar) return [];
-  const timeMin = `${dateISO}T00:00:00Z`;
-  const timeMax = `${getNextDateISO(dateISO)}T00:00:00Z`;
+  const { start, end } = getTimeRangeForDate(dateISO);
   try {
     const result = await calendar.events.list({
       calendarId: GOOGLE_CALENDAR_ID,
-      timeMin,
-      timeMax,
-      maxResults: 2500,
+      timeMin: start.toISOString(),
+      timeMax: end.toISOString(),
       singleEvents: true,
       orderBy: "startTime",
     });
     return result?.data?.items || [];
   } catch (err) {
-    console.error("[GOOGLE] Calendar events list failed:", err);
+    console.error("[GOOGLE] Calendar list failed:", err);
     return [];
   }
 }
 
-function isDateClosedByCalendar(events) {
+function formatTimeSlot(date, startDate) {
+  if (!date) return "";
+  if (
+    startDate &&
+    date.getHours() === 0 &&
+    date.getMinutes() === 0 &&
+    date.getTime() > startDate.getTime()
+  ) {
+    return "24:00";
+  }
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function timeToMinutes(time) {
+  if (!time || !time.includes(":")) return null;
+  const [h, m] = time.split(":").map((n) => Number(n));
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+  return h * 60 + m;
+}
+
+function getBaseDurationMinutes(people) {
+  if (!Number.isFinite(people)) return 120;
+  if (people <= 4) return 120;
+  if (people <= 8) return 150;
+  if (people <= 15) return 180;
+  return 180;
+}
+
+function hasLiveMusicEvent(events) {
   return events.some((event) => {
     const summary = String(event.summary || "").toLowerCase();
     const description = String(event.description || "").toLowerCase();
-    return summary.includes("locale chiuso") || description.includes("locale chiuso");
+    return (
+      summary.includes("live music") ||
+      description.includes("live music") ||
+      summary.includes("dj set") ||
+      description.includes("dj set")
+    );
   });
 }
 
+function computeDurationMinutes(session, events) {
+  const baseMinutes = getBaseDurationMinutes(session?.people);
+  const startMinutes = timeToMinutes(session?.time24);
+  if (!events || events.length === 0) return baseMinutes;
+  if (!Number.isFinite(startMinutes)) return baseMinutes;
+  if (startMinutes < 20 * 60) return baseMinutes;
+  if ((session?.people || 0) > 8) return baseMinutes;
+  if (!hasLiveMusicEvent(events)) return baseMinutes;
+  return baseMinutes + 30;
+}
+
+function maybeSayDivanettiNotice(vr, session) {
+  if (!session?.divanettiNotice || session.divanettiNoticeSpoken) return;
+  sayIt(vr, "Ti abbiamo riservato l’area divanetti, ideale per aperitivo e dopocena.");
+  session.divanettiNoticeSpoken = true;
+}
+
 function buildAvailabilityDescription(dateISO, events) {
-  const tables = buildAvailableTables(new Set(), null, { wantsOutside: true });
-  const tableSummary = tables.map((table) => `${table.id} (${table.area})`).join(", ");
-  const eventsSummary = events.map((event) => event.summary || "").join(", ");
-  return [
-    `Disponibilità aggiornate per ${dateISO}`,
-    `Tavoli: ${tableSummary}`,
-    `Eventi: ${eventsSummary}`,
-  ].join("\n");
+  const tableIds = TABLES.map((table) => table.id);
+  const occupancy = new Map(tableIds.map((id) => [id, []]));
+  const bookingRange = {
+    start: new Date(`${dateISO}T00:00:00`),
+    end: new Date(`${dateISO}T23:59:59`),
+  };
+
+  for (const event of events) {
+    const summary = String(event.summary || "").toLowerCase();
+    const eventType = event.extendedProperties?.private?.type || "";
+    if (summary.startsWith("annullata")) continue;
+    if (summary.includes("tavoli disponibili")) continue;
+    if (summary.includes("locale chiuso")) continue;
+    if (summary.includes("evento") || eventType === "evento") continue;
+    const eventRange = getEventTimeRange(event);
+    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
+    const tableIdsForEvent = extractTablesFromEvent(event)
+      .flatMap(expandTableLocks)
+      .filter((id) => occupancy.has(id));
+    for (const tableId of tableIdsForEvent) {
+      occupancy.get(tableId).push({
+        start: eventRange.start,
+        end: eventRange.end,
+      });
+    }
+  }
+
+  const lines = tableIds.map((tableId) => {
+    const slots = occupancy.get(tableId) || [];
+    slots.sort((a, b) => a.start - b.start);
+    if (slots.length === 0) {
+      return `${tableId}:`;
+    }
+    const slotText = slots
+      .map((slot) => {
+        const start = formatTimeSlot(slot.start);
+        const end = formatTimeSlot(slot.end, slot.start);
+        return `occupato dalle ${start} alle ${end};`;
+      })
+      .join(" ");
+    return `${tableId}: ${slotText}`;
+  });
+
+  return lines.join("\n");
 }
 
 async function upsertAvailabilityEvent(dateISO) {
@@ -967,6 +1113,111 @@ async function upsertAvailabilityEvent(dateISO) {
     console.error("[GOOGLE] Availability event update failed:", err);
     return null;
   }
+}
+
+async function reserveTableForSession(session, { commit } = { commit: false }) {
+  const events = await listCalendarEvents(session.dateISO);
+  if (isDateClosedByCalendar(events)) {
+    return { status: "closed" };
+  }
+
+  session.divanettiNotice = false;
+  session.divanettiNoticeSpoken = false;
+  session.durationMinutes = computeDurationMinutes(session, events);
+  const bookingStart = new Date(`${session.dateISO}T${session.time24}:00`);
+  const bookingEnd = new Date(bookingStart.getTime() + (session.durationMinutes || 120) * 60 * 1000);
+  const bookingRange = { start: bookingStart, end: bookingEnd };
+  const occupied = new Set();
+  const eventoEvents = [];
+
+  for (const event of events) {
+    const summary = String(event.summary || "").toLowerCase();
+    if (summary.startsWith("annullata")) continue;
+    if (summary.includes("evento")) {
+      eventoEvents.push(event);
+      continue;
+    }
+    const eventRange = getEventTimeRange(event);
+    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
+    const tableIds = extractTablesFromEvent(event);
+    tableIds.flatMap(expandTableLocks).forEach((id) => occupied.add(id));
+  }
+
+  let availableOverride = null;
+  if (eventoEvents.length > 0) {
+    const eventTables = eventoEvents
+      .flatMap((event) => extractTablesFromEvent(event))
+      .flatMap((id) => expandTableLocks(id));
+    availableOverride = new Set(eventTables);
+  }
+
+  const selection = pickTableForParty(session.people, occupied, availableOverride, session);
+  if (!selection) {
+    const availableTables = buildAvailableTables(occupied, availableOverride, session);
+    const insideTables = availableTables.filter((table) => table.area === "inside");
+    const insideSplit = pickSplitTables(session.people, insideTables, session);
+    if (insideSplit) {
+      session.tableDisplayId = insideSplit.displayIds.join(" e ");
+      session.tableLocks = insideSplit.locks;
+      session.tableNotes = insideSplit.notes;
+      session.divanettiNotice = insideSplit.locks.some((id) => isDivanettiTableId(id));
+      session.divanettiNoticeSpoken = false;
+      session.splitRequired = true;
+      session.outsideRequired = false;
+      return { status: "needs_split" };
+    }
+
+    const anySplit = pickSplitTables(session.people, availableTables, session);
+    if (anySplit) {
+      session.tableDisplayId = anySplit.displayIds.join(" e ");
+      session.tableLocks = anySplit.locks;
+      session.tableNotes = anySplit.notes;
+      session.divanettiNotice = anySplit.locks.some((id) => isDivanettiTableId(id));
+      session.divanettiNoticeSpoken = false;
+      session.splitRequired = true;
+      session.outsideRequired = anySplit.locks.some((id) => getTableById(id)?.area === "outside");
+      return { status: "needs_outside" };
+    }
+
+    return { status: "unavailable" };
+  }
+  session.tableDisplayId = selection.displayId;
+  session.tableLocks = selection.locks;
+  session.tableNotes = selection.notes;
+  session.divanettiNotice = selection.locks.some((id) => isDivanettiTableId(id));
+  session.divanettiNoticeSpoken = false;
+  session.splitRequired = false;
+  session.outsideRequired = selection.locks.some((id) => getTableById(id)?.area === "outside");
+
+  if (commit && eventoEvents.length > 0) {
+    const calendar = buildCalendarClient();
+    if (calendar) {
+      for (const event of eventoEvents) {
+        const eventTables = extractTablesFromEvent(event);
+        const remaining = eventTables.filter((id) => !selection.locks.includes(id));
+        const availableCount = remaining.length;
+        const updatedSummary = `Evento - tavoli disponibili: ${availableCount}`;
+        const baseDescription = String(event.description || "");
+        const updatedDescription = baseDescription.match(/Tavolo:\s*/i)
+          ? baseDescription.replace(/Tavolo:\s*[^\n]*/i, `Tavolo: ${remaining.join(", ")}`)
+          : `${baseDescription}\nTavolo: ${remaining.join(", ")}`.trim();
+        try {
+          await calendar.events.patch({
+            calendarId: GOOGLE_CALENDAR_ID,
+            eventId: event.id,
+            requestBody: {
+              summary: updatedSummary,
+              description: updatedDescription,
+            },
+          });
+        } catch (err) {
+          console.error("[GOOGLE] Calendar event update failed:", err);
+        }
+      }
+    }
+  }
+
+  return { status: "ok", selection };
 }
 
 async function cancelCalendarEvent(session) {
@@ -1105,207 +1356,51 @@ async function createEventCalendarEvent(session) {
   }
 }
 
-async function updateCalendarEventDescription(session) {
-  if (!session?.calendarEventId) return null;
-  const calendar = buildCalendarClient();
-  if (!calendar) return null;
-  const summary = session.calendarEventSummary || "";
+// ======================= ROUTES =======================
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+app.post("/call/outbound", async (req, res) => {
   try {
-    const result = await calendar.events.patch({
-      calendarId: GOOGLE_CALENDAR_ID,
-      eventId: session.calendarEventId,
-      requestBody: {
-        summary,
-        description: [
-          `Nome: ${session.name || ""}`,
-          `Persone: ${session.people || ""}`,
-          `Note: ${buildSpecialRequestsText(session)}`,
-          `Preordine: ${session.preorderLabel || "nessuno"}`,
-          `Tavolo: ${session.tableDisplayId || ""}`,
-          `Telefono: ${session.phone || "non fornito"}`,
-        ].join("\n"),
-      },
+    const to = String(req.body?.to || "").trim();
+    if (!to || !isValidPhoneE164(to)) {
+      return res.status(400).json({ ok: false, error: "Invalid 'to' number" });
+    }
+    if (!twilioClient) {
+      return res.status(500).json({ ok: false, error: "Twilio not configured" });
+    }
+    const fromNumber = requireTwilioVoiceFrom();
+    const twimlUrl = BASE_URL ? `${BASE_URL}/twilio/voice/outbound` : "/twilio/voice/outbound";
+    const call = await twilioClient.calls.create({
+      to,
+      from: fromNumber,
+      url: twimlUrl,
+      method: "POST",
     });
-    return result?.data || null;
+    return res.json({ ok: true, callSid: call.sid });
   } catch (err) {
-    console.error("[GOOGLE] Calendar update failed:", err);
-    return null;
+    console.error("[OUTBOUND] Error:", err);
+    if (err && err.message === "TWILIO_VOICE_FROM is not set") {
+      return res.status(500).json({ ok: false, error: "TWILIO_VOICE_FROM not set" });
+    }
+    return res.status(500).json({ ok: false });
   }
-}
+});
 
-async function createEventCalendarEventBackup(session) {
-  if (!GOOGLE_CALENDAR_ID) return null;
-  const calendar = buildCalendarClient();
-  if (!calendar) return null;
-  if (!session?.eventDateISO || !session?.eventTime24 || !session?.eventName) return null;
-
-  const startDateTime = `${session.eventDateISO}T${session.eventTime24}:00`;
-  const endDate = new Date(`${session.eventDateISO}T${session.eventTime24}:00`);
-  endDate.setMinutes(endDate.getMinutes() + 120);
-  const endDateTime = `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, "0")}-${String(
-    endDate.getDate()
-  ).padStart(2, "0")}T${String(endDate.getHours()).padStart(2, "0")}:${String(
-    endDate.getMinutes()
-  ).padStart(2, "0")}:00`;
-
-  const event = {
-    summary: `Evento - ${session.eventName}`,
-    description: [
-      `Nome evento: ${session.eventName}`,
-      `Data: ${session.eventDateISO}`,
-      `Ora: ${session.eventTime24}`,
-    ].join("\n"),
-    start: { dateTime: startDateTime, timeZone: GOOGLE_CALENDAR_TZ },
-    end: { dateTime: endDateTime, timeZone: GOOGLE_CALENDAR_TZ },
-  };
-
+app.post("/twilio/voice/outbound", (req, res) => {
   try {
-    const result = await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID,
-      requestBody: event,
-    });
-    return result?.data || null;
+    const vr = buildTwiml();
+    vr.say(
+      { language: "it-IT", voice: "alice" },
+      xmlEscape("Ciao! Ti chiamiamo da TuttiBrilli per un aggiornamento sulla tua prenotazione. Grazie.")
+    );
+    vr.hangup();
+    res.set("Content-Type", "text/xml; charset=utf-8");
+    return res.send(vr.toString());
   } catch (err) {
-    console.error("[GOOGLE] Event insert failed:", err);
-    return null;
+    console.error("[OUTBOUND_TWIML] Error:", err);
+    return res.status(500).send("Error");
   }
-}
-
-async function findReservationByPhone(session) {
-  if (!session?.phone || !session?.dateISO) return null;
-  const events = await listCalendarEvents(session.dateISO);
-  for (const event of events) {
-    const summary = String(event.summary || "").toLowerCase();
-    if (summary.includes("evento")) continue;
-    const description = String(event.description || "");
-    if (!description.includes(session.phone)) continue;
-    const tableIds = extractTablesFromEvent(event);
-    const tableId = tableIds.length > 0 ? tableIds.join(" e ") : "da assegnare";
-    return {
-      id: event.id,
-      summary: event.summary,
-      name: event.summary,
-      dateISO: session.dateISO,
-      time24: event.start?.dateTime ? event.start.dateTime.slice(11, 16) : "",
-      tableId,
-      notes: description,
-      preorder: description,
-      people: description,
-    };
-  }
-  return null;
-}
-
-function maybeSayDivanettiNotice(vr, session) {
-  if (!session?.divanettiNotice || session.divanettiNoticeSpoken) return;
-  sayIt(vr, "Ti informo che il tavolo assegnato è vicino ai divanetti.");
-  session.divanettiNoticeSpoken = true;
-}
-
-async function reserveTableForSession(session, { commit } = { commit: false }) {
-  const events = await listCalendarEvents(session.dateISO);
-  if (isDateClosedByCalendar(events)) {
-    return { status: "closed" };
-  }
-
-  session.divanettiNotice = false;
-  session.divanettiNoticeSpoken = false;
-  session.durationMinutes = computeDurationMinutes(session, events);
-  const bookingStart = new Date(`${session.dateISO}T${session.time24}:00`);
-  const bookingEnd = new Date(bookingStart.getTime() + (session.durationMinutes || 120) * 60 * 1000);
-  const bookingRange = { start: bookingStart, end: bookingEnd };
-  const occupied = new Set();
-  const eventoEvents = [];
-
-  for (const event of events) {
-    const summary = String(event.summary || "").toLowerCase();
-    if (summary.startsWith("annullata")) continue;
-    if (summary.includes("evento")) {
-      eventoEvents.push(event);
-      continue;
-    }
-    const eventRange = getEventTimeRange(event);
-    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
-    const tableIds = extractTablesFromEvent(event);
-    tableIds.flatMap(expandTableLocks).forEach((id) => occupied.add(id));
-  }
-
-  let availableOverride = null;
-  if (eventoEvents.length > 0) {
-    const eventTables = eventoEvents
-      .flatMap((event) => extractTablesFromEvent(event))
-      .flatMap((id) => expandTableLocks(id));
-    availableOverride = new Set(eventTables);
-  }
-
-  const selection = pickTableForParty(session.people, occupied, availableOverride, session);
-  if (!selection) {
-    const availableTables = buildAvailableTables(occupied, availableOverride, session);
-    const insideTables = availableTables.filter((table) => table.area === "inside");
-    const insideSplit = pickSplitTables(session.people, insideTables, session);
-    if (insideSplit) {
-      session.tableDisplayId = insideSplit.displayIds.join(" e ");
-      session.tableLocks = insideSplit.locks;
-      session.tableNotes = insideSplit.notes;
-      session.divanettiNotice = insideSplit.locks.some((id) => isDivanettiTableId(id));
-      session.divanettiNoticeSpoken = false;
-      session.splitRequired = true;
-      session.outsideRequired = false;
-      return { status: "needs_split" };
-    }
-
-    const anySplit = pickSplitTables(session.people, availableTables, session);
-    if (anySplit) {
-      session.tableDisplayId = anySplit.displayIds.join(" e ");
-      session.tableLocks = anySplit.locks;
-      session.tableNotes = anySplit.notes;
-      session.divanettiNotice = anySplit.locks.some((id) => isDivanettiTableId(id));
-      session.divanettiNoticeSpoken = false;
-      session.splitRequired = true;
-      session.outsideRequired = anySplit.locks.some((id) => getTableById(id)?.area === "outside");
-      return { status: "needs_outside" };
-    }
-
-    return { status: "unavailable" };
-  }
-  session.tableDisplayId = selection.displayId;
-  session.tableLocks = selection.locks;
-  session.tableNotes = selection.notes;
-  session.divanettiNotice = selection.locks.some((id) => isDivanettiTableId(id));
-  session.divanettiNoticeSpoken = false;
-  session.splitRequired = false;
-  session.outsideRequired = selection.locks.some((id) => getTableById(id)?.area === "outside");
-
-  if (commit && eventoEvents.length > 0) {
-    const calendar = buildCalendarClient();
-    if (calendar) {
-      for (const event of eventoEvents) {
-        const eventTables = extractTablesFromEvent(event);
-        const remaining = eventTables.filter((id) => !selection.locks.includes(id));
-        const availableCount = remaining.length;
-        const updatedSummary = `Evento - tavoli disponibili: ${availableCount}`;
-        const baseDescription = String(event.description || "");
-        const updatedDescription = baseDescription.match(/Tavolo:\s*/i)
-          ? baseDescription.replace(/Tavolo:\s*[^\n]*/i, `Tavolo: ${remaining.join(", ")}`)
-          : `${baseDescription}\nTavolo: ${remaining.join(", ")}`.trim();
-        try {
-          await calendar.events.patch({
-            calendarId: GOOGLE_CALENDAR_ID,
-            eventId: event.id,
-            requestBody: {
-              summary: updatedSummary,
-              description: updatedDescription,
-            },
-          });
-        } catch (err) {
-          console.error("[GOOGLE] Calendar event update failed:", err);
-        }
-      }
-    }
-  }
-
-  return { status: "ok", selection };
-}
+});
 
 async function handleVoiceRequest(req, res) {
   const callSid = req.body.CallSid || "";
@@ -1399,12 +1494,12 @@ async function handleVoiceRequest(req, res) {
 
         if (!intent) {
           session.intentRetries += 1;
-          if (session.intentRetries >= 2) {
-            await sendFallbackEmail(session, req, "intent_retry_exhausted");
-            void sendOperatorEmail(session, req, "intent_retry_exhausted");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(forwardToHumanTwiml());
-          }
+        if (session.intentRetries >= 2) {
+          await sendFallbackEmail(session, req, "intent_retry_exhausted");
+          void sendOperatorEmail(session, req, "intent_retry_exhausted");
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(forwardToHumanTwiml());
+        }
           gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni, oppure prenotare un evento?");
           break;
         }
@@ -1985,7 +2080,7 @@ async function handleVoiceRequest(req, res) {
     return res.send(vr.toString());
   } catch (err) {
     console.error("[VOICE] Error:", err);
-    await sendFallbackEmail(session, req, "exception");
+    void sendFallbackEmailSmtpOnly(session, req, "exception");
     if (canForwardToHuman()) {
       void sendOperatorEmail(session, req, "exception");
       res.set("Content-Type", "text/xml; charset=utf-8");
