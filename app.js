@@ -122,7 +122,8 @@ const TABLE_COMBINATIONS = [
   { displayId: "T11", area: "inside", replaces: ["T11", "T12"], min: 6, max: 6, notes: "unione T11+T12" },
   { displayId: "T12", area: "inside", replaces: ["T12", "T13"], min: 6, max: 6, notes: "unione T12+T13" },
   { displayId: "T11", area: "inside", replaces: ["T11", "T12", "T13"], min: 8, max: 10, notes: "unione T11+T12+T13" },
-  { displayId: "T16", area: "inside", replaces: ["T16", "T17"], min: 8, max: 10, notes: "unione T16+T17" },
+  { displayId: "T11", area: "inside", replaces: ["T7", "T11", "T12", "T13"], min: 12, max: 12, notes: "unione T7+T11+T12+T13" },
+  { displayId: "T16", area: "inside", replaces: ["T16", "T17"], min: 8, max: 11, notes: "unione T16+T17" },
   { displayId: "T7F", area: "outside", replaces: ["T7F", "T8F"], min: 6, max: 8, notes: "unione T7F+T8F" },
 ];
 
@@ -200,6 +201,7 @@ function forwardToHumanTwiml() {
   const vr = buildTwiml();
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
   vr.dial({}, OPERATOR_PHONE);
+  vr.hangup();
   return vr.toString();
 }
 
@@ -450,7 +452,11 @@ function handleSilence(session, vr, promptFn) {
 }
 
 function normalizeText(s) {
-  return String(s || "").trim().toLowerCase().replace(/\s+/g, " ");
+  return String(s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[.,!?]/g, "")
+    .replace(/\s+/g, " ");
 }
 
 function isPureConsent(speech) {
@@ -566,7 +572,7 @@ function promptForStep(vr, session) {
     case 7:
       gatherSpeech(
         vr,
-        "Non abbiamo più disponibilità per un unico tavolo. Posso sistemarvi in tavoli separati?"
+        "Non abbiamo più disponibilità per un unico tavolo. Posco sistemarvi in tavoli separati?"
       );
       return;
     case 8:
@@ -897,6 +903,7 @@ function getTablePenalty(tableId, session) {
   let penalty = 0;
   if (isHighTableId(tableId)) penalty += 20;
   if (isDivanettiTableId(tableId) && !isDivanettiPreferred(session)) penalty += 10;
+  if (tableId === "T7") penalty += 5;
   return penalty;
 }
 
@@ -1183,6 +1190,34 @@ async function reserveTableForSession(session, { commit } = { commit: false }) {
   const selection = pickTableForParty(session.people, occupied, availableOverride, session);
   if (!selection) {
     const availableTables = buildAvailableTables(occupied, availableOverride, session);
+    const availableSet = buildAvailableTableSet(availableTables);
+    if (session.people === 12) {
+      const comboT14 = TABLE_COMBINATIONS.find(
+        (combo) => combo.displayId === "T14" && combo.replaces.length === 2 && combo.replaces.includes("T15")
+      );
+      const comboT7T11 = TABLE_COMBINATIONS.find(
+        (combo) =>
+          combo.displayId === "T11" &&
+          combo.replaces.length === 4 &&
+          combo.replaces.includes("T7") &&
+          combo.replaces.includes("T11") &&
+          combo.replaces.includes("T12") &&
+          combo.replaces.includes("T13")
+      );
+      const hasComboT14 = comboT14 && comboT14.replaces.every((id) => availableSet.has(id));
+      const hasComboT7T11 = comboT7T11 && comboT7T11.replaces.every((id) => availableSet.has(id));
+      if (!hasComboT14 && !hasComboT7T11) {
+        session.criticalReservation = true;
+        session.tableDisplayId = "T10";
+        session.tableLocks = ["T10"];
+        session.tableNotes = null;
+        session.divanettiNotice = false;
+        session.divanettiNoticeSpoken = false;
+        session.splitRequired = false;
+        session.outsideRequired = false;
+        return { status: "ok", selection: { displayId: "T10", locks: ["T10"], notes: null } };
+      }
+    }
     const insideTables = availableTables.filter((table) => table.area === "inside");
     const insideSplit = pickSplitTables(session.people, insideTables, session);
     if (insideSplit) {
@@ -1453,6 +1488,7 @@ async function handleVoiceRequest(req, res) {
         return res.send(forwardToHumanTwiml());
       }
       sayIt(vr, "Ti passo un operatore per completare la richiesta.");
+      vr.hangup();
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(vr.toString());
     }
@@ -1467,6 +1503,7 @@ async function handleVoiceRequest(req, res) {
         return res.send(forwardToHumanTwiml());
       }
       sayIt(vr, "Ti passo un operatore per completare la richiesta.");
+      vr.hangup();
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(vr.toString());
     }
@@ -1645,8 +1682,9 @@ async function handleVoiceRequest(req, res) {
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(forwardToHumanTwiml());
         }
-        session.step = 1;
-        break;
+        vr.hangup();
+        res.set("Content-Type", "text/xml; charset=utf-8");
+        return res.send(vr.toString());
       }
 
       case 1: {
@@ -1770,7 +1808,7 @@ async function handleVoiceRequest(req, res) {
           break;
         }
         if (isPureConsent(speech)) {
-          gatherSpeech(vr, "Va bene, puoi dirmi quale richiesta / intolleranza?");
+          gatherSpeech(vr, "Quali? Dimmi pure le intolleranze o la richiesta.");
           break;
         }
         session.specialRequestsRaw = emptySpeech ? "nessuna" : speech.trim().slice(0, 200);
@@ -1871,6 +1909,12 @@ async function handleVoiceRequest(req, res) {
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
+          if (session.forceOperatorFallback) {
+            sayIt(vr, t("step9_fallback_transfer_operator.main"));
+            vr.hangup();
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
           session.step = 4;
           gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
           break;
@@ -1914,7 +1958,7 @@ async function handleVoiceRequest(req, res) {
               "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
             );
           } else {
-            gatherSpeech(vr, "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
+            gatherSpeech(vr, "Posco sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
           }
           break;
         }
@@ -1926,6 +1970,7 @@ async function handleVoiceRequest(req, res) {
             return res.send(forwardToHumanTwiml());
           }
           sayIt(vr, t("step9_fallback_transfer_operator.main"));
+          vr.hangup();
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(vr.toString());
         }
@@ -1975,11 +2020,10 @@ async function handleVoiceRequest(req, res) {
           resetRetries(session);
           session.step = 1;
           session.criticalReservation = false;
-          gatherSpeech(
-            vr,
-            "La prenotazione è stata effettuata. Verrai richiamato da un operatore per confermare i dettagli."
-          );
-          break;
+          sayIt(vr, "La prenotazione è stata effettuata. Verrai richiamato da un operatore per confermare i dettagli.");
+          vr.hangup();
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
         }
         session.step = 9;
         maybeSayApericenaNotices(vr, session);
@@ -2002,7 +2046,7 @@ async function handleVoiceRequest(req, res) {
           break;
         }
         if (isPureConsent(speech)) {
-          gatherSpeech(vr, "Va bene, puoi dirmi quale richiesta / intolleranza?");
+          gatherSpeech(vr, "Quali? Dimmi pure le intolleranze o la richiesta.");
           break;
         }
         const confirmation = parseYesNo(speech);
@@ -2094,6 +2138,12 @@ async function handleVoiceRequest(req, res) {
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(forwardToHumanTwiml());
           }
+          if (session.forceOperatorFallback) {
+            sayIt(vr, t("step9_fallback_transfer_operator.main"));
+            vr.hangup();
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
           session.step = 4;
           gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
           break;
@@ -2106,8 +2156,10 @@ async function handleVoiceRequest(req, res) {
         }
         resetRetries(session);
         session.step = 1;
-        gatherSpeech(vr, t("step9_success.main"));
-        break;
+        sayIt(vr, t("step9_success.main"));
+        vr.hangup();
+        res.set("Content-Type", "text/xml; charset=utf-8");
+        return res.send(vr.toString());
       }
 
       default: {
@@ -2135,6 +2187,7 @@ async function handleVoiceRequest(req, res) {
       return res.send(forwardToHumanTwiml());
     }
     sayIt(vr, t("step9_fallback_transfer_operator.main"));
+    vr.hangup();
     res.set("Content-Type", "text/xml; charset=utf-8");
     return res.send(vr.toString());
   }
