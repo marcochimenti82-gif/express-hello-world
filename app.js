@@ -44,8 +44,8 @@ const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_USER = process.env.SMTP_USER || "";
 const SMTP_PASS = process.env.SMTP_PASS || "";
 const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true";
-const FALLBACK_EMAIL_TO = process.env.FALLBACK_EMAIL_TO || "tuttibrillienoteca@gmail.com";
-const FALLBACK_EMAIL_FROM = process.env.FALLBACK_EMAIL_FROM || "no-reply@tuttibrilli.local";
+const EMAIL_TO = process.env.EMAIL_TO || "tuttibrillienoteca@gmail.com";
+const EMAIL_FROM = process.env.EMAIL_FROM || "no-reply@tuttibrilli.local";
 
 const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "false").toLowerCase() === "true";
 const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || "";
@@ -438,24 +438,19 @@ function buildFallbackEmailPayload(session, req, reason) {
 async function sendFallbackEmail(session, req, reason) {
   const payload = buildFallbackEmailPayload(session, req, reason);
   try {
-    let transporter = null;
-    if (SMTP_HOST) {
-      transporter = nodemailer.createTransport({
-        host: SMTP_HOST,
-        port: SMTP_PORT,
-        secure: SMTP_SECURE,
-        auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-      });
-    } else {
-      transporter = nodemailer.createTransport({
-        sendmail: true,
-        newline: "unix",
-        path: "/usr/sbin/sendmail",
-      });
+    if (!SMTP_HOST) {
+      console.error("[EMAIL] SMTP_HOST is not set");
+      return;
     }
+    const transporter = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_SECURE,
+      auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+    });
     await transporter.sendMail({
-      from: FALLBACK_EMAIL_FROM,
-      to: FALLBACK_EMAIL_TO,
+      from: EMAIL_FROM,
+      to: EMAIL_TO,
       subject: payload.subject,
       text: payload.text,
     });
@@ -475,8 +470,8 @@ async function sendFallbackEmailSmtpOnly(session, req, reason) {
       auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
     });
     await transporter.sendMail({
-      from: FALLBACK_EMAIL_FROM,
-      to: FALLBACK_EMAIL_TO,
+      from: EMAIL_FROM,
+      to: EMAIL_TO,
       subject: payload.subject,
       text: payload.text,
     });
@@ -509,24 +504,19 @@ function buildOperatorEmailPayload(session, req, reason) {
 async function sendOperatorEmail(session, req, reason) {
   const payload = buildOperatorEmailPayload(session, req, reason);
   try {
-    let transporter = null;
-    if (SMTP_HOST) {
-      transporter = nodemailer.createTransport({
-        host: SMTP_HOST,
-        port: SMTP_PORT,
-        secure: SMTP_SECURE,
-        auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-      });
-    } else {
-      transporter = nodemailer.createTransport({
-        sendmail: true,
-        newline: "unix",
-        path: "/usr/sbin/sendmail",
-      });
+    if (!SMTP_HOST) {
+      console.error("[EMAIL] SMTP_HOST is not set");
+      return;
     }
+    const transporter = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_SECURE,
+      auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+    });
     await transporter.sendMail({
-      from: FALLBACK_EMAIL_FROM,
-      to: "tuttibrillienoteca@gmail.com",
+      from: EMAIL_FROM,
+      to: EMAIL_TO,
       subject: payload.subject,
       text: payload.text,
     });
