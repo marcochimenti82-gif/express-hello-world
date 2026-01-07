@@ -22,6 +22,7 @@ const nodemailer = require("nodemailer");
 const { google } = require("googleapis");
 
 const { PROMPTS } = require("./prompts");
+const { getInfoResponse } = require("./services/infoMatcher");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -1588,6 +1589,19 @@ async function handleVoiceRequest(req, res) {
         }
 
         if (intent === "info") {
+          try {
+            const infoResponse = await getInfoResponse({
+              speech,
+              locale: "it-IT",
+            });
+            if (infoResponse && infoResponse.text && !infoResponse.fallback) {
+              sayIt(vr, infoResponse.text);
+              res.set("Content-Type", "text/xml; charset=utf-8");
+              return res.send(vr.toString());
+            }
+          } catch (err) {
+            console.error("[INFO_MATCH] Failed:", err);
+          }
           await sendFallbackEmail(session, req, "info_request");
           if (canForwardToHuman()) {
             void sendOperatorEmail(session, req, "info_request");
@@ -1940,7 +1954,7 @@ async function handleVoiceRequest(req, res) {
         if (emptySpeech) {
           const promptText = session.outsideRequired
             ? "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
-            : "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.";
+            : "Posco sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.";
           const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, promptText));
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step7");
