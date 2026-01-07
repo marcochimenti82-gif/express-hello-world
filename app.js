@@ -1314,8 +1314,8 @@ async function upsertAvailabilityEvent(dateISO) {
   const requestBody = {
     summary: "Tavoli disponibili",
     description,
-    start: { date: dateISO, timeZone: GOOGLE_CALENDAR_TZ },
-    end: { date: getNextDateISO(dateISO), timeZone: GOOGLE_CALENDAR_TZ },
+    start: { date: dateISO },
+    end: { date: getNextDateISO(dateISO) },
   };
 
   try {
