@@ -2022,7 +2022,7 @@ async function handleVoiceRequest(req, res) {
         session.intent = "prenotazione";
         session.step = 1;
         gatherSpeech(vr, t("step1_welcome_name.main"));
-        break;
+        return res.send(vr.toString());
       }
 
       if (normalized.includes("info") || normalized.includes("informaz") || normalized.includes("evento")) {
