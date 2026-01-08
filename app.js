@@ -1783,213 +1783,112 @@ async function createFailedCallCalendarEvent(session, req, reason) {
 
 async function safeCreateFailedCallCalendarEvent(session, req, reason) {
   try {
-    return await createFailedCallCalendarEvent(session, req, reason);
+    await createFailedCallCalendarEvent(session, req, reason);
   } catch (err) {
-    console.error("[GOOGLE] Failed call calendar creation error:", err);
-    return null;
+    console.error("[GOOGLE] Failed call safe insert failed:", err);
   }
 }
 
-// ======================= PROMPTS (STATIC) =======================
-function buildDayLabel(dateISO) {
-  return formatDateLabel(dateISO);
-}
+// ======================= ROUTES =======================
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-function tYesNo(fallback) {
-  return fallback;
-}
-
-function tWantsOutside(defaultValue) {
-  return defaultValue;
-}
-
-function tSplitConfirm(defaultValue) {
-  return defaultValue;
-}
-
-// ======================= PROMPTS (AUTO) =======================
-function promptWithOffer(vr, session, prompt) {
-  if (!session?.name) return gatherSpeech(vr, prompt);
-  const offer = `Ti va di fare una prenotazione con ${session.name}?`;
-  gatherSpeech(vr, `${offer} ${prompt}`);
-}
-
-function maybeAskOutside(session, vr) {
-  if (!session?.pendingOutsideConfirm) return false;
-  if (session?.outsideRequired) {
-    gatherSpeech(
-      vr,
-      "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
-    );
-    return true;
-  }
-  return false;
-}
-
-// ======================= STATIC PROMPTS =======================
-const FALLBACK_PROMPTS = {
-  intent: {
-    main: "Dimmi se vuoi prenotare un tavolo o avere informazioni.",
-    short: "Vuoi prenotare o chiedere informazioni?",
-  },
-};
-
-function tFallbackPrompt(path, fallback = "") {
-  const parts = String(path || "").split(".");
-  let node = FALLBACK_PROMPTS;
-  for (const p of parts) {
-    if (!node || typeof node !== "object" || !(p in node)) return fallback;
-    node = node[p];
-  }
-  return typeof node === "string" ? node : fallback;
-}
-
-function tFallback(path, vars = {}, fallback = "") {
-  return renderTemplate(tFallbackPrompt(path, fallback), vars);
-}
-
-// ======================= PROMPTS (SIMPLE) =======================
-const PROMPTS_SIMPLE = {
-  intent: {
-    main: "Buongiorno! Sono l'assistente virtuale di Tutti Brilli. Vuoi prenotare o chiedere informazioni?",
-  },
-};
-
-function tSimple(path, vars = {}, fallback = "") {
-  return renderTemplate(pickPrompt(path, fallback), vars);
-}
-
-// ======================= PROMPTS (DEFAULT) =======================
-const PROMPTS_DEFAULT = {
-  intent: {
-    main: "Buongiorno! Sono l'assistente virtuale di Tutti Brilli. Vuoi prenotare o chiedere informazioni?",
-  },
-  step1_welcome_name: {
-    main: "Perfetto. Come ti chiami?",
-    short: "Come ti chiami?",
-  },
-  step2_confirm_name_ask_date: {
-    main: "Piacere {{name}}. Per quale giorno vuoi prenotare?",
-  },
-  step3_confirm_date_ask_time: {
-    main: "Perfetto. A che ora vuoi prenotare?",
-  },
-  step4_ask_party_size: {
-    main: "In quante persone siete?",
-  },
-  step5_party_size_ask_notes: {
-    main: "Perfetto. Hai intolleranze o esigenze particolari?",
-  },
-  step6_preorder: {
-    main: "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno.",
-  },
-  step7_tables_split: {
-    main: "Non abbiamo più disponibilità per un unico tavolo. Posco sistemarvi in tavoli separati?",
-  },
-  step8_phone: {
-    main: "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.",
-  },
-  step8_summary_confirm: {
-    main: "Perfetto {{name}}, confermi la prenotazione per {{dateLabel}} alle {{time}} per {{partySize}} persone?",
-    short: "Confermi la prenotazione per {{dateLabel}} alle {{time}} per {{partySize}} persone?",
-  },
-  step9_success: {
-    main: "Grazie! La prenotazione è stata confermata. A presto!",
-  },
-  step9_fallback_transfer_operator: {
-    main: "Mi dispiace, non riesco a completare la richiesta. Ti passerò un operatore.",
-  },
-};
-
-function getPrompt(path) {
-  const parts = String(path || "").split(".");
-  let node = PROMPTS_DEFAULT;
-  for (const p of parts) {
-    if (!node || typeof node !== "object" || !(p in node)) return null;
-    node = node[p];
-  }
-  return typeof node === "string" ? node : null;
-}
-
-function tDefault(path, vars = {}, fallback = "") {
-  const prompt = getPrompt(path);
-  return renderTemplate(prompt || fallback, vars);
-}
-
-// ======================= MAIN PROMPTS =======================
-function getVoicePrompt(path) {
-  const overrides = PROMPTS;
-  const parts = String(path || "").split(".");
-  let node = overrides;
-  for (const p of parts) {
-    if (!node || typeof node !== "object" || !(p in node)) {
-      node = null;
-      break;
-    }
-    node = node[p];
-  }
-  if (typeof node === "string") return node;
-
-  const fallback = getPrompt(path);
-  if (fallback) return fallback;
-
-  return tFallback(path, {}, "");
-}
-
-function tMain(path, vars = {}, fallback = "") {
-  return renderTemplate(getVoicePrompt(path) || fallback, vars);
-}
-
-// ======================= PROMPTS DISPATCH =======================
-function t(path, vars = {}, fallback = "") {
-  return tMain(path, vars, fallback);
-}
-
-// ======================= VOICE HANDLER =======================
-async function handleVoiceRequest(req, res) {
-  const session = getSession(req.body?.CallSid);
-  const vr = buildTwiml();
+app.post("/call/outbound", async (req, res) => {
   try {
-    maybeWarnMissingEnv();
-    const speech = req.body.SpeechResult || "";
-    const language = req.body.SpeechResultConfidence ? "it-IT" : "it-IT";
-    const emptySpeech = !normalizeText(speech);
+    const to = String(req.body?.to || "").trim();
+    if (!to || !isValidPhoneE164(to)) {
+      return res.status(400).json({ ok: false, error: "Invalid 'to' number" });
+    }
+    if (!twilioClient) {
+      return res.status(500).json({ ok: false, error: "Twilio not configured" });
+    }
+    const fromNumber = requireTwilioVoiceFrom();
+    const twimlUrl = BASE_URL ? `${BASE_URL}/twilio/voice/outbound` : "/twilio/voice/outbound";
+    const call = await twilioClient.calls.create({
+      to,
+      from: fromNumber,
+      url: twimlUrl,
+      method: "POST",
+    });
+    return res.json({ ok: true, callSid: call.sid });
+  } catch (err) {
+    console.error("[OUTBOUND] Error:", err);
+    if (err && err.message === "TWILIO_VOICE_FROM is not set") {
+      return res.status(500).json({ ok: false, error: "TWILIO_VOICE_FROM not set" });
+    }
+    return res.status(500).json({ ok: false });
+  }
+});
 
+app.post("/twilio/voice/outbound", (req, res) => {
+  try {
+    const vr = buildTwiml();
+    vr.say(
+      { language: "it-IT", voice: "alice" },
+      xmlEscape("Ciao! Ti chiamiamo da TuttiBrilli per un aggiornamento sulla tua prenotazione. Grazie.")
+    );
+    vr.hangup();
+    res.set("Content-Type", "text/xml; charset=utf-8");
+    return res.send(vr.toString());
+  } catch (err) {
+    console.error("[OUTBOUND_TWIML] Error:", err);
+    return res.status(500).send("Error");
+  }
+});
+
+async function handleVoiceRequest(req, res) {
+  const callSid = req.body.CallSid || "";
+  const speech = req.body.SpeechResult || "";
+  const session = getSession(callSid);
+  const vr = buildTwiml();
+
+  try {
     if (!session) {
+      await sendFallbackEmail(session, req, "session_error");
       if (canForwardToHuman()) {
-        await sendFallbackEmail(session, req, "session_error");
         void sendOperatorEmail(session, req, "session_error");
         res.set("Content-Type", "text/xml; charset=utf-8");
         await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
         return res.send(forwardToHumanTwiml());
       }
-      sayIt(vr, t("step9_fallback_transfer_operator.main"));
+      sayIt(vr, "Ti passo un operatore per completare la richiesta.");
       await safeCreateFailedCallCalendarEvent(session, req, "fallback");
       vr.hangup();
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(vr.toString());
     }
 
+    const emptySpeech = !normalizeText(speech);
+
     if (!emptySpeech && isOperatorRequest(speech)) {
+      await sendFallbackEmail(session, req, "operator_request");
       if (canForwardToHuman()) {
-        await sendFallbackEmail(session, req, "operator_request");
         void sendOperatorEmail(session, req, "operator_request");
         res.set("Content-Type", "text/xml; charset=utf-8");
         await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
         return res.send(forwardToHumanTwiml());
       }
+      sayIt(vr, "Ti passo un operatore per completare la richiesta.");
+      await safeCreateFailedCallCalendarEvent(session, req, "fallback");
+      vr.hangup();
+      res.set("Content-Type", "text/xml; charset=utf-8");
+      return res.send(vr.toString());
     }
 
     if (session.step !== "intent" && !emptySpeech && isCancelCommand(speech)) {
-      if (canForwardToHuman()) {
+      const canceled = await cancelCalendarEvent(session);
+      if (canceled) {
+        session.step = 1;
+        gatherSpeech(vr, "Ho annullato la prenotazione. Vuoi prenotare di nuovo?");
+      } else if (canForwardToHuman()) {
         await sendFallbackEmail(session, req, "cancel_request_forward");
         void sendOperatorEmail(session, req, "cancel_request_forward");
         res.set("Content-Type", "text/xml; charset=utf-8");
         await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
         return res.send(forwardToHumanTwiml());
+      } else {
+        session.step = 1;
+        gatherSpeech(vr, "Ok, mi occupo di annullare la prenotazione. Vuoi fare una nuova richiesta?");
       }
-      sayIt(vr, "Va bene, annullo la prenotazione. Se hai bisogno di altro, chiamami pure.");
-      vr.hangup();
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(vr.toString());
     }
@@ -2002,116 +1901,187 @@ async function handleVoiceRequest(req, res) {
       return res.send(vr.toString());
     }
 
-    if (session.step === "intent") {
-      if (emptySpeech) {
-        const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, tFallback("intent.main")));
-        if (silenceResult.action === "forward") {
+    switch (session.step) {
+      case "intent": {
+        if (!session.intentWelcomed) {
+          sayIt(vr, "Benvenuto da Tuttibrilli.");
+          session.intentWelcomed = true;
+        }
+        if (emptySpeech) {
+          gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni, oppure prenotare un evento?");
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
+
+        const normalized = normalizeText(speech);
+        let intent = null;
+        if (normalized.includes("tavolo") || normalized.includes("prenot")) {
+          intent = "table";
+        } else if (
+          normalized.includes("info") ||
+          normalized.includes("informazioni") ||
+          normalized.includes("orari") ||
+          normalized.includes("menu")
+        ) {
+          intent = "info";
+        } else if (
+          normalized.includes("evento") ||
+          normalized.includes("festa") ||
+          normalized.includes("compleanno")
+        ) {
+          intent = "event";
+        }
+
+        if (!intent) {
+          session.intentRetries += 1;
+        if (session.intentRetries >= 2) {
           await sendFallbackEmail(session, req, "intent_retry_exhausted");
           void sendOperatorEmail(session, req, "intent_retry_exhausted");
           res.set("Content-Type", "text/xml; charset=utf-8");
           await safeCreateFailedCallCalendarEvent(session, req, "fallback");
           return res.send(forwardToHumanTwiml());
         }
-        return res.send(vr.toString());
-
-      }
-
-      const normalized = normalizeText(speech);
-
-      if (normalized.includes("prenot")) {
-        session.intent = "prenotazione";
-        session.step = 1;
-        gatherSpeech(vr, t("step1_welcome_name.main"));
-        return res.send(vr.toString());
-      }
-
-      if (normalized.includes("info") || normalized.includes("informaz") || normalized.includes("evento")) {
-        session.intent = "informazioni";
-        session.step = "info";
-        session.intentWelcomed = true;
-        gatherSpeech(vr, "Cosa vuoi sapere?");
-        break;
-      }
-
-      const infoResponse = await getInfoResponse({ speech, locale: language });
-      if (infoResponse) {
-        sayIt(vr, infoResponse);
-        gatherSpeech(vr, tFallback("intent.short"));
-        break;
-      }
-
-      const confirmation = parseYesNo(speech);
-      if (confirmation === null) {
-        session.intentRetries += 1;
-        if (session.intentRetries >= 2 && canForwardToHuman()) {
-          await sendFallbackEmail(session, req, "intent_retry_exhausted");
-          void sendOperatorEmail(session, req, "intent_retry_exhausted");
+          gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni, oppure prenotare un evento?");
           res.set("Content-Type", "text/xml; charset=utf-8");
-          await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-          return res.send(forwardToHumanTwiml());
+          return res.send(vr.toString());
         }
-        gatherSpeech(vr, tFallback("intent.main"));
-        break;
-      }
 
-      if (confirmation) {
-        session.intent = "prenotazione";
-        session.step = 1;
-        gatherSpeech(vr, t("step1_welcome_name.main"));
-        break;
-      }
+        session.intent = intent;
+        session.intentRetries = 0;
+        resetRetries(session);
 
-      session.intent = "informazioni";
-      session.step = "info";
-      session.intentWelcomed = true;
-      gatherSpeech(vr, "Cosa vuoi sapere?");
-      break;
-    }
+        if (intent === "table") {
+          session.step = 1;
+          gatherSpeech(vr, t("step1_welcome_name.main"));
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
 
-    if (session.step === "info") {
-      if (emptySpeech) {
-        const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Che informazioni ti servono?"));
-        if (silenceResult.action === "forward") {
+        if (intent === "info") {
+          try {
+            const infoResponse = await getInfoResponse({
+              speech,
+              locale: "it-IT",
+            });
+            if (infoResponse && infoResponse.text && !infoResponse.fallback) {
+              sayIt(vr, infoResponse.text);
+              res.set("Content-Type", "text/xml; charset=utf-8");
+              return res.send(vr.toString());
+            }
+          } catch (err) {
+            console.error("[INFO_MATCH] Failed:", err);
+          }
           await sendFallbackEmail(session, req, "info_request");
-          void sendOperatorEmail(session, req, "info_request");
+          if (canForwardToHuman()) {
+            void sendOperatorEmail(session, req, "info_request");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
+            return res.send(forwardToHumanTwiml());
+          }
+          sayIt(vr, "Per informazioni puoi consultare il nostro sito o richiedere un operatore.");
           res.set("Content-Type", "text/xml; charset=utf-8");
-          await safeCreateFailedCallCalendarEvent(session, req, "fallback");
+          return res.send(vr.toString());
+        }
+
+        session.step = "event_name";
+        gatherSpeech(vr, "Perfetto. Come si chiama l'evento?");
+        res.set("Content-Type", "text/xml; charset=utf-8");
+        return res.send(vr.toString());
+      }
+
+      case "event_name": {
+        if (emptySpeech) {
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, "Perfetto. Come si chiama l'evento?")
+          );
+          if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_event_name");
+            void sendOperatorEmail(session, req, "silence_event_name");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
+        }
+        session.eventName = speech.trim().slice(0, 80);
+        resetRetries(session);
+        session.step = "event_date";
+        gatherSpeech(vr, "Per quale data?");
+        break;
+      }
+
+      case "event_date": {
+        if (emptySpeech) {
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, "Per quale data?")
+          );
+          if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_event_date");
+            void sendOperatorEmail(session, req, "silence_event_date");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
+        }
+        const eventDateISO = parseDateIT(speech);
+        if (!eventDateISO) {
+          gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
+          break;
+        }
+        session.eventDateISO = eventDateISO;
+        resetRetries(session);
+        session.step = "event_time";
+        gatherSpeech(vr, "A che ora vuoi prenotare l'evento?");
+        break;
+      }
+
+      case "event_time": {
+        if (emptySpeech) {
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, "A che ora vuoi prenotare l'evento?")
+          );
+          if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_event_time");
+            void sendOperatorEmail(session, req, "silence_event_time");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
+        }
+        const eventTime24 = parseTimeIT(speech);
+        if (!eventTime24) {
+          gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
+          break;
+        }
+        session.eventTime24 = eventTime24;
+        resetRetries(session);
+        const createdEvent = await createEventCalendarEvent(session);
+        if (!createdEvent && canForwardToHuman()) {
+          await sendFallbackEmail(session, req, "event_calendar_failed");
+          void sendOperatorEmail(session, req, "event_calendar_failed");
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
           return res.send(forwardToHumanTwiml());
         }
-        break;
-      }
-
-      const infoResponse = await getInfoResponse({ speech, locale: language });
-      if (infoResponse) {
-        sayIt(vr, infoResponse);
-        gatherSpeech(vr, "Posso aiutarti con altro?");
-        break;
-      }
-
-      const normalized = normalizeText(speech);
-      if (normalized.includes("prenot")) {
-        session.intent = "prenotazione";
-        session.step = 1;
-        gatherSpeech(vr, t("step1_welcome_name.main"));
-        break;
-      }
-
-      if (normalized.includes("no") || normalized.includes("grazie")) {
-        sayIt(vr, "Va bene, buona giornata!");
+        sayIt(vr, "Grazie. Ho registrato la tua richiesta per l'evento. Ti contatteremo presto.");
+        await sendFallbackEmail(session, req, "event_request_completed");
+        if (canForwardToHuman()) {
+          void sendOperatorEmail(session, req, "event_request_completed");
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
+          return res.send(forwardToHumanTwiml());
+        }
         vr.hangup();
         res.set("Content-Type", "text/xml; charset=utf-8");
         return res.send(vr.toString());
       }
 
-      gatherSpeech(vr, "Non ho trovato l'informazione, puoi ripetere?");
-      break;
-    }
-
-    switch (session.step) {
       case 1: {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step1_welcome_name.short"))
+            gatherSpeech(vr, t("step1_welcome_name.main"))
           );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step1");
@@ -2125,14 +2095,14 @@ async function handleVoiceRequest(req, res) {
         session.name = speech.trim().slice(0, 60);
         resetRetries(session);
         session.step = 2;
-        gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" }));
+        gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name }));
         break;
       }
 
       case 2: {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" }))
+            gatherSpeech(vr, t("step3_confirm_date_ask_time.error"))
           );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step2");
@@ -2145,22 +2115,25 @@ async function handleVoiceRequest(req, res) {
         }
         const dateISO = parseDateIT(speech);
         if (!dateISO) {
-          gatherSpeech(vr, "Scusami, non ho capito la data. Puoi ripeterla?");
+          gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
+          break;
+        }
+        if (!isValidDateForReservation(dateISO)) {
+          gatherSpeech(vr, "Mi dispiace, in quella data siamo chiusi. Vuoi provare un'altra data?");
           break;
         }
         session.dateISO = dateISO;
         session.dateLabel = formatDateLabel(dateISO);
-        session.durationMinutes = computeBookingDuration(session);
         resetRetries(session);
         session.step = 3;
-        gatherSpeech(vr, "Perfetto. In quante persone siete?");
+        gatherSpeech(vr, t("step4_ask_party_size.main"));
         break;
       }
 
       case 3: {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "Scusami, non ho capito quante persone. Puoi ripeterlo?")
+            gatherSpeech(vr, t("step4_ask_party_size.main"))
           );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step3");
@@ -2173,20 +2146,30 @@ async function handleVoiceRequest(req, res) {
         }
         const people = parsePeopleIT(speech);
         if (!people) {
-          gatherSpeech(vr, "Scusami, non ho capito in quante persone. Puoi ripeterlo?");
+          gatherSpeech(vr, "Quante persone siete?");
           break;
         }
         session.people = people;
         resetRetries(session);
         session.step = 4;
-        gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel || "" }));
+        gatherSpeech(
+          vr,
+          t("step3_confirm_date_ask_time.main", {
+            dateLabel: session.dateLabel,
+          })
+        );
         break;
       }
 
       case 4: {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel || "" }))
+            gatherSpeech(
+              vr,
+              t("step3_confirm_date_ask_time.main", {
+                dateLabel: session.dateLabel,
+              })
+            )
           );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step4");
@@ -2199,21 +2182,30 @@ async function handleVoiceRequest(req, res) {
         }
         const time24 = parseTimeIT(speech);
         if (!time24) {
-          gatherSpeech(vr, "Scusami, non ho capito l'orario. Puoi ripeterlo?");
+          gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
           break;
         }
         session.time24 = time24;
-        session.liveMusicNoticePending = true;
         resetRetries(session);
         session.step = 5;
-        gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" }));
+        gatherSpeech(
+          vr,
+          t("step5_party_size_ask_notes.main", {
+            partySize: session.people,
+          })
+        );
         break;
       }
 
       case 5: {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" }))
+            gatherSpeech(
+              vr,
+              t("step5_party_size_ask_notes.main", {
+                partySize: session.people,
+              })
+            )
           );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step5");
@@ -2229,26 +2221,15 @@ async function handleVoiceRequest(req, res) {
           break;
         }
         session.specialRequestsRaw = emptySpeech ? "nessuna" : speech.trim().slice(0, 200);
-        if (hasGlutenIntolerance(session.specialRequestsRaw)) {
-          session.glutenPiattoNotice = true;
-        }
         resetRetries(session);
         session.step = 6;
-        gatherSpeech(
-          vr,
-          "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
-        );
+        gatherSpeech(vr, t("step6_preorder.main"));
         break;
       }
 
       case 6: {
         if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(
-              vr,
-              "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
-            )
-          );
+          const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, t("step6_preorder.main")));
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step6");
             void sendOperatorEmail(session, req, "silence_step6");
@@ -2264,83 +2245,69 @@ async function handleVoiceRequest(req, res) {
           session.preorderLabel = "nessuno";
           resetRetries(session);
           session.step = 7;
-          const result = await reserveTableForSession(session, { commit: false });
-          if (result.status === "invalid_time") {
-            session.step = 4;
-            gatherSpeech(vr, "Mi dispiace, quell'orario non è disponibile. Vuoi provare un altro orario?");
-            break;
-          }
-          if (result.status === "closed") {
-            session.step = 2;
-            gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
-            break;
-          }
-          if (result.status === "unavailable") {
+          const check = await checkAvailability(session, { allowSplit: true });
+          if (check.status === "unavailable") {
             session.step = 7;
-            session.forceOperatorFallback = false;
             session.splitRequired = true;
-            gatherSpeech(vr, "Non abbiamo più disponibilità per un unico tavolo. Posco sistemarvi in tavoli separati?");
+            session.forceOperatorFallback = false;
+            gatherSpeech(vr, t("step7_tables_split.main"));
+            break;
+          }
+          if (check.status === "invalid_time") {
+            session.step = 4;
+            gatherSpeech(vr, "Mi dispiace, non ci sono tavoli disponibili a quell'orario. Vuoi un altro orario?");
+            break;
+          }
+          if (check.status === "closed") {
+            session.step = 2;
+            gatherSpeech(vr, "Mi dispiace, in quella data siamo chiusi. Vuoi provare un'altra data?");
             break;
           }
           session.step = 8;
-          gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
+          gatherSpeech(vr, t("step8_phone.main"));
           break;
         }
-        const preorderOption = PREORDER_OPTIONS.find((opt) => normalizeText(opt.label) === normalized);
-        if (!preorderOption) {
-          gatherSpeech(
-            vr,
-            "Scusami, non ho capito. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
-          );
+        const preorderKey = parsePreorderChoice(speech);
+        if (!preorderKey) {
+          gatherSpeech(vr, t("step6_preorder.main"));
           break;
         }
-        session.preorderChoiceKey = preorderOption.key;
-        session.preorderLabel = preorderOption.label;
-        if (preorderOption.constraints.promoOnly) {
-          session.promoEligible = false;
+        session.preorderChoiceKey = preorderKey;
+        const preorderOption = getPreorderOptionByKey(preorderKey);
+        session.preorderLabel = preorderOption?.label || preorderKey;
+        if (preorderOption?.constraints?.promoOnly) {
           session.promoRegistrationNotice = true;
-        }
-        if (preorderOption.key === "piatto_apericena") {
-          session.glutenPiattoNotice = true;
         }
         resetRetries(session);
         session.step = 7;
-
-        const reservationCheck = await reserveTableForSession(session, { commit: false });
-        if (reservationCheck.status === "invalid_time") {
-          session.step = 4;
-          gatherSpeech(vr, "Mi dispiace, quell'orario non è disponibile. Vuoi provare un altro orario?");
-          break;
-        }
-        if (reservationCheck.status === "closed") {
-          session.step = 2;
-          gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
-          break;
-        }
-        if (reservationCheck.status === "unavailable") {
+        const check = await checkAvailability(session, { allowSplit: true });
+        if (check.status === "unavailable") {
           session.step = 7;
-          session.forceOperatorFallback = false;
           session.splitRequired = true;
-          gatherSpeech(vr, "Non abbiamo più disponibilità per un unico tavolo. Posco sistemarvi in tavoli separati?");
+          session.forceOperatorFallback = false;
+          gatherSpeech(vr, t("step7_tables_split.main"));
+          break;
+        }
+        if (check.status === "invalid_time") {
+          session.step = 4;
+          gatherSpeech(vr, "Mi dispiace, non ci sono tavoli disponibili a quell'orario. Vuoi un altro orario?");
+          break;
+        }
+        if (check.status === "closed") {
+          session.step = 2;
+          gatherSpeech(vr, "Mi dispiace, in quella data siamo chiusi. Vuoi provare un'altra data?");
           break;
         }
         session.step = 8;
-        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
+        gatherSpeech(vr, t("step8_phone.main"));
         break;
       }
 
       case 7: {
         if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () => {
-            if (session.outsideRequired) {
-              gatherSpeech(
-                vr,
-                "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
-              );
-            } else {
-              gatherSpeech(vr, "Posco sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
-            }
-          });
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.")
+          );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step7");
             void sendOperatorEmail(session, req, "silence_step7");
@@ -2348,26 +2315,6 @@ async function handleVoiceRequest(req, res) {
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
             return res.send(forwardToHumanTwiml());
           }
-          break;
-        }
-        if (session.outsideRequired) {
-          const confirmation = parseYesNo(speech);
-          if (confirmation === null) {
-            gatherSpeech(
-              vr,
-              "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
-            );
-            break;
-          }
-          if (!confirmation) {
-            session.forceOperatorFallback = true;
-            session.step = 7;
-            gatherSpeech(vr, "Posco sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
-            break;
-          }
-          resetRetries(session);
-          session.step = 8;
-          gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
           break;
         }
         const confirmation = parseYesNo(speech);
