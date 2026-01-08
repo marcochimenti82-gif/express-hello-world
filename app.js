@@ -408,8 +408,7 @@ function requireTwilioVoiceFrom() {
 function forwardToHumanTwiml() {
   const vr = buildTwiml();
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
-  vr.dial({}, OPERATOR_PHONE);
-   return vr.toString();
+ vr.dial({ timeout: 20 }, OPERATOR_PHONE);
 }
 
 function buildFallbackEmailPayload(session, req, reason) {
