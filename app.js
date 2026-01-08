@@ -409,8 +409,7 @@ function forwardToHumanTwiml() {
   const vr = buildTwiml();
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
   vr.dial({}, OPERATOR_PHONE);
-  vr.hangup();
-  return vr.toString();
+   return vr.toString();
 }
 
 function buildFallbackEmailPayload(session, req, reason) {
