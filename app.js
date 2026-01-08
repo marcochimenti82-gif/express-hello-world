@@ -52,6 +52,9 @@ const SMTP_PASS = process.env.EMAIL_PASS || "";
 const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true";
 const EMAIL_TO = process.env.EMAIL_TO || "tuttibrillienoteca@gmail.com";
 const EMAIL_FROM = process.env.EMAIL_FROM || "no-reply@tuttibrilli.local";
+const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || "";
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const EMAIL_OPERATOR = process.env.EMAIL_OPERATOR || EMAIL_TO;
 
 const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "false").toLowerCase() === "true";
 const HUMAN_FORWARD_TO = process.env.HUMAN_FORWARD_TO || "";
@@ -441,8 +444,44 @@ function buildFallbackEmailPayload(session, req, reason) {
   };
 }
 
+async function sendEmailWithResend({ to, subject, text }) {
+  try {
+    if (!RESEND_API_KEY) {
+      console.error("[EMAIL] RESEND_API_KEY is not set");
+      return;
+    }
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: EMAIL_FROM,
+        to: [to],
+        subject: subject,
+        text: text,
+      }),
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("[EMAIL] Resend failed:", response.status, errorText);
+    }
+  } catch (err) {
+    console.error("[EMAIL] Resend failed:", err);
+  }
+}
+
 async function sendFallbackEmail(session, req, reason) {
   const payload = buildFallbackEmailPayload(session, req, reason);
+  if (EMAIL_PROVIDER === "resend") {
+    await sendEmailWithResend({
+      to: EMAIL_OPERATOR,
+      subject: payload.subject,
+      text: payload.text,
+    });
+    return;
+  }
   try {
     if (!SMTP_HOST) {
       console.error("[EMAIL] SMTP_HOST is not set");
@@ -509,6 +548,14 @@ function buildOperatorEmailPayload(session, req, reason) {
 
 async function sendOperatorEmail(session, req, reason) {
   const payload = buildOperatorEmailPayload(session, req, reason);
+  if (EMAIL_PROVIDER === "resend") {
+    await sendEmailWithResend({
+      to: EMAIL_OPERATOR,
+      subject: payload.subject,
+      text: payload.text,
+    });
+    return;
+  }
   try {
     if (!SMTP_HOST) {
       console.error("[EMAIL] SMTP_HOST is not set");
