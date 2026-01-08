@@ -2012,7 +2012,8 @@ async function handleVoiceRequest(req, res) {
           await safeCreateFailedCallCalendarEvent(session, req, "fallback");
           return res.send(forwardToHumanTwiml());
         }
-        break;
+        return res.send(vr.toString());
+
       }
 
       const normalized = normalizeText(speech);
