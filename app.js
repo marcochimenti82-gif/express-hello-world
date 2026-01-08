@@ -18,7 +18,6 @@ if (hasDotenv) {
 const express = require("express");
 const twilio = require("twilio");
 const bodyParser = require("body-parser");
-const nodemailer = require("nodemailer");
 const { google } = require("googleapis");
 
 const { PROMPTS } = require("./prompts");
@@ -39,12 +38,9 @@ const GOOGLE_CALENDAR_TZ = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
 
-const SMTP_HOST = process.env.SMTP_HOST || "";
-const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-const SMTP_USER = process.env.EMAIL_USER || "";
-const SMTP_PASS = process.env.EMAIL_PASS || "";
-const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true";
-const EMAIL_TO = process.env.EMAIL_TO || "tuttibrillienoteca@gmail.com";
+const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || "";
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const EMAIL_OPERATOR = process.env.EMAIL_OPERATOR || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || "no-reply@tuttibrilli.local";
 
 const ENABLE_FORWARDING = (process.env.ENABLE_FORWARDING || "false").toLowerCase() === "true";
@@ -403,11 +399,8 @@ function forwardToHumanTwiml() {
   return vr.toString();
 }
 
-function buildFallbackEmailPayload(session, req, reason) {
-  const caller = req?.body?.From || "";
-  const timestamp = new Date().toISOString();
-  const state = session?.step || "unknown";
-  const data = {
+function buildEmailSessionData(session) {
+  return {
     name: session?.name || "",
     dateISO: session?.dateISO || "",
     time24: session?.time24 || "",
@@ -422,14 +415,59 @@ function buildFallbackEmailPayload(session, req, reason) {
     eventName: session?.eventName || "",
     eventDateISO: session?.eventDateISO || "",
     eventTime24: session?.eventTime24 || "",
+    intent: session?.intent || "",
+    step: session?.step || "unknown",
   };
+}
+
+function canSendEmail() {
+  return (
+    EMAIL_PROVIDER.toLowerCase() === "resend" &&
+    Boolean(RESEND_API_KEY) &&
+    Boolean(EMAIL_FROM) &&
+    Boolean(EMAIL_OPERATOR)
+  );
+}
+
+async function sendResendEmail({ subject, text }) {
+  if (!canSendEmail()) {
+    console.error("[EMAIL] Resend configuration missing");
+    return;
+  }
+  try {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: EMAIL_FROM,
+        to: [EMAIL_OPERATOR],
+        subject,
+        text,
+      }),
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("[EMAIL] Resend send failed:", response.status, errorText);
+    }
+  } catch (err) {
+    console.error("[EMAIL] Resend send failed:", err);
+  }
+}
+
+function buildFallbackEmailPayload(session, req, reason) {
+  const caller = req?.body?.From || "";
+  const timestamp = new Date().toISOString();
+  const data = buildEmailSessionData(session);
+  const phone = data.phone || caller;
   return {
     subject: "Fallback richiesta prenotazione",
     text: [
-      `Numero chiamante: ${caller}`,
+      `Motivo email: ${reason || "non specificato"}`,
+      `Numero cliente: ${phone}`,
       `Timestamp: ${timestamp}`,
-      `Stato flusso: ${state}`,
-      `Motivo fallback: ${reason || "non specificato"}`,
       `Dati raccolti: ${JSON.stringify(data)}`,
     ].join("\n"),
   };
@@ -437,92 +475,30 @@ function buildFallbackEmailPayload(session, req, reason) {
 
 async function sendFallbackEmail(session, req, reason) {
   const payload = buildFallbackEmailPayload(session, req, reason);
-  try {
-    if (!SMTP_HOST) {
-      console.error("[EMAIL] SMTP_HOST is not set");
-      return;
-    }
-    const transporter = nodemailer.createTransport({
-      host: SMTP_HOST,
-      port: SMTP_PORT,
-      secure: SMTP_SECURE,
-      auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-    });
-    await transporter.sendMail({
-      from: EMAIL_FROM,
-      to: EMAIL_TO,
-      subject: payload.subject,
-      text: payload.text,
-    });
-  } catch (err) {
-    console.error("[EMAIL] Fallback email failed:", err);
-  }
+  await sendResendEmail(payload);
 }
 
 async function sendFallbackEmailSmtpOnly(session, req, reason) {
-  if (!SMTP_HOST) return;
   const payload = buildFallbackEmailPayload(session, req, reason);
-  try {
-    const transporter = nodemailer.createTransport({
-      host: SMTP_HOST,
-      port: SMTP_PORT,
-      secure: SMTP_SECURE,
-      auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-    });
-    await transporter.sendMail({
-      from: EMAIL_FROM,
-      to: EMAIL_TO,
-      subject: payload.subject,
-      text: payload.text,
-    });
-  } catch (err) {
-    console.error("[EMAIL] Fallback email failed:", err);
-  }
+  await sendResendEmail(payload);
 }
 
 function buildOperatorEmailPayload(session, req, reason) {
-  const caller = session?.phone || req?.body?.From || "";
-  const state = session?.step || "unknown";
-  const requestType = session?.intent || "";
-  const payload = {
+  const data = buildEmailSessionData(session);
+  const caller = data.phone || req?.body?.From || "";
+  return {
     subject: "Inoltro operatore - contesto prenotazione",
     text: [
+      `Motivo email: ${reason || "non specificato"}`,
       `Numero cliente: ${caller}`,
-      `Tipo richiesta: ${requestType || "non specificato"}`,
-      `Nome cliente: ${session?.name || ""}`,
-      `Data: ${session?.dateISO || ""}`,
-      `Ora: ${session?.time24 || ""}`,
-      `Persone: ${session?.people || ""}`,
-      `Richieste: ${buildSpecialRequestsText(session)}`,
-      `Stato flusso: ${state}`,
-      `Motivo inoltro: ${reason || "non specificato"}`,
+      `Dati raccolti: ${JSON.stringify(data)}`,
     ].join("\n"),
   };
-  return payload;
 }
 
 async function sendOperatorEmail(session, req, reason) {
   const payload = buildOperatorEmailPayload(session, req, reason);
-  try {
-    if (!SMTP_HOST) {
-      console.error("[EMAIL] SMTP_HOST is not set");
-      return;
-    }
-    const transporter = nodemailer.createTransport({
-      host: SMTP_HOST,
-      port: SMTP_PORT,
-      secure: SMTP_SECURE,
-      auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-    });
-    await transporter.sendMail({
-      from: EMAIL_FROM,
-      to: EMAIL_TO,
-      subject: payload.subject,
-      text: payload.text,
-    });
-  } catch (err) {
-    console.error("[EMAIL] Operator email failed:", err);
-  }
+  await sendResendEmail(payload);
 }
 
 async function notifyCriticalReservation(phone, summary) {
@@ -605,84 +581,126 @@ function getSession(callSid) {
       extraRequestsRaw: null,
       liveMusicNoticePending: false,
       liveMusicNoticeSpoken: false,
+      glutenPiattoNoticeSpoken: false,
+      promoRegistrationNoticeSpoken: false,
+      outsideWarningSpoken: false,
       forceOperatorFallback: false,
     });
   }
   return sessions.get(callSid);
 }
 
-function bumpRetries(session) {
-  session.retries = (session.retries || 0) + 1;
-  return session.retries;
-}
 function resetRetries(session) {
   session.retries = 0;
-  resetSilence(session);
-}
-
-function resetSilence(session) {
-  session.silenceStep = null;
   session.silenceRetries = 0;
 }
 
-function handleSilence(session, vr, promptFn) {
-  if (session.silenceStep !== session.step) {
-    session.silenceStep = session.step;
+function trackSilence(session, step) {
+  if (session.silenceStep !== step) {
+    session.silenceStep = step;
     session.silenceRetries = 0;
   }
   session.silenceRetries += 1;
-  if (session.silenceRetries >= 2) {
-    session.silenceRetries = 0;
-    return { action: "forward" };
-  }
-  promptFn();
-  return { action: "prompt" };
+  return session.silenceRetries;
 }
 
-function normalizeText(s) {
-  return String(s || "")
-    .trim()
+function handleSilence(session, vr, onRetry) {
+  const tries = trackSilence(session, session.step);
+  if (tries <= 1) {
+    onRetry();
+    return { action: "retry" };
+  }
+  if (canForwardToHuman()) {
+    return { action: "forward" };
+  }
+  sayIt(vr, t("step9_fallback_transfer_operator.main"));
+  vr.hangup();
+  return { action: "hangup" };
+}
+
+function goBack(session) {
+  if (session.step <= 2) {
+    session.step = 1;
+    return;
+  }
+  session.step -= 1;
+}
+
+function normalizeText(text) {
+  return String(text || "")
     .toLowerCase()
-    .replace(/[.,!?]/g, "")
-    .replace(/\s+/g, " ");
+    .replace(/[.,!?]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripAccents(text) {
+  return String(text || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
 }
 
 function isPureConsent(speech) {
-  const tt = normalizeText(speech);
-  if (!tt) return false;
-  if (YES_WORDS.includes(tt)) return true;
-  const words = tt.split(" ").filter(Boolean);
-  return words.length > 0 && words.every((word) => YES_WORDS.includes(word));
+  const norm = normalizeText(stripAccents(speech || ""));
+  return norm === "si" || norm === "sì" || norm === "ok" || norm === "va bene" || norm === "certo";
 }
 
-function isOperatorRequest(speech) {
-  const tt = normalizeText(speech);
-  return (
-    tt.includes("operatore") ||
-    tt.includes("parlare con qualcuno") ||
-    tt.includes("persona") ||
-    tt.includes("assistenza") ||
-    tt.includes("aiuto")
-  );
-}
-function toISODate(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+function parseYesNo(speech) {
+  const normalized = normalizeText(stripAccents(speech || ""));
+  if (!normalized) return null;
+  if (YES_WORDS.some((w) => normalized.includes(w))) return true;
+  if (NO_WORDS.some((w) => normalized.includes(w))) return false;
+  return null;
 }
 
-function formatDateLabel(dateISO) {
-  const date = new Date(`${dateISO}T00:00:00`);
-  const weekdays = [
-    "domenica",
-    "lunedì",
-    "martedì",
-    "mercoledì",
-    "giovedì",
-    "venerdì",
-    "sabato",
-  ];
+function parsePartySize(speech) {
+  const normalized = normalizeText(stripAccents(speech || ""));
+  const numbers = normalized.match(/\d+/g);
+  if (numbers && numbers.length > 0) {
+    const value = parseInt(numbers[0], 10);
+    if (Number.isFinite(value)) return value;
+  }
+  if (normalized.includes("uno")) return 1;
+  if (normalized.includes("una")) return 1;
+  if (normalized.includes("due")) return 2;
+  if (normalized.includes("tre")) return 3;
+  if (normalized.includes("quattro")) return 4;
+  if (normalized.includes("cinque")) return 5;
+  if (normalized.includes("sei")) return 6;
+  if (normalized.includes("sette")) return 7;
+  if (normalized.includes("otto")) return 8;
+  if (normalized.includes("nove")) return 9;
+  if (normalized.includes("dieci")) return 10;
+  if (normalized.includes("undici")) return 11;
+  if (normalized.includes("dodici")) return 12;
+  return null;
+}
+
+function parseTimeIT(speech) {
+  const normalized = normalizeText(stripAccents(speech || ""));
+  const numbers = normalized.match(/\d+/g);
+  if (!numbers || numbers.length === 0) return null;
+  let hour = parseInt(numbers[0], 10);
+  let minute = 0;
+  if (numbers.length > 1) {
+    minute = parseInt(numbers[1], 10);
+  }
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  if (hour > 24 || minute > 59) return null;
+  if (normalized.includes("mezza")) minute = 30;
+  if (normalized.includes("e un quarto")) minute = 15;
+  if (normalized.includes("e tre quarti")) minute = 45;
+  if (normalized.includes("di mattina") && hour >= 12) hour -= 12;
+  if (normalized.includes("del pomeriggio") && hour < 12) hour += 12;
+  if (normalized.includes("di sera") && hour < 12) hour += 12;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function parseDateISO(speech) {
+  const normalized = normalizeText(stripAccents(speech || ""));
+  const today = new Date();
+  const currentYear = today.getFullYear();
   const months = [
     "gennaio",
     "febbraio",
@@ -697,1201 +715,859 @@ function formatDateLabel(dateISO) {
     "novembre",
     "dicembre",
   ];
-  return `${weekdays[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
+  let day = null;
+  let monthIndex = null;
+  const parts = normalized.split(" ");
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    const numeric = parseInt(part, 10);
+    if (Number.isFinite(numeric) && numeric > 0 && numeric <= 31 && day === null) {
+      day = numeric;
+      continue;
+    }
+    const monthIdx = months.findIndex((m) => part.startsWith(m));
+    if (monthIdx !== -1) {
+      monthIndex = monthIdx;
+    }
+  }
+  if (normalized.includes("oggi")) {
+    day = today.getDate();
+    monthIndex = today.getMonth();
+  }
+  if (normalized.includes("domani")) {
+    const tomorrow = new Date(today);
+    tomorrow.setDate(today.getDate() + 1);
+    day = tomorrow.getDate();
+    monthIndex = tomorrow.getMonth();
+  }
+  if (normalized.includes("dopodomani")) {
+    const after = new Date(today);
+    after.setDate(today.getDate() + 2);
+    day = after.getDate();
+    monthIndex = after.getMonth();
+  }
+  if (day === null || monthIndex === null) return null;
+  const resultDate = new Date(currentYear, monthIndex, day);
+  if (resultDate < today.setHours(0, 0, 0, 0)) {
+    resultDate.setFullYear(currentYear + 1);
+  }
+  const iso = resultDate.toISOString().slice(0, 10);
+  const dateLabel = resultDate.toLocaleDateString("it-IT", {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  });
+  return { iso, label: dateLabel };
 }
 
-// ---- Back/edit commands
-function isBackCommand(speech) {
-  const tt = normalizeText(speech);
-  return (
-    tt.includes("indietro") ||
-    tt.includes("torna indietro") ||
-    tt.includes("tornare indietro") ||
-    tt.includes("errore") ||
-    tt.includes("ho sbagliato") ||
-    tt.includes("sbagliato")
+function normalizeName(name) {
+  if (!name) return "";
+  return String(name || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .split(" ")
+    .map((chunk) => chunk.charAt(0).toUpperCase() + chunk.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function parsePhoneNumber(raw) {
+  if (!raw) return null;
+  const normalized = String(raw).replace(/[^\d+]/g, "");
+  if (!normalized) return null;
+  if (normalized.startsWith("+")) {
+    if (isValidPhoneE164(normalized)) return normalized;
+    return null;
+  }
+  if (normalized.startsWith("00")) {
+    const e164 = `+${normalized.slice(2)}`;
+    if (isValidPhoneE164(e164)) return e164;
+    return null;
+  }
+  if (normalized.startsWith("0")) {
+    const e164 = `+39${normalized}`;
+    if (isValidPhoneE164(e164)) return e164;
+  }
+  if (normalized.length >= 7) {
+    const e164 = `+39${normalized}`;
+    if (isValidPhoneE164(e164)) return e164;
+  }
+  return null;
+}
+
+function getTimeMinutes(time24) {
+  const [hour, minute] = time24.split(":").map((value) => parseInt(value, 10));
+  return hour * 60 + minute;
+}
+
+function isTimeBetween(time24, start, end) {
+  const value = getTimeMinutes(time24);
+  return value >= getTimeMinutes(start) && value <= getTimeMinutes(end);
+}
+
+function isOutsideRequest(speech) {
+  const normalized = normalizeText(stripAccents(speech || ""));
+  return normalized.includes("esterno") || normalized.includes("fuori") || normalized.includes("terrazz");
+}
+
+function hasGlutenIntolerance(text) {
+  const normalized = normalizeText(stripAccents(text || ""));
+  return normalized.includes("celiach") || normalized.includes("glutine");
+}
+
+function buildSpecialRequestsText(session) {
+  if (!session?.specialRequestsRaw || session.specialRequestsRaw === "nessuna") {
+    return "nessuna";
+  }
+  return session.specialRequestsRaw || "nessuna";
+}
+
+function buildExtraRequestsText(session) {
+  if (!session?.extraRequestsRaw || session.extraRequestsRaw === "nessuna") {
+    return "nessuna";
+  }
+  return session.extraRequestsRaw || "nessuna";
+}
+
+function maybeSayOutsideWarning(vr) {
+  if (vr && vr.say && !vr.outsideWarningSpoken) {
+    vr.outsideWarningSpoken = true;
+    sayIt(
+      vr,
+      "Ricordo che la sala esterna non è coperta e in caso di maltempo non posso garantire il cambio all'interno."
+    );
+  }
+}
+
+function maybeSayDivanettiNotice(vr, session) {
+  if (!session.divanettiNoticeSpoken && session.divanettiNotice) {
+    session.divanettiNoticeSpoken = true;
+    sayIt(vr, "Ti informo che per i divanetti serve una consumazione minima.");
+  }
+}
+
+function maybeSayApericenaNotices(vr, session) {
+  if (session.glutenPiattoNotice && !session.glutenPiattoNoticeSpoken) {
+    session.glutenPiattoNoticeSpoken = true;
+    sayIt(vr, "Ti informo che il piatto apericena non è disponibile per celiaci o intolleranti al glutine.");
+  }
+  if (session.promoRegistrationNotice && !session.promoRegistrationNoticeSpoken) {
+    session.promoRegistrationNoticeSpoken = true;
+    sayIt(vr, "Per il piatto apericena in promo serve registrazione sul sito.");
+  }
+}
+
+function maybeSayLiveMusicNotice(vr, session) {
+  if (session.liveMusicNoticePending && !session.liveMusicNoticeSpoken) {
+    session.liveMusicNoticeSpoken = true;
+    sayIt(vr, "Ti informo che è prevista musica dal vivo quella sera.");
+  }
+}
+
+function isDateClosedByCalendar(events) {
+  return events.some((event) => event.summary === "CHIUSO");
+}
+
+function hasLiveMusicEvent(events) {
+  return events.some((event) => event.summary?.toLowerCase().includes("musica dal vivo"));
+}
+
+async function listCalendarEvents(dateISO) {
+  if (!GOOGLE_CALENDAR_ID) return [];
+  const client = getGoogleCalendarClient();
+  if (!client) return [];
+  const start = new Date(`${dateISO}T00:00:00`);
+  const end = new Date(`${dateISO}T23:59:59`);
+  try {
+    const result = await client.events.list({
+      calendarId: GOOGLE_CALENDAR_ID,
+      timeMin: start.toISOString(),
+      timeMax: end.toISOString(),
+      singleEvents: true,
+    });
+    return result?.data?.items || [];
+  } catch (err) {
+    console.error("[CALENDAR] Failed to list events:", err);
+    return [];
+  }
+}
+
+function getGoogleCalendarClient() {
+  const jsonRaw = GOOGLE_SERVICE_ACCOUNT_JSON || "";
+  const jsonB64 = GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
+  let credentials = null;
+  if (jsonB64) {
+    try {
+      const decoded = Buffer.from(jsonB64, "base64").toString("utf8");
+      credentials = JSON.parse(decoded);
+    } catch (err) {
+      console.error("[CALENDAR] Invalid base64 credentials:", err);
+    }
+  }
+  if (!credentials && jsonRaw) {
+    try {
+      credentials = JSON.parse(jsonRaw);
+    } catch (err) {
+      console.error("[CALENDAR] Invalid JSON credentials:", err);
+    }
+  }
+  if (!credentials) return null;
+  try {
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ["https://www.googleapis.com/auth/calendar"],
+    });
+    return google.calendar({ version: "v3", auth });
+  } catch (err) {
+    console.error("[CALENDAR] Failed to create client:", err);
+    return null;
+  }
+}
+
+function calendarGetEventStartDateTime(event) {
+  if (!event?.start) return null;
+  if (event.start.dateTime) return event.start.dateTime;
+  if (event.start.date) return `${event.start.date}T00:00:00`;
+  return null;
+}
+
+function calendarGetEventEndDateTime(event) {
+  if (!event?.end) return null;
+  if (event.end.dateTime) return event.end.dateTime;
+  if (event.end.date) return `${event.end.date}T23:59:59`;
+  return null;
+}
+
+function normalizeCalendarEvent(event) {
+  const start = calendarGetEventStartDateTime(event);
+  const end = calendarGetEventEndDateTime(event);
+  if (!start || !end) return null;
+  const startDate = new Date(start);
+  const endDate = new Date(end);
+  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) return null;
+  const endTime = endDate.toISOString();
+  const summary = event.summary || "";
+  return {
+    summary,
+    start: startDate,
+    end: endDate,
+    endTime,
+    id: event.id,
+    description: event.description || "",
+    location: event.location || "",
+    status: event.status || "",
+  };
+}
+
+function normalizeCalendarEvents(events) {
+  return (events || [])
+    .map((event) => normalizeCalendarEvent(event))
+    .filter((event) => Boolean(event));
+}
+
+function isWithinTimeRange(start, end, time24) {
+  const minutes = getTimeMinutes(time24);
+  const startMinutes = getTimeMinutes(start);
+  const endMinutes = getTimeMinutes(end);
+  return minutes >= startMinutes && minutes <= endMinutes;
+}
+
+function isRestaurantOpenAt(dateISO, time24) {
+  const date = new Date(`${dateISO}T00:00:00`);
+  const day = date.getDay();
+  if (day === OPENING.closedDay) return false;
+  const isFriSat = day === 5 || day === 6;
+  const hours = isFriSat ? OPENING.restaurant.friSat : OPENING.restaurant.default;
+  return isWithinTimeRange(hours.start, hours.end, time24);
+}
+
+function isDrinksOnlyTime(time24) {
+  return isWithinTimeRange(OPENING.drinksOnly.start, OPENING.drinksOnly.end, time24);
+}
+
+function isMusicNight(dateISO) {
+  const date = new Date(`${dateISO}T00:00:00`);
+  const day = date.getDay();
+  return OPENING.musicNights.days.includes(day);
+}
+
+function matchTablesForParty(partySize, prefersOutside) {
+  return TABLES.filter((table) => {
+    if (prefersOutside && table.area !== "outside") return false;
+    if (!prefersOutside && table.area !== "inside") return false;
+    return partySize >= table.min && partySize <= table.max;
+  });
+}
+
+function matchCombinedTablesForParty(partySize, prefersOutside) {
+  return TABLE_COMBINATIONS.filter((combo) => {
+    if (prefersOutside && combo.area !== "outside") return false;
+    if (!prefersOutside && combo.area !== "inside") return false;
+    return partySize >= combo.min && partySize <= combo.max;
+  });
+}
+
+function isTableAvailable(occupiedTables, tableId) {
+  return !occupiedTables.has(tableId);
+}
+
+function buildTableNotes(table) {
+  if (table?.notes) return table.notes;
+  return "";
+}
+
+function getTableLocksForCombination(combo) {
+  return combo.replaces ? combo.replaces : [];
+}
+
+function findAvailableTable(tables, occupiedTables) {
+  return tables.find((table) => isTableAvailable(occupiedTables, table.id)) || null;
+}
+
+function findAvailableCombination(combos, occupiedTables) {
+  return combos.find((combo) => combo.replaces.every((id) => isTableAvailable(occupiedTables, id))) || null;
+}
+
+function getOccupiedTables(events, dateISO, time24) {
+  const normalizedEvents = normalizeCalendarEvents(events);
+  const occupied = new Set();
+  const targetDateTime = new Date(`${dateISO}T${time24}:00`);
+  normalizedEvents.forEach((event) => {
+    const starts = event.start;
+    const ends = event.end;
+    if (targetDateTime >= starts && targetDateTime <= ends) {
+      const summary = event.summary || "";
+      const matches = summary.match(/\bT\d+F?\b/g);
+      if (matches) {
+        matches.forEach((match) => occupied.add(match));
+      }
+    }
+  });
+  return occupied;
+}
+
+function shouldUseSplitTables(partySize) {
+  return partySize >= 8;
+}
+
+function reserveTableFromAvailability(availability) {
+  if (availability.selectedTable) {
+    return {
+      displayId: availability.selectedTable.id,
+      tableLocks: [],
+      notes: buildTableNotes(availability.selectedTable),
+      splitRequired: false,
+      outsideRequired: availability.prefersOutside,
+      critical: false,
+    };
+  }
+  if (availability.selectedCombo) {
+    return {
+      displayId: availability.selectedCombo.displayId,
+      tableLocks: getTableLocksForCombination(availability.selectedCombo),
+      notes: availability.selectedCombo.notes || "",
+      splitRequired: false,
+      outsideRequired: availability.prefersOutside,
+      critical: false,
+    };
+  }
+  return null;
+}
+
+function selectTableForSession(session, events) {
+  const partySize = session.people;
+  const prefersOutside = session.wantsOutside;
+  const occupiedTables = getOccupiedTables(events, session.dateISO, session.time24);
+  const candidates = matchTablesForParty(partySize, prefersOutside);
+  const combos = matchCombinedTablesForParty(partySize, prefersOutside);
+
+  const selectedTable = findAvailableTable(candidates, occupiedTables);
+  if (selectedTable) {
+    return {
+      status: "available",
+      selectedTable,
+      selectedCombo: null,
+      prefersOutside,
+      needsSplit: false,
+    };
+  }
+
+  const selectedCombo = findAvailableCombination(combos, occupiedTables);
+  if (selectedCombo) {
+    return {
+      status: "available",
+      selectedTable: null,
+      selectedCombo,
+      prefersOutside,
+      needsSplit: false,
+    };
+  }
+
+  if (!prefersOutside) {
+    const outsideCandidates = matchTablesForParty(partySize, true);
+    const outsideCombos = matchCombinedTablesForParty(partySize, true);
+    const outsideTable = findAvailableTable(outsideCandidates, occupiedTables);
+    if (outsideTable) {
+      return {
+        status: "needs_outside",
+        selectedTable: outsideTable,
+        selectedCombo: null,
+        prefersOutside: true,
+        needsSplit: false,
+      };
+    }
+    const outsideCombo = findAvailableCombination(outsideCombos, occupiedTables);
+    if (outsideCombo) {
+      return {
+        status: "needs_outside",
+        selectedTable: null,
+        selectedCombo: outsideCombo,
+        prefersOutside: true,
+        needsSplit: false,
+      };
+    }
+  }
+
+  if (shouldUseSplitTables(partySize)) {
+    return {
+      status: "needs_split",
+      selectedTable: null,
+      selectedCombo: null,
+      prefersOutside,
+      needsSplit: true,
+    };
+  }
+
+  return {
+    status: "unavailable",
+    selectedTable: null,
+    selectedCombo: null,
+    prefersOutside,
+    needsSplit: false,
+  };
+}
+
+async function reserveTableForSession(session, { commit }) {
+  if (!session.dateISO || !session.time24 || !session.people) {
+    return { status: "missing" };
+  }
+  if (!isRestaurantOpenAt(session.dateISO, session.time24)) {
+    if (isDrinksOnlyTime(session.time24)) {
+      session.bookingType = "drinksOnly";
+    } else {
+      return { status: "closed" };
+    }
+  }
+  const events = await listCalendarEvents(session.dateISO);
+  if (isDateClosedByCalendar(events)) {
+    return { status: "closed" };
+  }
+  const availability = selectTableForSession(session, events);
+  if (availability.status === "available") {
+    if (commit) {
+      const reservation = reserveTableFromAvailability(availability);
+      session.tableDisplayId = reservation.displayId;
+      session.tableLocks = reservation.tableLocks;
+      session.tableNotes = reservation.notes;
+      session.splitRequired = reservation.splitRequired;
+      session.outsideRequired = reservation.outsideRequired;
+    }
+    return { status: "available" };
+  }
+  if (availability.status === "needs_split") {
+    session.splitRequired = true;
+    return { status: "needs_split" };
+  }
+  if (availability.status === "needs_outside") {
+    session.outsideRequired = true;
+    if (commit) {
+      const reservation = reserveTableFromAvailability(availability);
+      session.tableDisplayId = reservation.displayId;
+      session.tableLocks = reservation.tableLocks;
+      session.tableNotes = reservation.notes;
+      session.splitRequired = reservation.splitRequired;
+      session.outsideRequired = reservation.outsideRequired;
+    }
+    return { status: "needs_outside" };
+  }
+  return { status: "unavailable" };
+}
+
+function buildCalendarEventDescription(session) {
+  const lines = [];
+  if (session.name) lines.push(`Nome: ${session.name}`);
+  if (session.people) lines.push(`Persone: ${session.people}`);
+  if (session.time24) lines.push(`Ora: ${session.time24}`);
+  if (session.specialRequestsRaw) lines.push(`Richieste: ${buildSpecialRequestsText(session)}`);
+  if (session.preorderLabel) lines.push(`Preordine: ${session.preorderLabel}`);
+  if (session.phone) lines.push(`Telefono: ${session.phone}`);
+  if (session.extraRequestsRaw) lines.push(`Richieste extra: ${buildExtraRequestsText(session)}`);
+  if (session.tableLocks && session.tableLocks.length > 0) {
+    lines.push(`Tavoli bloccati: ${session.tableLocks.join(", ")}`);
+  }
+  if (session.tableNotes) lines.push(`Note tavolo: ${session.tableNotes}`);
+  if (session.bookingType === "drinksOnly") lines.push("Tipo: Dopocena");
+  if (session.bookingType === "event") lines.push(`Evento: ${session.eventName || ""}`);
+  if (session.criticalReservation) lines.push("Criticità: sì");
+  return lines.join("\n");
+}
+
+function buildCalendarEventSummary(session) {
+  const name = session.name || "Cliente";
+  const people = session.people || "?";
+  const table = session.tableDisplayId ? `Tavolo ${session.tableDisplayId}` : "Tavolo";
+  const bookingType = session.bookingType === "drinksOnly" ? "Dopocena" : "Cena";
+  if (session.bookingType === "event") {
+    return `${session.eventName || "Evento"} - ${name} (${people})`;
+  }
+  return `${bookingType} - ${table} - ${name} (${people})`;
+}
+
+function buildCalendarEventStart(session) {
+  const dateIso = session.dateISO;
+  const time = session.time24 || "00:00";
+  return `${dateIso}T${time}:00`;
+}
+
+function buildCalendarEventEnd(session) {
+  const start = new Date(buildCalendarEventStart(session));
+  const durationMinutes = session.durationMinutes || 150;
+  const end = new Date(start);
+  end.setMinutes(start.getMinutes() + durationMinutes);
+  return end.toISOString();
+}
+
+async function createCalendarEvent(session) {
+  if (!GOOGLE_CALENDAR_ID) return null;
+  const client = getGoogleCalendarClient();
+  if (!client) return null;
+  const start = buildCalendarEventStart(session);
+  const end = buildCalendarEventEnd(session);
+  if (!session.tableDisplayId) {
+    await reserveTableForSession(session, { commit: true });
+  }
+  const description = buildCalendarEventDescription(session);
+  const summary = buildCalendarEventSummary(session);
+  try {
+    const response = await client.events.insert({
+      calendarId: GOOGLE_CALENDAR_ID,
+      requestBody: {
+        summary,
+        description,
+        start: { dateTime: start, timeZone: GOOGLE_CALENDAR_TZ },
+        end: { dateTime: end, timeZone: GOOGLE_CALENDAR_TZ },
+        location: session.tableDisplayId ? `Tavolo ${session.tableDisplayId}` : undefined,
+      },
+    });
+    session.calendarEventId = response?.data?.id || null;
+    return response?.data || null;
+  } catch (err) {
+    console.error("[CALENDAR] Failed to create event:", err);
+    return null;
+  }
+}
+
+async function getEventsForDay(dateISO) {
+  return await listCalendarEvents(dateISO);
+}
+
+function findEventByName(events, name) {
+  const normalized = normalizeText(stripAccents(name || ""));
+  if (!normalized) return null;
+  return events.find((event) =>
+    normalizeText(stripAccents(event.summary || "")).includes(normalized)
   );
 }
 
-function isCancelCommand(speech) {
-  const tt = normalizeText(speech);
-  return CANCEL_WORDS.some((word) => tt.includes(word));
+function getEventConfigForName(events, name) {
+  const event = findEventByName(events, name);
+  if (!event) return null;
+  const description = event.description || "";
+  const durationMatch = description.match(/durata=(\d+)/i);
+  const bookingTypeMatch = description.match(/tipo=(\w+)/i);
+  const priceMatch = description.match(/prezzo=([\d.]+)/i);
+  const durationMinutes = durationMatch ? parseInt(durationMatch[1], 10) : null;
+  const bookingType = bookingTypeMatch ? bookingTypeMatch[1] : null;
+  const priceEUR = priceMatch ? parseFloat(priceMatch[1]) : null;
+  return {
+    event,
+    durationMinutes,
+    bookingType,
+    priceEUR,
+  };
 }
 
-function goBack(session) {
-  if (!session || typeof session.step !== "number") return;
-  if (session.step <= 1) return;
+async function buildEventOptions(dateISO) {
+  const events = await getEventsForDay(dateISO);
+  const normalized = normalizeCalendarEvents(events);
+  const options = normalized
+    .filter((event) => event.summary && event.summary.toLowerCase() !== "chiuso")
+    .map((event) => event.summary);
+  return options;
+}
 
-  if (session.step === 2) session.step = 1;
-  else if (session.step === 3) session.step = 2;
-  else if (session.step === 4) session.step = 3;
-  else if (session.step === 5) session.step = 4;
-  else if (session.step === 6) session.step = 5;
-  else if (session.step === 7) session.step = 6;
-  else if (session.step === 8) session.step = 7;
-  else if (session.step === 9) session.step = 8;
-  else if (session.step === 10) session.step = 9;
-  else session.step = Math.max(1, session.step - 1);
+function buildEventOptionsText(options) {
+  if (!options || options.length === 0) return "Nessun evento disponibile.";
+  return `Eventi disponibili: ${options.join(", ")}.`;
+}
+
+function parseEventNameFromSpeech(speech, options) {
+  const normalized = normalizeText(stripAccents(speech || ""));
+  const match = options.find((option) => normalized.includes(normalizeText(stripAccents(option))));
+  if (match) return match;
+  return null;
+}
+
+async function askEventName(vr, session) {
+  session.step = "event_name";
+  const options = await buildEventOptions(session.dateISO);
+  if (!options || options.length === 0) {
+    session.step = 1;
+    gatherSpeech(vr, "Mi dispiace, non ci sono eventi disponibili per quella data.");
+    return;
+  }
+  const optionsText = buildEventOptionsText(options);
+  gatherSpeech(vr, `Quale evento vuoi prenotare? ${optionsText}`);
+}
+
+async function askEventDate(vr, session) {
+  session.step = "event_date";
+  gatherSpeech(vr, "Per quale data vuoi prenotare l'evento?");
+}
+
+async function askEventTime(vr, session) {
+  session.step = "event_time";
+  gatherSpeech(vr, "A che ora vuoi prenotare?");
+}
+
+async function handleEventRequest(req, res, session, vr, speech, emptySpeech) {
+  switch (session.step) {
+    case "event_name": {
+      if (emptySpeech) {
+        const silenceResult = handleSilence(session, vr, () =>
+          gatherSpeech(vr, "Non ho sentito il nome dell'evento. Puoi ripetere?")
+        );
+        if (silenceResult.action === "forward") {
+          await sendFallbackEmail(session, req, "silence_event_name");
+          void sendOperatorEmail(session, req, "silence_event_name");
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(forwardToHumanTwiml());
+        }
+        break;
+      }
+      const events = await getEventsForDay(session.dateISO);
+      const options = events.map((event) => event.summary || "");
+      const match = parseEventNameFromSpeech(speech, options);
+      if (!match) {
+        gatherSpeech(vr, "Non ho trovato l'evento. Puoi ripetere il nome?");
+        break;
+      }
+      const config = getEventConfigForName(events, match);
+      session.eventName = match;
+      session.durationMinutes = config?.durationMinutes || null;
+      session.bookingType = config?.bookingType || "event";
+      resetRetries(session);
+      await askEventTime(vr, session);
+      break;
+    }
+    case "event_date": {
+      if (emptySpeech) {
+        const silenceResult = handleSilence(session, vr, () =>
+          gatherSpeech(vr, "Non ho sentito la data. Puoi ripetere?")
+        );
+        if (silenceResult.action === "forward") {
+          await sendFallbackEmail(session, req, "silence_event_date");
+          void sendOperatorEmail(session, req, "silence_event_date");
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(forwardToHumanTwiml());
+        }
+        break;
+      }
+      const parsed = parseDateISO(speech);
+      if (!parsed) {
+        gatherSpeech(vr, "Non ho capito la data. Puoi ripetere?");
+        break;
+      }
+      session.dateISO = parsed.iso;
+      session.dateLabel = parsed.label;
+      resetRetries(session);
+      await askEventName(vr, session);
+      break;
+    }
+    case "event_time": {
+      if (emptySpeech) {
+        const silenceResult = handleSilence(session, vr, () =>
+          gatherSpeech(vr, "Non ho sentito l'orario. Puoi ripetere?")
+        );
+        if (silenceResult.action === "forward") {
+          await sendFallbackEmail(session, req, "silence_event_time");
+          void sendOperatorEmail(session, req, "silence_event_time");
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(forwardToHumanTwiml());
+        }
+        break;
+      }
+      const time24 = parseTimeIT(speech);
+      if (!time24) {
+        gatherSpeech(vr, "Non ho capito l'orario. Puoi ripetere?");
+        break;
+      }
+      session.time24 = time24;
+      const availability = await reserveTableForSession(session, { commit: false });
+      if (availability.status === "closed") {
+        session.step = 1;
+        gatherSpeech(vr, "Mi dispiace, il locale risulta chiuso quel giorno. Vuoi scegliere un'altra data?");
+        break;
+      }
+      if (availability.status === "unavailable") {
+        session.step = 1;
+        gatherSpeech(vr, "Mi dispiace, non ci sono tavoli disponibili a quell'orario.");
+        break;
+      }
+      const calendarEvent = await createCalendarEvent(session);
+      if (!calendarEvent) {
+        await sendFallbackEmail(session, req, "event_calendar_failed");
+      }
+      session.step = 1;
+      sayIt(vr, "Prenotazione evento confermata. Ti aspettiamo.");
+      vr.hangup();
+      res.set("Content-Type", "text/xml; charset=utf-8");
+      await sendFallbackEmail(session, req, "event_request_completed");
+      return res.send(vr.toString());
+    }
+    default:
+      break;
+  }
+  res.set("Content-Type", "text/xml; charset=utf-8");
+  return res.send(vr.toString());
 }
 
 function promptForStep(vr, session) {
   switch (session.step) {
     case 1:
-      gatherSpeech(vr, t("step1_welcome_name.main"));
-      return;
+      gatherSpeech(vr, t("step1_welcome_name.short"));
+      break;
     case 2:
-      gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name || "" }));
-      return;
+      gatherSpeech(vr, t("step2_ask_date.main"));
+      break;
     case 3:
-      gatherSpeech(vr, "Perfetto. In quante persone siete?");
-      return;
+      gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel }));
+      break;
     case 4:
-      gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel || "" }));
-      return;
+      gatherSpeech(vr, t("step4_confirm_time_ask_party_size.main"));
+      break;
     case 5:
-      gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" }));
-      return;
+      gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people }));
+      break;
     case 6:
       gatherSpeech(
         vr,
         "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
       );
-      return;
+      break;
     case 7:
-      gatherSpeech(
-        vr,
-        "Non abbiamo più disponibilità per un unico tavolo. Posco sistemarvi in tavoli separati?"
-      );
-      return;
+      gatherSpeech(vr, "Posso sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
+      break;
     case 8:
       gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
-      return;
+      break;
     case 9:
       gatherSpeech(vr, "Hai altre richieste particolari? Ad esempio sala esterna.");
-      return;
+      break;
     case 10:
       gatherSpeech(
         vr,
-        t("step8_summary_confirm.main", {
-          name: session.name || "",
+        t("step8_summary_confirm.short", {
           dateLabel: session.dateLabel || "",
           time: session.time24 || "",
           partySize: session.people || "",
         })
       );
-      return;
+      break;
+    case "event_date":
+      gatherSpeech(vr, "Per quale data vuoi prenotare l'evento?");
+      break;
+    case "event_name":
+      gatherSpeech(vr, "Quale evento vuoi prenotare?");
+      break;
+    case "event_time":
+      gatherSpeech(vr, "A che ora vuoi prenotare?");
+      break;
     default:
       gatherSpeech(vr, t("step1_welcome_name.short"));
-      return;
+      break;
   }
 }
-
-// ====== parsing basilari (per arrivare al punto: FIX crash step 5) ======
-function parseTimeIT(speech) {
-  const tt = normalizeText(speech);
-  const hm = tt.match(/(\d{1,2})[:\s](\d{2})/);
-  if (hm) {
-    const hh = Number(hm[1]);
-    const mm = Number(hm[2]);
-    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
-      return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
-    }
-  }
-  const onlyH = tt.match(/\b(\d{1,2})\b/);
-  if (onlyH) {
-    const hh = Number(onlyH[1]);
-    if (hh >= 0 && hh <= 23) return `${String(hh).padStart(2, "0")}:00`;
-  }
-  return null;
-}
-
-function parseDateIT(speech) {
-  const tt = normalizeText(speech).replace(/[,\.]/g, " ").replace(/\s+/g, " ").trim();
-  const today = new Date();
-
-  if (tt.includes("oggi")) return toISODate(today);
-  if (tt.includes("domani")) {
-    const next = new Date(today.getTime() + 24 * 60 * 60 * 1000);
-    return toISODate(next);
-  }
-
-  const dmY = tt.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
-  if (dmY) {
-    const dd = Number(dmY[1]);
-    const mm = Number(dmY[2]);
-    let yy = dmY[3] ? Number(dmY[3]) : today.getFullYear();
-    if (yy < 100) yy += 2000;
-    if (dd >= 1 && dd <= 31 && mm >= 1 && mm <= 12) {
-      return toISODate(new Date(yy, mm - 1, dd));
-    }
-  }
-
-  const m = tt.match(
-    /\b(\d{1,2})\s+(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre)(?:\s+(\d{2,4}))?\b/
-  );
-  if (m) {
-    const months = {
-      gennaio: 1,
-      febbraio: 2,
-      marzo: 3,
-      aprile: 4,
-      maggio: 5,
-      giugno: 6,
-      luglio: 7,
-      agosto: 8,
-      settembre: 9,
-      ottobre: 10,
-      novembre: 11,
-      dicembre: 12,
-    };
-    const dd = Number(m[1]);
-    const mm = months[m[2]];
-    let yy = m[3] ? Number(m[3]) : today.getFullYear();
-    if (yy < 100) yy += 2000;
-    if (dd >= 1 && dd <= 31 && mm) return toISODate(new Date(yy, mm - 1, dd));
-  }
-
-  return null;
-}
-
-function parsePeopleIT(speech) {
-  const tt = normalizeText(speech);
-  const m = tt.match(/\b(\d{1,2})\b/);
-  if (!m) return null;
-  const n = Number(m[1]);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return n;
-}
-
-function parseYesNo(speech) {
-  const tt = normalizeText(speech);
-  if (!tt) return null;
-  if (YES_WORDS.some((w) => tt.includes(w))) return true;
-  if (NO_WORDS.some((w) => tt.includes(w))) return false;
-  return null;
-}
-
-function hasGlutenIntolerance(text) {
-  const tt = normalizeText(text);
-  if (!tt) return false;
-  return (
-    tt.includes("celiachia") ||
-    tt.includes("glutine") ||
-    tt.includes("senza glutine") ||
-    tt.includes("intolleranza al glutine")
-  );
-}
-
-function isDivanettiTableId(id) {
-  return id === "T14" || id === "T15";
-}
-
-function isHighTableId(id) {
-  return id === "T16" || id === "T17";
-}
-
-function isDivanettiPreferred(session) {
-  const choice = session?.preorderChoiceKey || "";
-  return choice === "apericena" || choice === "dopocena";
-}
-
-function getApericenaNoticeTexts(session) {
-  const notices = [];
-  if (session?.glutenPiattoNotice) {
-    notices.push(
-      "Ti informo che il piatto apericena e il piatto apericena promo non sono disponibili senza glutine. Il personale di sala potrà consigliarti alternative adatte."
-    );
-  }
-  if (session?.promoRegistrationNotice) {
-    notices.push(
-      "Se non hai ancora fatto la registrazione online, dovrai completarla in struttura per accedere alla promo."
-    );
-  }
-  return notices;
-}
-
-function maybeSayApericenaNotices(vr, session) {
-  const notices = getApericenaNoticeTexts(session);
-  if (notices.length === 0) return;
-  for (const notice of notices) {
-    sayIt(vr, notice);
-  }
-}
-
-function buildSpecialRequestsText(session) {
-  const base = session?.specialRequestsRaw || "nessuna";
-  const notices = getApericenaNoticeTexts(session);
-  const extra = buildExtraRequestsText(session);
-  const parts = [base, `Richiesta finale: ${extra}`];
-  if (notices.length > 0) {
-    parts.push(notices.join(" "));
-  }
-  return parts.join(" | ");
-}
-
-function buildExtraRequestsText(session) {
-  const extra = session?.extraRequestsRaw;
-  if (!extra) return "nessuna";
-  return extra;
-}
-
-function parsePhoneNumber(speech) {
-  if (!speech) return null;
-  if (isValidPhoneE164(speech)) return speech.trim();
-  const digits = String(speech).replace(/[^\d]/g, "");
-  if (digits.length >= 8 && digits.length <= 15) {
-    if (digits.length <= 10) return `+39${digits}`;
-    return `+${digits}`;
-  }
-  return null;
-}
-
-function isOutsideRequest(text) {
-  const tt = normalizeText(text);
-  if (!tt) return false;
-  return (
-    tt.includes("sala esterna") ||
-    tt.includes("esterno") ||
-    tt.includes("all'aperto") ||
-    tt.includes("fuori") ||
-    tt.includes("outdoor") ||
-    tt.includes("dehors")
-  );
-}
-
-function maybeSayOutsideWarning(vr) {
-  sayIt(
-    vr,
-    "La sala esterna non è coperta: in caso di pioggia o brutto tempo il posto interno non è garantito. Se vuoi, ti consiglio la sala interna."
-  );
-}
-
-function maybeSayLiveMusicNotice(vr, session) {
-  if (!session?.liveMusicNoticePending || session.liveMusicNoticeSpoken) return;
-  sayIt(vr, "Ti informo che quella sera è prevista musica live o dj set.");
-  session.liveMusicNoticeSpoken = true;
-}
-
-function getGoogleCredentials() {
-  if (GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
-    try {
-      const decoded = Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
-      return JSON.parse(decoded);
-    } catch (err) {
-      console.error("[GOOGLE] Invalid base64 credentials:", err);
-    }
-  }
-  if (GOOGLE_SERVICE_ACCOUNT_JSON) {
-    try {
-      return JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
-    } catch (err) {
-      console.error("[GOOGLE] Invalid JSON credentials:", err);
-    }
-  }
-  return null;
-}
-
-function buildCalendarClient() {
-  const credentials = getGoogleCredentials();
-  if (!credentials) return null;
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/calendar"],
-  });
-  return google.calendar({ version: "v3", auth });
-}
-
-function getTimeRangeForDate(dateISO) {
-  const start = new Date(`${dateISO}T00:00:00`);
-  const end = new Date(`${dateISO}T23:59:59`);
-  return { start, end };
-}
-
-function isDateClosedByCalendar(events) {
-  return events.some((event) => {
-    const summary = String(event.summary || "").toLowerCase();
-    const description = String(event.description || "").toLowerCase();
-    return summary.includes("locale chiuso") || description.includes("locale chiuso");
-  });
-}
-
-function extractTablesFromEvent(event) {
-  const description = String(event.description || "");
-  const match = description.match(/Tavolo:\s*([^\n]+)/i);
-  const summary = String(event.summary || "");
-  const summaryMatch = summary.match(/tav(?:olo)?\s*([^\-,]+)/i);
-  const tableText = match?.[1] || summaryMatch?.[1];
-  if (!tableText) return [];
-  return tableText
-    .split(/,| e /i)
-    .map((entry) => normalizeTableId(entry))
-    .filter(Boolean);
-}
-
-function getEventTimeRange(event) {
-  const start = event.start?.dateTime || event.start?.date;
-  const end = event.end?.dateTime || event.end?.date;
-  if (!start || !end) return null;
-  return {
-    start: new Date(start),
-    end: new Date(end),
-  };
-}
-
-function overlapsRange(a, b) {
-  return a.start < b.end && b.start < a.end;
-}
-
-function normalizeTableId(raw) {
-  const cleaned = String(raw || "")
-    .replace(/tav(?:olo)?/i, "")
-    .replace(/[^\dA-Z]/gi, "")
-    .toUpperCase();
-  if (!cleaned) return null;
-  return cleaned.startsWith("T") ? cleaned : `T${cleaned}`;
-}
-
-function expandTableLocks(tableId) {
-  const combo = TABLE_COMBINATIONS.find((c) => c.displayId === tableId);
-  if (combo) return combo.replaces;
-  return [tableId];
-}
-
-function isValidTableSelection(selection) {
-  if (!selection || !Array.isArray(selection.locks) || selection.locks.length === 0) return false;
-  const locks = [...selection.locks].sort();
-  if (locks.length === 1) {
-    return selection.displayId === locks[0] && Boolean(getTableById(locks[0]));
-  }
-  const combo = TABLE_COMBINATIONS.find((c) => c.displayId === selection.displayId);
-  if (!combo) return false;
-  const comboLocks = [...combo.replaces].sort();
-  if (comboLocks.length !== locks.length) return false;
-  return comboLocks.every((id, idx) => id === locks[idx]);
-}
-
-function buildAvailableTables(occupied, availableOverride, session) {
-  return TABLES.filter((table) => {
-    if (occupied.has(table.id)) return false;
-    if (availableOverride && !availableOverride.has(table.id)) return false;
-    if (!session?.wantsOutside && table.area === "outside") return false;
-    return true;
-  });
-}
-
-function getTableById(id) {
-  return TABLES.find((table) => table.id === id) || null;
-}
-
-function buildAvailableTableSet(availableTables) {
-  return new Set(availableTables.map((table) => table.id));
-}
-
-function getTablePenalty(tableId, session) {
-  let penalty = 0;
-  if (isHighTableId(tableId)) penalty += 20;
-  if (isDivanettiTableId(tableId) && !isDivanettiPreferred(session)) penalty += 10;
-  if (tableId === "T7") penalty += 5;
-  return penalty;
-}
-
-function pickTableForParty(people, occupied, availableOverride, session) {
-  const availableTables = buildAvailableTables(occupied, availableOverride, session);
-  const availableSet = buildAvailableTableSet(availableTables);
-  const directCandidates = availableTables.filter((table) => people >= table.min && people <= table.max);
-  if (directCandidates.length > 0) {
-    const preferredTwoTopIds = new Set(["T5", "T10", "T13"]);
-    const twoTopCandidates =
-      people === 2 ? directCandidates.filter((table) => preferredTwoTopIds.has(table.id)) : [];
-    const directPool = twoTopCandidates.length > 0 ? twoTopCandidates : directCandidates;
-    const exactCandidates = directPool.filter((table) => table.max === people);
-    const directOptions = exactCandidates.length > 0 ? exactCandidates : directPool;
-    directOptions.sort((a, b) => {
-      const sizeA = a.max;
-      const sizeB = b.max;
-      if (sizeA !== sizeB) return sizeA - sizeB;
-      const penaltyA = getTablePenalty(a.id, session);
-      const penaltyB = getTablePenalty(b.id, session);
-      if (penaltyA !== penaltyB) return penaltyA - penaltyB;
-      return a.id.localeCompare(b.id);
-    });
-    const direct = directOptions[0];
-    return { displayId: direct.id, locks: [direct.id], notes: direct.notes || null };
-  }
-
-  const comboCandidates = [];
-  for (const combo of TABLE_COMBINATIONS) {
-    if (people < combo.min || people > combo.max) continue;
-    const unavailable = combo.replaces.some((id) => occupied.has(id) || !availableSet.has(id));
-    if (!unavailable) comboCandidates.push(combo);
-  }
-  if (comboCandidates.length > 0) {
-    const exactCombos = comboCandidates.filter((combo) => combo.max === people);
-    const comboOptions = exactCombos.length > 0 ? exactCombos : comboCandidates;
-    comboOptions.sort((a, b) => {
-      const sizeA = a.max;
-      const sizeB = b.max;
-      if (sizeA !== sizeB) return sizeA - sizeB;
-      const penaltyA = a.replaces.reduce((sum, id) => sum + getTablePenalty(id, session), 0);
-      const penaltyB = b.replaces.reduce((sum, id) => sum + getTablePenalty(id, session), 0);
-      if (penaltyA !== penaltyB) return penaltyA - penaltyB;
-      return a.displayId.localeCompare(b.displayId);
-    });
-    const combo = comboOptions[0];
-    return { displayId: combo.displayId, locks: combo.replaces, notes: combo.notes || null };
-  }
-  return null;
-}
-
-function pickSplitTables(people, availableTables, session) {
-  const sorted = [...availableTables].sort((a, b) => {
-    const penaltyA = getTablePenalty(a.id, session);
-    const penaltyB = getTablePenalty(b.id, session);
-    if (penaltyA !== penaltyB) return penaltyA - penaltyB;
-    return b.max - a.max;
-  });
-  const selected = [];
-  let remaining = people;
-  let capacity = 0;
-
-  for (const table of sorted) {
-    if (remaining <= 0) break;
-    selected.push(table);
-    capacity += table.max;
-    remaining -= table.max;
-  }
-
-  if (capacity < people || selected.length === 0) return null;
-  return {
-    displayIds: selected.map((table) => table.id),
-    locks: selected.map((table) => table.id),
-    notes: "tavoli separati",
-  };
-}
-
-function getNextDateISO(dateISO) {
-  const date = new Date(`${dateISO}T00:00:00`);
-  date.setDate(date.getDate() + 1);
-  return toISODate(date);
-}
-
-async function listCalendarEvents(dateISO) {
-  if (!GOOGLE_CALENDAR_ID) return [];
-  const calendar = buildCalendarClient();
-  if (!calendar) return [];
-  const { start, end } = getTimeRangeForDate(dateISO);
-  try {
-    const result = await calendar.events.list({
-      calendarId: GOOGLE_CALENDAR_ID,
-      timeMin: start.toISOString(),
-      timeMax: end.toISOString(),
-      singleEvents: true,
-      orderBy: "startTime",
-    });
-    return result?.data?.items || [];
-  } catch (err) {
-    console.error("[GOOGLE] Calendar list failed:", err);
-    return [];
-  }
-}
-
-function formatTimeSlot(date, startDate) {
-  if (!date) return "";
-  if (
-    startDate &&
-    date.getHours() === 0 &&
-    date.getMinutes() === 0 &&
-    date.getTime() > startDate.getTime()
-  ) {
-    return "24:00";
-  }
-  const hh = String(date.getHours()).padStart(2, "0");
-  const mm = String(date.getMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
-}
-
-function timeToMinutes(time) {
-  if (!time || !time.includes(":")) return null;
-  const [h, m] = time.split(":").map((n) => Number(n));
-  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
-  return h * 60 + m;
-}
-
-function getBaseDurationMinutes(people) {
-  if (!Number.isFinite(people)) return 120;
-  if (people <= 4) return 120;
-  if (people <= 8) return 150;
-  if (people <= 15) return 180;
-  return 180;
-}
-
-function hasLiveMusicEvent(events) {
-  return events.some((event) => {
-    const summary = String(event.summary || "").toLowerCase();
-    const description = String(event.description || "").toLowerCase();
-    return (
-      summary.includes("live music") ||
-      description.includes("live music") ||
-      summary.includes("dj set") ||
-      description.includes("dj set")
-    );
-  });
-}
-
-function computeDurationMinutes(session, events) {
-  const baseMinutes = getBaseDurationMinutes(session?.people);
-  const startMinutes = timeToMinutes(session?.time24);
-  if (!events || events.length === 0) return baseMinutes;
-  if (!Number.isFinite(startMinutes)) return baseMinutes;
-  if (startMinutes < 20 * 60) return baseMinutes;
-  if ((session?.people || 0) > 8) return baseMinutes;
-  if (!hasLiveMusicEvent(events)) return baseMinutes;
-  return baseMinutes + 30;
-}
-
-function maybeSayDivanettiNotice(vr, session) {
-  if (!session?.divanettiNotice || session.divanettiNoticeSpoken) return;
-  sayIt(vr, "Ti abbiamo riservato l’area divanetti, ideale per aperitivo e dopocena.");
-  session.divanettiNoticeSpoken = true;
-}
-
-function buildAvailabilityDescription(dateISO, events) {
-  const tableIds = TABLES.map((table) => table.id);
-  const occupancy = new Map(tableIds.map((id) => [id, []]));
-  const bookingRange = {
-    start: new Date(`${dateISO}T00:00:00`),
-    end: new Date(`${dateISO}T23:59:59`),
-  };
-
-  for (const event of events) {
-    const summary = String(event.summary || "").toLowerCase();
-    const eventType = event.extendedProperties?.private?.type || "";
-    if (summary.startsWith("annullata")) continue;
-    if (summary.includes("tavoli disponibili")) continue;
-    if (summary.includes("locale chiuso")) continue;
-    if (summary.includes("evento") || eventType === "evento") continue;
-    const eventRange = getEventTimeRange(event);
-    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
-    const tableIdsForEvent = extractTablesFromEvent(event)
-      .flatMap(expandTableLocks)
-      .filter((id) => occupancy.has(id));
-    for (const tableId of tableIdsForEvent) {
-      occupancy.get(tableId).push({
-        start: eventRange.start,
-        end: eventRange.end,
-      });
-    }
-  }
-
-  const lines = tableIds.map((tableId) => {
-    const slots = occupancy.get(tableId) || [];
-    slots.sort((a, b) => a.start - b.start);
-    if (slots.length === 0) {
-      return `${tableId}:`;
-    }
-    const slotText = slots
-      .map((slot) => {
-        const start = formatTimeSlot(slot.start);
-        const end = formatTimeSlot(slot.end, slot.start);
-        return `occupato dalle ${start} alle ${end};`;
-      })
-      .join(" ");
-    return `${tableId}: ${slotText}`;
-  });
-
-  return lines.join("\n");
-}
-
-async function upsertAvailabilityEvent(dateISO) {
-  if (!GOOGLE_CALENDAR_ID) return null;
-  const calendar = buildCalendarClient();
-  if (!calendar) return null;
-  const events = await listCalendarEvents(dateISO);
-  const availabilityEvent = events.find((event) =>
-    String(event.summary || "").toLowerCase().includes("tavoli disponibili")
-  );
-  const description = buildAvailabilityDescription(dateISO, events);
-  const requestBody = {
-    summary: "Tavoli disponibili",
-    description,
-    start: { date: dateISO },
-    end: { date: getNextDateISO(dateISO) },
-  };
-
-  try {
-    if (availabilityEvent?.id) {
-      const result = await calendar.events.patch({
-        calendarId: GOOGLE_CALENDAR_ID,
-        eventId: availabilityEvent.id,
-        requestBody,
-      });
-      return result?.data || null;
-    }
-    const result = await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID,
-      requestBody,
-    });
-    return result?.data || null;
-  } catch (err) {
-    console.error("[GOOGLE] Availability event update failed:", err);
-    return null;
-  }
-}
-
-async function reserveTableForSession(session, { commit } = { commit: false }) {
-  const events = await listCalendarEvents(session.dateISO);
-  if (isDateClosedByCalendar(events)) {
-    return { status: "closed" };
-  }
-
-  session.forceOperatorFallback = false;
-  session.divanettiNotice = false;
-  session.divanettiNoticeSpoken = false;
-  session.durationMinutes = computeDurationMinutes(session, events);
-  const bookingStart = new Date(`${session.dateISO}T${session.time24}:00`);
-  const bookingEnd = new Date(bookingStart.getTime() + (session.durationMinutes || 120) * 60 * 1000);
-  const bookingRange = { start: bookingStart, end: bookingEnd };
-  const occupied = new Set();
-  const eventoEvents = [];
-
-  for (const event of events) {
-    const summary = String(event.summary || "").toLowerCase();
-    if (summary.startsWith("annullata")) continue;
-    if (summary.includes("evento")) {
-      eventoEvents.push(event);
-      continue;
-    }
-    const eventRange = getEventTimeRange(event);
-    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
-    const tableIds = extractTablesFromEvent(event);
-    tableIds.flatMap(expandTableLocks).forEach((id) => occupied.add(id));
-  }
-
-  let availableOverride = null;
-  if (eventoEvents.length > 0) {
-    const eventTables = eventoEvents
-      .flatMap((event) => extractTablesFromEvent(event))
-      .flatMap((id) => expandTableLocks(id));
-    availableOverride = new Set(eventTables);
-  }
-
-  const selection = pickTableForParty(session.people, occupied, availableOverride, session);
-  if (!selection) {
-    const availableTables = buildAvailableTables(occupied, availableOverride, session);
-    const availableSet = buildAvailableTableSet(availableTables);
-    if (session.people === 12) {
-      const comboT14 = TABLE_COMBINATIONS.find(
-        (combo) => combo.displayId === "T14" && combo.replaces.length === 2 && combo.replaces.includes("T15")
-      );
-      const comboT7T11 = TABLE_COMBINATIONS.find(
-        (combo) =>
-          combo.displayId === "T11" &&
-          combo.replaces.length === 4 &&
-          combo.replaces.includes("T7") &&
-          combo.replaces.includes("T11") &&
-          combo.replaces.includes("T12") &&
-          combo.replaces.includes("T13")
-      );
-      const hasComboT14 = comboT14 && comboT14.replaces.every((id) => availableSet.has(id));
-      const hasComboT7T11 = comboT7T11 && comboT7T11.replaces.every((id) => availableSet.has(id));
-      if (!hasComboT14 && !hasComboT7T11) {
-        session.criticalReservation = true;
-        session.tableDisplayId = "T10";
-        session.tableLocks = ["T10"];
-        session.tableNotes = null;
-        session.divanettiNotice = false;
-        session.divanettiNoticeSpoken = false;
-        session.splitRequired = false;
-        session.outsideRequired = false;
-        return { status: "ok", selection: { displayId: "T10", locks: ["T10"], notes: null } };
-      }
-    }
-    const insideTables = availableTables.filter((table) => table.area === "inside");
-    const insideSplit = pickSplitTables(session.people, insideTables, session);
-    if (insideSplit) {
-      session.tableDisplayId = insideSplit.displayIds.join(" e ");
-      session.tableLocks = insideSplit.locks;
-      session.tableNotes = insideSplit.notes;
-      session.divanettiNotice = insideSplit.locks.some((id) => isDivanettiTableId(id));
-      session.divanettiNoticeSpoken = false;
-      session.splitRequired = true;
-      session.outsideRequired = false;
-      return { status: "needs_split" };
-    }
-
-    const anySplit = pickSplitTables(session.people, availableTables, session);
-    if (anySplit) {
-      session.tableDisplayId = anySplit.displayIds.join(" e ");
-      session.tableLocks = anySplit.locks;
-      session.tableNotes = anySplit.notes;
-      session.divanettiNotice = anySplit.locks.some((id) => isDivanettiTableId(id));
-      session.divanettiNoticeSpoken = false;
-      session.splitRequired = true;
-      session.outsideRequired = anySplit.locks.some((id) => getTableById(id)?.area === "outside");
-      return { status: "needs_outside" };
-    }
-
-    return { status: "unavailable" };
-  }
-  if (!isValidTableSelection(selection)) {
-    session.forceOperatorFallback = true;
-    session.tableDisplayId = null;
-    session.tableLocks = [];
-    session.tableNotes = null;
-    return { status: "unavailable" };
-  }
-  session.tableDisplayId = selection.displayId;
-  session.tableLocks = selection.locks;
-  session.tableNotes = selection.notes;
-  session.divanettiNotice = selection.locks.some((id) => isDivanettiTableId(id));
-  session.divanettiNoticeSpoken = false;
-  session.splitRequired = false;
-  session.outsideRequired = selection.locks.some((id) => getTableById(id)?.area === "outside");
-
-  if (commit && eventoEvents.length > 0) {
-    const calendar = buildCalendarClient();
-    if (calendar) {
-      for (const event of eventoEvents) {
-        const eventTables = extractTablesFromEvent(event);
-        const remaining = eventTables.filter((id) => !selection.locks.includes(id));
-        const availableCount = remaining.length;
-        const updatedSummary = `Evento - tavoli disponibili: ${availableCount}`;
-        const baseDescription = String(event.description || "");
-        const updatedDescription = baseDescription.match(/Tavolo:\s*/i)
-          ? baseDescription.replace(/Tavolo:\s*[^\n]*/i, `Tavolo: ${remaining.join(", ")}`)
-          : `${baseDescription}\nTavolo: ${remaining.join(", ")}`.trim();
-        try {
-          await calendar.events.patch({
-            calendarId: GOOGLE_CALENDAR_ID,
-            eventId: event.id,
-            requestBody: {
-              summary: updatedSummary,
-              description: updatedDescription,
-            },
-          });
-        } catch (err) {
-          console.error("[GOOGLE] Calendar event update failed:", err);
-        }
-      }
-    }
-  }
-
-  return { status: "ok", selection };
-}
-
-async function cancelCalendarEvent(session) {
-  if (!session?.calendarEventId) return null;
-  const calendar = buildCalendarClient();
-  if (!calendar) return null;
-  const summary = session.calendarEventSummary || "";
-  const summaryWithoutTable = summary.replace(/,\s*tav[^,]+/i, "").trim();
-  const updatedSummary = summaryWithoutTable.startsWith("Annullata")
-    ? summaryWithoutTable
-    : `Annullata - ${summaryWithoutTable}`;
-
-  try {
-    const result = await calendar.events.patch({
-      calendarId: GOOGLE_CALENDAR_ID,
-      eventId: session.calendarEventId,
-      requestBody: {
-        summary: updatedSummary,
-        description: [
-          `Nome: ${session.name || ""}`,
-          `Persone: ${session.people || ""}`,
-          `Note: ${buildSpecialRequestsText(session)}`,
-          `Preordine: ${session.preorderLabel || "nessuno"}`,
-          "Tavolo: ",
-          `Telefono: ${session.phone || "non fornito"}`,
-        ].join("\n"),
-      },
-    });
-    if (session.dateISO) {
-      await upsertAvailabilityEvent(session.dateISO);
-    }
-    return result?.data || null;
-  } catch (err) {
-    console.error("[GOOGLE] Calendar cancel update failed:", err);
-    return null;
-  }
-}
-
-async function createCalendarEvent(session) {
-  if (!GOOGLE_CALENDAR_ID) return null;
-  const calendar = buildCalendarClient();
-  if (!calendar) return null;
-  if (!session?.dateISO || !session?.time24 || !session?.name || !session?.people) return null;
-
-  const reservation = await reserveTableForSession(session, { commit: true });
-  if (reservation.status === "closed") return { status: "closed" };
-  if (reservation.status === "unavailable") return { status: "unavailable" };
-
-  const startDateTime = `${session.dateISO}T${session.time24}:00`;
-  const endDate = new Date(`${session.dateISO}T${session.time24}:00`);
-  endDate.setMinutes(endDate.getMinutes() + (session.durationMinutes || 120));
-  const endDateTime = `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, "0")}-${String(
-    endDate.getDate()
-  ).padStart(2, "0")}T${String(endDate.getHours()).padStart(2, "0")}:${String(
-    endDate.getMinutes()
-  ).padStart(2, "0")}:00`;
-
-  const tableLabel = session.tableLocks?.length
-    ? session.tableLocks.join(" e ")
-    : session.tableDisplayId || "da assegnare";
-  const event = {
-    summary: `Ore ${session.time24}, tav ${tableLabel}, ${session.name}, ${session.people} pax`,
-    description: [
-      `Nome: ${session.name}`,
-      `Persone: ${session.people}`,
-      `Note: ${buildSpecialRequestsText(session)}`,
-      `Preordine: ${session.preorderLabel || "nessuno"}`,
-      `Tavolo: ${tableLabel}`,
-      `Telefono: ${session.phone || "non fornito"}`,
-    ].join("\n"),
-    start: { dateTime: startDateTime, timeZone: GOOGLE_CALENDAR_TZ },
-    end: { dateTime: endDateTime, timeZone: GOOGLE_CALENDAR_TZ },
-  };
-  if (session.criticalReservation) {
-    event.colorId = CRITICAL_COLOR_ID;
-  }
-
-  try {
-    const result = await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID,
-      requestBody: event,
-    });
-    const data = result?.data || null;
-    if (data?.id) {
-      session.calendarEventId = data.id;
-      session.calendarEventSummary = data.summary || event.summary;
-    }
-    await upsertAvailabilityEvent(session.dateISO);
-    return data;
-  } catch (err) {
-    console.error("[GOOGLE] Calendar insert failed:", err);
-    return null;
-  }
-}
-
-async function createEventCalendarEvent(session) {
-  if (!GOOGLE_CALENDAR_ID) return null;
-  const calendar = buildCalendarClient();
-  if (!calendar) return null;
-  if (!session?.eventDateISO || !session?.eventTime24 || !session?.eventName) return null;
-
-  const startDateTime = `${session.eventDateISO}T${session.eventTime24}:00`;
-  const endDate = new Date(`${session.eventDateISO}T${session.eventTime24}:00`);
-  endDate.setMinutes(endDate.getMinutes() + 120);
-  const endDateTime = `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, "0")}-${String(
-    endDate.getDate()
-  ).padStart(2, "0")}T${String(endDate.getHours()).padStart(2, "0")}:${String(
-    endDate.getMinutes()
-  ).padStart(2, "0")}:00`;
-
-  const event = {
-    summary: `Evento - ${session.eventName}`,
-    description: [
-      `Nome evento: ${session.eventName}`,
-      `Data: ${session.eventDateISO}`,
-      `Ora: ${session.eventTime24}`,
-    ].join("\n"),
-    start: { dateTime: startDateTime, timeZone: GOOGLE_CALENDAR_TZ },
-    end: { dateTime: endDateTime, timeZone: GOOGLE_CALENDAR_TZ },
-    extendedProperties: {
-      private: {
-        type: "evento",
-      },
-    },
-  };
-
-  try {
-    const result = await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID,
-      requestBody: event,
-    });
-    return result?.data || null;
-  } catch (err) {
-    console.error("[GOOGLE] Event insert failed:", err);
-    return null;
-  }
-}
-
-// ======================= ROUTES =======================
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-app.post("/call/outbound", async (req, res) => {
-  try {
-    const to = String(req.body?.to || "").trim();
-    if (!to || !isValidPhoneE164(to)) {
-      return res.status(400).json({ ok: false, error: "Invalid 'to' number" });
-    }
-    if (!twilioClient) {
-      return res.status(500).json({ ok: false, error: "Twilio not configured" });
-    }
-    const fromNumber = requireTwilioVoiceFrom();
-    const twimlUrl = BASE_URL ? `${BASE_URL}/twilio/voice/outbound` : "/twilio/voice/outbound";
-    const call = await twilioClient.calls.create({
-      to,
-      from: fromNumber,
-      url: twimlUrl,
-      method: "POST",
-    });
-    return res.json({ ok: true, callSid: call.sid });
-  } catch (err) {
-    console.error("[OUTBOUND] Error:", err);
-    if (err && err.message === "TWILIO_VOICE_FROM is not set") {
-      return res.status(500).json({ ok: false, error: "TWILIO_VOICE_FROM not set" });
-    }
-    return res.status(500).json({ ok: false });
-  }
-});
-
-app.post("/twilio/voice/outbound", (req, res) => {
-  try {
-    const vr = buildTwiml();
-    vr.say(
-      { language: "it-IT", voice: "alice" },
-      xmlEscape("Ciao! Ti chiamiamo da TuttiBrilli per un aggiornamento sulla tua prenotazione. Grazie.")
-    );
-    vr.hangup();
-    res.set("Content-Type", "text/xml; charset=utf-8");
-    return res.send(vr.toString());
-  } catch (err) {
-    console.error("[OUTBOUND_TWIML] Error:", err);
-    return res.status(500).send("Error");
-  }
-});
 
 async function handleVoiceRequest(req, res) {
-  const callSid = req.body.CallSid || "";
-  const speech = req.body.SpeechResult || "";
-  const session = getSession(callSid);
   const vr = buildTwiml();
-
+  let session = null;
   try {
+    const callSid = req.body.CallSid || req.body.callSid;
+    session = getSession(callSid);
     if (!session) {
+      console.error("[VOICE] Missing session");
       await sendFallbackEmail(session, req, "session_error");
+      res.set("Content-Type", "text/xml; charset=utf-8");
+      return res.send(vr.toString());
+    }
+
+    const speech = req.body.SpeechResult || "";
+    const emptySpeech = !speech || !speech.trim();
+
+    if (session.intent === "operator") {
       if (canForwardToHuman()) {
-        void sendOperatorEmail(session, req, "session_error");
+        await sendFallbackEmail(session, req, "operator_request");
         res.set("Content-Type", "text/xml; charset=utf-8");
         return res.send(forwardToHumanTwiml());
       }
-      sayIt(vr, "Ti passo un operatore per completare la richiesta.");
+      sayIt(vr, t("step9_fallback_transfer_operator.main"));
       vr.hangup();
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(vr.toString());
     }
 
-    const emptySpeech = !normalizeText(speech);
-
-    if (!emptySpeech && isOperatorRequest(speech)) {
-      await sendFallbackEmail(session, req, "operator_request");
+    if (session.intent === "cancel") {
       if (canForwardToHuman()) {
-        void sendOperatorEmail(session, req, "operator_request");
-        res.set("Content-Type", "text/xml; charset=utf-8");
-        return res.send(forwardToHumanTwiml());
-      }
-      sayIt(vr, "Ti passo un operatore per completare la richiesta.");
-      vr.hangup();
-      res.set("Content-Type", "text/xml; charset=utf-8");
-      return res.send(vr.toString());
-    }
-
-    if (session.step !== "intent" && !emptySpeech && isCancelCommand(speech)) {
-      const canceled = await cancelCalendarEvent(session);
-      if (canceled) {
-        session.step = 1;
-        gatherSpeech(vr, "Ho annullato la prenotazione. Vuoi prenotare di nuovo?");
-      } else if (canForwardToHuman()) {
         await sendFallbackEmail(session, req, "cancel_request_forward");
-        void sendOperatorEmail(session, req, "cancel_request_forward");
         res.set("Content-Type", "text/xml; charset=utf-8");
         return res.send(forwardToHumanTwiml());
-      } else {
-        session.step = 1;
-        gatherSpeech(vr, "Ok, mi occupo di annullare la prenotazione. Vuoi fare una nuova richiesta?");
       }
+      sayIt(vr, t("step9_fallback_transfer_operator.main"));
+      vr.hangup();
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(vr.toString());
     }
 
-    if (session.step !== "intent" && !emptySpeech && isBackCommand(speech)) {
-      resetRetries(session);
-      goBack(session);
-      promptForStep(vr, session);
+    if (session.intent === "info") {
+      const infoResponse = await getInfoResponse({
+        speech,
+        locale: req.body?.FromCountry || "it-it",
+      });
+      if (infoResponse?.text) {
+        sayIt(vr, infoResponse.text);
+      } else {
+        sayIt(vr, t("step9_fallback_transfer_operator.main"));
+      }
+      vr.hangup();
       res.set("Content-Type", "text/xml; charset=utf-8");
+      await sendFallbackEmail(session, req, "info_request");
       return res.send(vr.toString());
+    }
+
+    if (session.intent === "event") {
+      return await handleEventRequest(req, res, session, vr, speech, emptySpeech);
     }
 
     switch (session.step) {
       case "intent": {
         if (!session.intentWelcomed) {
-          sayIt(vr, "Benvenuto da Tuttibrilli.");
           session.intentWelcomed = true;
-        }
-        if (emptySpeech) {
-          gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni, oppure prenotare un evento?");
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-
-        const normalized = normalizeText(speech);
-        let intent = null;
-        if (normalized.includes("tavolo") || normalized.includes("prenot")) {
-          intent = "table";
-        } else if (
-          normalized.includes("info") ||
-          normalized.includes("informazioni") ||
-          normalized.includes("orari") ||
-          normalized.includes("menu")
-        ) {
-          intent = "info";
-        } else if (
-          normalized.includes("evento") ||
-          normalized.includes("festa") ||
-          normalized.includes("compleanno")
-        ) {
-          intent = "event";
-        }
-
-        if (!intent) {
-          session.intentRetries += 1;
-        if (session.intentRetries >= 2) {
-          await sendFallbackEmail(session, req, "intent_retry_exhausted");
-          void sendOperatorEmail(session, req, "intent_retry_exhausted");
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(forwardToHumanTwiml());
-        }
-          gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni, oppure prenotare un evento?");
+          gatherSpeech(vr, t("step1_welcome_name.short"));
           break;
         }
-
-        session.intent = intent;
-        session.intentRetries = 0;
-        resetRetries(session);
-
-        if (intent === "table") {
-          session.step = 1;
-          gatherSpeech(vr, t("step1_welcome_name.main"));
-          break;
-        }
-
-        if (intent === "info") {
-          try {
-            const infoResponse = await getInfoResponse({
-              speech,
-              locale: "it-IT",
-            });
-            if (infoResponse && infoResponse.text && !infoResponse.fallback) {
-              sayIt(vr, infoResponse.text);
-              res.set("Content-Type", "text/xml; charset=utf-8");
-              return res.send(vr.toString());
-            }
-          } catch (err) {
-            console.error("[INFO_MATCH] Failed:", err);
-          }
-          await sendFallbackEmail(session, req, "info_request");
-          if (canForwardToHuman()) {
-            void sendOperatorEmail(session, req, "info_request");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(forwardToHumanTwiml());
-          }
-          sayIt(vr, "Per informazioni puoi consultare il nostro sito o richiedere un operatore.");
-          break;
-        }
-
-        session.step = "event_name";
-        gatherSpeech(vr, "Perfetto. Come si chiama l'evento?");
-        break;
-      }
-
-      case "event_name": {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "Perfetto. Come si chiama l'evento?")
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_event_name");
-            void sendOperatorEmail(session, req, "silence_event_name");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        session.eventName = speech.trim().slice(0, 80);
-        resetRetries(session);
-        session.step = "event_date";
-        gatherSpeech(vr, "Per quale data vuoi prenotare l'evento?");
-        break;
-      }
-
-      case "event_date": {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "Per quale data vuoi prenotare l'evento?")
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_event_date");
-            void sendOperatorEmail(session, req, "silence_event_date");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        const eventDateISO = parseDateIT(speech);
-        if (!eventDateISO) {
-          gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
-          break;
-        }
-        session.eventDateISO = eventDateISO;
-        resetRetries(session);
-        session.step = "event_time";
-        gatherSpeech(vr, "A che ora vuoi prenotare l'evento?");
-        break;
-      }
-
-      case "event_time": {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "A che ora vuoi prenotare l'evento?")
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_event_time");
-            void sendOperatorEmail(session, req, "silence_event_time");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        const eventTime24 = parseTimeIT(speech);
-        if (!eventTime24) {
-          gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
-          break;
-        }
-        session.eventTime24 = eventTime24;
-        resetRetries(session);
-        const createdEvent = await createEventCalendarEvent(session);
-        if (!createdEvent && canForwardToHuman()) {
-          await sendFallbackEmail(session, req, "event_calendar_failed");
-          void sendOperatorEmail(session, req, "event_calendar_failed");
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(forwardToHumanTwiml());
-        }
-        sayIt(vr, "Grazie. Ho registrato la tua richiesta per l'evento. Ti contatteremo presto.");
-        await sendFallbackEmail(session, req, "event_request_completed");
-        if (canForwardToHuman()) {
-          void sendOperatorEmail(session, req, "event_request_completed");
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(forwardToHumanTwiml());
-        }
-        vr.hangup();
-        res.set("Content-Type", "text/xml; charset=utf-8");
-        return res.send(vr.toString());
-      }
-
-      case 1: {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step1_welcome_name.main"))
+            gatherSpeech(vr, t("step1_welcome_name.short"))
           );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step1");
@@ -1901,17 +1577,84 @@ async function handleVoiceRequest(req, res) {
           }
           break;
         }
-        session.name = speech.trim().slice(0, 60);
+        const normalized = normalizeText(stripAccents(speech));
+        if (normalized.includes("operatore")) {
+          session.intent = "operator";
+          if (canForwardToHuman()) {
+            await sendFallbackEmail(session, req, "operator_request");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
+          sayIt(vr, t("step9_fallback_transfer_operator.main"));
+          vr.hangup();
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
+        if (normalized.includes("annulla") || normalized.includes("cancella")) {
+          session.intent = "cancel";
+          if (canForwardToHuman()) {
+            await sendFallbackEmail(session, req, "cancel_request_forward");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
+          sayIt(vr, t("step9_fallback_transfer_operator.main"));
+          vr.hangup();
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
+        if (normalized.includes("informazioni") || normalized.includes("info")) {
+          session.intent = "info";
+          const infoResponse = await getInfoResponse({
+            speech,
+            locale: req.body?.FromCountry || "it-it",
+          });
+          if (infoResponse?.text) {
+            sayIt(vr, infoResponse.text);
+          } else {
+            sayIt(vr, t("step9_fallback_transfer_operator.main"));
+          }
+          vr.hangup();
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          await sendFallbackEmail(session, req, "info_request");
+          return res.send(vr.toString());
+        }
+        if (normalized.includes("evento")) {
+          session.intent = "event";
+          session.step = "event_date";
+          await askEventDate(vr, session);
+          break;
+        }
+        session.intent = "booking";
+        session.step = 1;
+        gatherSpeech(vr, t("step1_welcome_name.short"));
+        break;
+      }
+
+      case 1: {
+        if (emptySpeech) {
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, t("step1_welcome_name.short"))
+          );
+          if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step1");
+            void sendOperatorEmail(session, req, "silence_step1");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
+        }
+        const name = normalizeName(speech);
+        session.name = name;
         resetRetries(session);
         session.step = 2;
-        gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name }));
+        gatherSpeech(vr, t("step2_ask_date.main"));
         break;
       }
 
       case 2: {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step3_confirm_date_ask_time.error"))
+            gatherSpeech(vr, t("step2_ask_date.main"))
           );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step2");
@@ -1921,23 +1664,23 @@ async function handleVoiceRequest(req, res) {
           }
           break;
         }
-        const dateISO = parseDateIT(speech);
-        if (!dateISO) {
-          gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
+        const parsed = parseDateISO(speech);
+        if (!parsed) {
+          gatherSpeech(vr, t("step2_ask_date.error"));
           break;
         }
-        session.dateISO = dateISO;
+        session.dateISO = parsed.iso;
+        session.dateLabel = parsed.label;
         resetRetries(session);
         session.step = 3;
-        session.dateLabel = formatDateLabel(dateISO);
-        gatherSpeech(vr, "Perfetto. In quante persone siete?");
+        gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel }));
         break;
       }
 
       case 3: {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step5_party_size_ask_notes.error"))
+            gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel }))
           );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step3");
@@ -1947,8 +1690,33 @@ async function handleVoiceRequest(req, res) {
           }
           break;
         }
-        const people = parsePeopleIT(speech);
-        if (!people) {
+        const time24 = parseTimeIT(speech);
+        if (!time24) {
+          gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
+          break;
+        }
+        session.time24 = time24;
+        resetRetries(session);
+        session.step = 4;
+        gatherSpeech(vr, t("step4_confirm_time_ask_party_size.main"));
+        break;
+      }
+
+      case 4: {
+        if (emptySpeech) {
+          const silenceResult = handleSilence(session, vr, () =>
+            gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"))
+          );
+          if (silenceResult.action === "forward") {
+            await sendFallbackEmail(session, req, "silence_step4");
+            void sendOperatorEmail(session, req, "silence_step4");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(forwardToHumanTwiml());
+          }
+          break;
+        }
+        const people = parsePartySize(speech);
+        if (!people || people < 1 || people > 18) {
           gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
           break;
         }
