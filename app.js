@@ -405,11 +405,14 @@ function requireTwilioVoiceFrom() {
   }
   return TWILIO_VOICE_FROM;
 }
-
 function forwardToHumanTwiml() {
   const vr = buildTwiml();
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
- vr.dial({ timeout: 20 }, OPERATOR_PHONE);
+    if (isValidPhoneE164(OPERATOR_PHONE)) {
+    const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice/operator-fallback` : "/twilio/voice/operator-fallback";
+    vr.dial({ timeout: 20, action: actionUrl, method: "POST" }, OPERATOR_PHONE);
+  }
+  return vr.toString();
 }
 
 function buildFallbackEmailPayload(session, req, reason) {
@@ -2555,11 +2558,19 @@ app.all("/twilio/voice", async (req, res) => {
   res.set("Content-Type", "text/xml; charset=utf-8");
   return res.send(vr.toString());
 });
+app.post("/twilio/voice/operator-fallback", (req, res) => {
+  const vr = buildTwiml();
+  sayIt(vr, "Operatore non disponibile al momento.");
+  vr.hangup();
+  res.set("Content-Type", "text/xml; charset=utf-8");
+  return res.send(vr.toString());
+});
 
 app.all("/voice", (req, res) => {
   const targetUrl = BASE_URL ? `${BASE_URL}/twilio/voice` : "/twilio/voice";
   return res.redirect(307, targetUrl);
 });
+
 
 // NOTA: /finalize lo rimettiamo dopo, quando confermi che non cade più allo step 5.
 // (non serve per risolvere il crash delle intolleranze)
