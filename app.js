@@ -413,7 +413,11 @@ function forwardToHumanTwiml() {
   const operatorPhone = getOperatorPhoneE164();
   if (operatorPhone) {
     const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice/operator-fallback` : "/twilio/voice/operator-fallback";
-    vr.dial({ timeout: 20, action: actionUrl, method: "POST" }, operatorPhone);
+    const dialOpts = { timeout: 20, action: actionUrl, method: "POST", answerOnBridge: true };
+    if (TWILIO_VOICE_FROM && isValidPhoneE164(TWILIO_VOICE_FROM)) {
+      dialOpts.callerId = TWILIO_VOICE_FROM.trim();
+    }
+    vr.dial(dialOpts, operatorPhone);
   }
   return vr.toString();
 }
@@ -2565,9 +2569,22 @@ app.all("/twilio/voice", async (req, res) => {
   return res.send(vr.toString());
 });
 app.post("/twilio/voice/operator-fallback", (req, res) => {
+  const body = req && req.body ? req.body : {};
+  const dialStatus = String(body.DialCallStatus || "").trim().toLowerCase();
+  try {
+    console.log("[operator-fallback] DialCallStatus:", dialStatus || "(missing)", "DialCallDuration:", body.DialCallDuration || "", "To:", body.To || "", "From:", body.From || "");
+  } catch (_) {}
+
   const vr = buildTwiml();
-  sayIt(vr, "Operatore non disponibile al momento.");
-  vr.hangup();
+
+  // If the call was actually connected and completed, do not speak any fallback message.
+  if (dialStatus === "completed") {
+    vr.hangup();
+  } else {
+    sayIt(vr, "Operatore non disponibile al momento.");
+    vr.hangup();
+  }
+
   res.set("Content-Type", "text/xml; charset=utf-8");
   return res.send(vr.toString());
 });
