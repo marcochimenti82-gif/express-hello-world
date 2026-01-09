@@ -1002,7 +1002,10 @@ function buildExtraRequestsText(session) {
 function parsePhoneNumber(speech) {
   if (!speech) return null;
   if (isValidPhoneE164(speech)) return speech.trim();
-  const digits = String(speech).replace(/[^\d]/g, "");
+  let digits = String(speech).replace(/[^\d]/g, "");
+  if (digits.startsWith("00")) {
+    digits = digits.slice(2);
+  }
   if (digits.length >= 8 && digits.length <= 15) {
     if (digits.length <= 10) return `+39${digits}`;
     return `+${digits}`;
