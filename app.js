@@ -410,21 +410,24 @@ function requireTwilioVoiceFrom() {
 function forwardToHumanTwiml(req) {
   const vr = buildTwiml();
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
+
   const operatorPhone = getOperatorPhoneE164();
   if (operatorPhone) {
-    const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice/operator-fallback` : "/twilio/voice/operator-fallback";
-    const dialAttrs = { timeout: 20, action: actionUrl, method: "POST", answerOnBridge: true };
+    const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice/after-dial` : "/twilio/voice/after-dial";
 
-    // Usa un callerId stabile (numero Twilio). In alternativa usa il "To" della chiamata in ingresso (numero Twilio chiamato).
-    const candidateCallerIds = [];
-    if (isValidPhoneE164(TWILIO_VOICE_FROM)) candidateCallerIds.push(TWILIO_VOICE_FROM.trim());
+    const dialAttrs = { timeout: 25, action: actionUrl, method: "POST", answerOnBridge: true };
+
+    // callerId stabile (preferisci numero Twilio; fallback: numero chiamato in ingresso)
+    const candidates = [];
+    if (isValidPhoneE164(TWILIO_VOICE_FROM)) candidates.push(TWILIO_VOICE_FROM.trim());
     const inboundTo = req?.body?.To || req?.body?.Called || "";
     const inboundToE164 = parsePhoneNumber(inboundTo);
-    if (inboundToE164 && isValidPhoneE164(inboundToE164)) candidateCallerIds.push(inboundToE164);
-    if (candidateCallerIds.length > 0) dialAttrs.callerId = candidateCallerIds[0];
+    if (isValidPhoneE164(inboundToE164)) candidates.push(inboundToE164);
+    if (candidates.length > 0) dialAttrs.callerId = candidates[0];
 
     vr.dial(dialAttrs, operatorPhone);
   }
+
   return vr.toString();
 }
 
@@ -568,4 +571,10 @@ async function sendOperatorEmail(session, req, reason) {
     await sendEmailWithResend({
       to: EMAIL_OPERATOR,
       subject: payload.subject,
-      text: payloa
+      text: payload.text,
+    });
+    return;
+  }
+  try {
+    if (!SMTP_HOST) {
+      console.error("[EMAIL] SMTP_HOST is no
