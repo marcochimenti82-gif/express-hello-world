@@ -407,17 +407,23 @@ function requireTwilioVoiceFrom() {
   }
   return TWILIO_VOICE_FROM;
 }
-function forwardToHumanTwiml() {
+function forwardToHumanTwiml(req) {
   const vr = buildTwiml();
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
   const operatorPhone = getOperatorPhoneE164();
   if (operatorPhone) {
     const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice/operator-fallback` : "/twilio/voice/operator-fallback";
-    const dialOpts = { timeout: 20, action: actionUrl, method: "POST", answerOnBridge: true };
-    if (TWILIO_VOICE_FROM && isValidPhoneE164(TWILIO_VOICE_FROM)) {
-      dialOpts.callerId = TWILIO_VOICE_FROM.trim();
-    }
-    vr.dial(dialOpts, operatorPhone);
+    const dialAttrs = { timeout: 20, action: actionUrl, method: "POST", answerOnBridge: true };
+
+    // Usa un callerId stabile (numero Twilio). In alternativa usa il "To" della chiamata in ingresso (numero Twilio chiamato).
+    const candidateCallerIds = [];
+    if (isValidPhoneE164(TWILIO_VOICE_FROM)) candidateCallerIds.push(TWILIO_VOICE_FROM.trim());
+    const inboundTo = req?.body?.To || req?.body?.Called || "";
+    const inboundToE164 = parsePhoneNumber(inboundTo);
+    if (inboundToE164 && isValidPhoneE164(inboundToE164)) candidateCallerIds.push(inboundToE164);
+    if (candidateCallerIds.length > 0) dialAttrs.callerId = candidateCallerIds[0];
+
+    vr.dial(dialAttrs, operatorPhone);
   }
   return vr.toString();
 }
@@ -1800,7 +1806,7 @@ async function handleVoiceRequest(req, res) {
         void sendOperatorEmail(session, req, "session_error");
         res.set("Content-Type", "text/xml; charset=utf-8");
         await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
-        return res.send(forwardToHumanTwiml());
+        return res.send(forwardToHumanTwiml(req));
       }
       sayIt(vr, "Ti passo un operatore per completare la richiesta.");
       await safeCreateFailedCallCalendarEvent(session, req, "fallback");
@@ -1817,7 +1823,7 @@ async function handleVoiceRequest(req, res) {
         void sendOperatorEmail(session, req, "operator_request");
         res.set("Content-Type", "text/xml; charset=utf-8");
         await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
-        return res.send(forwardToHumanTwiml());
+        return res.send(forwardToHumanTwiml(req));
       }
       sayIt(vr, "Ti passo un operatore per completare la richiesta.");
       await safeCreateFailedCallCalendarEvent(session, req, "fallback");
@@ -1836,7 +1842,7 @@ async function handleVoiceRequest(req, res) {
         void sendOperatorEmail(session, req, "cancel_request_forward");
         res.set("Content-Type", "text/xml; charset=utf-8");
         await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
-        return res.send(forwardToHumanTwiml());
+        return res.send(forwardToHumanTwiml(req));
       } else {
         session.step = 1;
         gatherSpeech(vr, "Ok, mi occupo di annullare la prenotazione. Vuoi fare una nuova richiesta?");
@@ -1891,7 +1897,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "intent_retry_exhausted");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni, oppure prenotare un evento?");
           break;
@@ -1926,7 +1932,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "info_request");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           sayIt(vr, "Per informazioni puoi consultare il nostro sito o richiedere un operatore.");
           break;
@@ -1947,7 +1953,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_event_name");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -1968,7 +1974,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_event_date");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -1994,7 +2000,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_event_time");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -2011,7 +2017,7 @@ async function handleVoiceRequest(req, res) {
           void sendOperatorEmail(session, req, "event_calendar_failed");
           res.set("Content-Type", "text/xml; charset=utf-8");
           await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
-          return res.send(forwardToHumanTwiml());
+          return res.send(forwardToHumanTwiml(req));
         }
         sayIt(vr, "Grazie. Ho registrato la tua richiesta per l'evento. Ti contatteremo presto.");
         await sendFallbackEmail(session, req, "event_request_completed");
@@ -2019,7 +2025,7 @@ async function handleVoiceRequest(req, res) {
           void sendOperatorEmail(session, req, "event_request_completed");
           res.set("Content-Type", "text/xml; charset=utf-8");
           await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
-          return res.send(forwardToHumanTwiml());
+          return res.send(forwardToHumanTwiml(req));
         }
         vr.hangup();
         res.set("Content-Type", "text/xml; charset=utf-8");
@@ -2036,7 +2042,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_step1");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -2057,7 +2063,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_step2");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -2084,7 +2090,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_step3");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -2121,7 +2127,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_step4");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -2147,7 +2153,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_step5");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -2173,7 +2179,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_step6");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -2253,7 +2259,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "invalid_table_combo");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           if (session.forceOperatorFallback) {
             sayIt(vr, t("step9_fallback_transfer_operator.main"));
@@ -2294,7 +2300,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_step7");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -2316,7 +2322,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "split_declined");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           sayIt(vr, t("step9_fallback_transfer_operator.main"));
           await safeCreateFailedCallCalendarEvent(session, req, "fallback");
@@ -2340,7 +2346,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_step8");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -2393,7 +2399,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_step9");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -2456,7 +2462,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "silence_step10");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           break;
         }
@@ -2490,7 +2496,7 @@ async function handleVoiceRequest(req, res) {
             void sendOperatorEmail(session, req, "invalid_table_combo");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
+            return res.send(forwardToHumanTwiml(req));
           }
           if (session.forceOperatorFallback) {
             sayIt(vr, t("step9_fallback_transfer_operator.main"));
@@ -2508,7 +2514,7 @@ async function handleVoiceRequest(req, res) {
           void sendOperatorEmail(session, req, "calendar_insert_failed");
           res.set("Content-Type", "text/xml; charset=utf-8");
           await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
-          return res.send(forwardToHumanTwiml());
+          return res.send(forwardToHumanTwiml(req));
         }
         resetRetries(session);
         session.step = 1;
@@ -2524,7 +2530,7 @@ async function handleVoiceRequest(req, res) {
           void sendOperatorEmail(session, req, "unknown_step");
           res.set("Content-Type", "text/xml; charset=utf-8");
           await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
-          return res.send(forwardToHumanTwiml());
+          return res.send(forwardToHumanTwiml(req));
         }
         resetRetries(session);
         session.step = 1;
@@ -2543,7 +2549,7 @@ async function handleVoiceRequest(req, res) {
       void sendOperatorEmail(session, req, "exception");
       res.set("Content-Type", "text/xml; charset=utf-8");
       await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
-      return res.send(forwardToHumanTwiml());
+      return res.send(forwardToHumanTwiml(req));
     }
     sayIt(vr, t("step9_fallback_transfer_operator.main"));
     await safeCreateFailedCallCalendarEvent(session, req, "fallback");
@@ -2569,22 +2575,21 @@ app.all("/twilio/voice", async (req, res) => {
   return res.send(vr.toString());
 });
 app.post("/twilio/voice/operator-fallback", (req, res) => {
-  const body = req && req.body ? req.body : {};
-  const dialStatus = String(body.DialCallStatus || "").trim().toLowerCase();
-  try {
-    console.log("[operator-fallback] DialCallStatus:", dialStatus || "(missing)", "DialCallDuration:", body.DialCallDuration || "", "To:", body.To || "", "From:", body.From || "");
-  } catch (_) {}
-
+  const status = String(req?.body?.DialCallStatus || "").toLowerCase();
+  console.log("[DIAL] operator-fallback", {
+    status,
+    dialCallSid: req?.body?.DialCallSid || "",
+    dialCallDuration: req?.body?.DialCallDuration || "",
+    to: req?.body?.To || "",
+  });
   const vr = buildTwiml();
-
-  // If the call was actually connected and completed, do not speak any fallback message.
-  if (dialStatus === "completed") {
+  if (status === "completed") {
+    // La chiamata con l’operatore si è conclusa: chiudiamo senza messaggi aggiuntivi.
     vr.hangup();
   } else {
-    sayIt(vr, "Operatore non disponibile al momento.");
+    sayIt(vr, "Non riesco a collegarti a un operatore in questo momento. Verrai ricontattato appena possibile.");
     vr.hangup();
   }
-
   res.set("Content-Type", "text/xml; charset=utf-8");
   return res.send(vr.toString());
 });
