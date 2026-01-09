@@ -410,32 +410,23 @@ function requireTwilioVoiceFrom() {
 function forwardToHumanTwiml(req) {
   const vr = buildTwiml();
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
-
   const operatorPhone = getOperatorPhoneE164();
   if (operatorPhone) {
-    const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice/after-dial` : "/twilio/voice/after-dial";
-    const dialAttrs = { timeout: 25, action: actionUrl, method: "POST", answerOnBridge: true };
+    const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice/operator-fallback` : "/twilio/voice/operator-fallback";
+    const dialAttrs = { timeout: 20, action: actionUrl, method: "POST", answerOnBridge: true };
 
-    // callerId: prefer numero Twilio configurato; in alternativa il numero chiamato in ingresso (To/Called) se valido.
-    const candidates = [];
-    if (isValidPhoneE164(TWILIO_VOICE_FROM)) candidates.push(String(TWILIO_VOICE_FROM).trim());
-    try {
-      const inboundTo = req?.body?.To || req?.body?.Called || req?.body?.To || "";
-      const inboundToE164 = inboundTo ? parsePhoneNumber(inboundTo) : null;
-      if (inboundToE164 && isValidPhoneE164(inboundToE164)) candidates.push(inboundToE164);
-    } catch (err) {
-      // ignore
-    }
-    if (candidates.length > 0) dialAttrs.callerId = candidates[0];
+    // Usa un callerId stabile (numero Twilio). In alternativa usa il "To" della chiamata in ingresso (numero Twilio chiamato).
+    const candidateCallerIds = [];
+    if (isValidPhoneE164(TWILIO_VOICE_FROM)) candidateCallerIds.push(TWILIO_VOICE_FROM.trim());
+    const inboundTo = req?.body?.To || req?.body?.Called || "";
+    const inboundToE164 = parsePhoneNumber(inboundTo);
+    if (inboundToE164 && isValidPhoneE164(inboundToE164)) candidateCallerIds.push(inboundToE164);
+    if (candidateCallerIds.length > 0) dialAttrs.callerId = candidateCallerIds[0];
 
     vr.dial(dialAttrs, operatorPhone);
-  } else {
-    vr.hangup();
   }
-
   return vr.toString();
 }
-
 
 function buildFallbackEmailPayload(session, req, reason) {
   const caller = req?.body?.From || "";
@@ -575,4 +566,6 @@ async function sendOperatorEmail(session, req, reason) {
   const payload = buildOperatorEmailPayload(session, req, reason);
   if (EMAIL_PROVIDER === "resend") {
     await sendEmailWithResend({
-     
+      to: EMAIL_OPERATOR,
+      subject: payload.subject,
+      text: payloa
