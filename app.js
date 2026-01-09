@@ -1,4 +1,5 @@
 
+
 "use strict";
 
 const fs = require("fs");
@@ -409,10 +410,6 @@ function forwardToHumanTwiml() {
   const vr = buildTwiml();
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
  vr.dial({ timeout: 20 }, OPERATOR_PHONE);
-}if (isValidPhoneE164(OPERATOR_PHONE)) {
-    vr.dial({ timeout: 20 }, OPERATOR_PHONE);
-  }
-  return vr.toString();
 }
 
 function buildFallbackEmailPayload(session, req, reason) {
