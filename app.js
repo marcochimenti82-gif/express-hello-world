@@ -395,8 +395,12 @@ function gatherSpeech(response, promptText) {
 function isValidPhoneE164(s) {
   return /^\+\d{8,15}$/.test(String(s || "").trim());
 }
+function getOperatorPhoneE164() {
+  if (!OPERATOR_PHONE) return null;
+  return parsePhoneNumber(OPERATOR_PHONE);
+}
 function canForwardToHuman() {
-  return ENABLE_FORWARDING && Boolean(OPERATOR_PHONE) && isValidPhoneE164(OPERATOR_PHONE);
+  return ENABLE_FORWARDING && Boolean(getOperatorPhoneE164());
 }
 
 function requireTwilioVoiceFrom() {
@@ -408,11 +412,13 @@ function requireTwilioVoiceFrom() {
 function forwardToHumanTwiml() {
   const vr = buildTwiml();
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
-    if (isValidPhoneE164(OPERATOR_PHONE)) {
+  const operatorPhone = getOperatorPhoneE164();
+  if (operatorPhone) {
     const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice/operator-fallback` : "/twilio/voice/operator-fallback";
-    vr.dial({ timeout: 20, action: actionUrl, method: "POST" }, OPERATOR_PHONE);
+    vr.dial({ timeout: 20, action: actionUrl, method: "POST" }, operatorPhone);
   }
   return vr.toString();
+}
 }
 
 function buildFallbackEmailPayload(session, req, reason) {
