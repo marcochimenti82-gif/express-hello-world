@@ -1886,7 +1886,7 @@ async function handleVoiceRequest(req, res) {
       if (emptySpeech || isPureConsent(speech)) {
         session.operatorReasonTries = Number(session.operatorReasonTries || 0) + 1;
         if (session.operatorReasonTries < 2) {
-          gatherSpeech(vr, "Qual è il motivo della richiesta?");
+          gatherSpeech(vr, session.operatorRetryPrompt || "Qual è il motivo della richiesta?");
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(vr.toString());
         }
@@ -1912,14 +1912,20 @@ async function handleVoiceRequest(req, res) {
       // Evita la creazione automatica dell'evento "chiamata interrotta" su ogni risposta HTTP
       session.fallbackEventCreated = true;
 
+      
+
+      // Registra sempre la richiesta di ricontatto prima di tentare il trasferimento live
+      void safeCreateOperatorCallbackCalendarEvent(session, req, "requested");
+
       session.operatorState = null;
+      session.operatorPrompt = null;
+      session.operatorRetryPrompt = null;
 
       if (canDialLive) {
         res.set("Content-Type", "text/xml; charset=utf-8");
         return res.send(forwardToHumanTwiml(req));
       }
 
-      void safeCreateOperatorCallbackCalendarEvent(session, req, "precheck_failed");
       sayIt(vr, "Perfetto. Ti faremo richiamare al più presto.");
       vr.hangup();
       res.set("Content-Type", "text/xml; charset=utf-8");
@@ -1930,7 +1936,9 @@ async function handleVoiceRequest(req, res) {
       session.operatorState = "await_reason";
       session.operatorReasonTries = 0;
       session.operatorReasonRaw = null;
-      gatherSpeech(vr, "Va bene. Dimmi in poche parole il motivo della richiesta.");
+      session.operatorPrompt = "Va bene. Dimmi in poche parole il motivo della richiesta.";
+      session.operatorRetryPrompt = "Qual è il motivo della richiesta?";
+      gatherSpeech(vr, session.operatorPrompt);
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(vr.toString());
     }
@@ -2011,37 +2019,34 @@ async function handleVoiceRequest(req, res) {
 
         if (intent === "table") {
           session.step = 1;
-          gatherSpeech(vr, t("step1_welcome_name.main"));
+          gatherSpeech(vr, "Perfetto, prenotiamo il tuo tavolo. Come ti chiami?");
           break;
         }
 
         if (intent === "info") {
-          try {
-            const infoResponse = await getInfoResponse({
-              speech,
-              locale: "it-IT",
-            });
-            if (infoResponse && infoResponse.text && !infoResponse.fallback) {
-              sayIt(vr, infoResponse.text);
-              res.set("Content-Type", "text/xml; charset=utf-8");
-              return res.send(vr.toString());
-            }
-          } catch (err) {
-            console.error("[INFO_MATCH] Failed:", err);
-          }
-          await sendFallbackEmail(session, req, "info_request");
-          if (canForwardToHuman()) {
-            void sendOperatorEmail(session, req, "info_request");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
-            return res.send(forwardToHumanTwiml());
-          }
-          sayIt(vr, "Per informazioni puoi consultare il nostro sito o richiedere un operatore.");
+          // Procedura ibrida: raccogli motivo, registra su Calendar e tenta inoltro operatore
+          session.operatorState = "await_reason";
+          session.operatorReasonTries = 0;
+          session.operatorReasonRaw = null;
+          session.operatorPrompt = "Va bene. Dimmi in poche parole di quali informazioni hai bisogno.";
+          session.operatorRetryPrompt = "Di quali informazioni hai bisogno?";
+          gatherSpeech(vr, session.operatorPrompt);
           break;
         }
 
-        session.step = "event_name";
-        gatherSpeech(vr, "Perfetto. Come si chiama l'evento?");
+        if (intent === "event") {
+          // Procedura ibrida: raccogli motivo, registra su Calendar e tenta inoltro operatore
+          session.operatorState = "await_reason";
+          session.operatorReasonTries = 0;
+          session.operatorReasonRaw = null;
+          session.operatorPrompt = "Va bene. Dimmi in poche parole i dettagli dell\'evento e cosa ti serve.";
+          session.operatorRetryPrompt = "Quali dettagli dell\'evento e cosa ti serve?";
+          gatherSpeech(vr, session.operatorPrompt);
+          break;
+        }
+
+        // Sicurezza: se per qualche motivo non siamo entrati in nessun intent
+        gatherSpeech(vr, "Vuoi prenotare un tavolo, chiedere informazioni, oppure prenotare un evento?");
         break;
       }
 
