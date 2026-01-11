@@ -1440,8 +1440,9 @@ async function reserveTableForSession(session, { commit } = { commit: false }) {
 
   for (const event of events) {
     const summary = String(event.summary || "").toLowerCase();
+    const eventType = event.extendedProperties?.private?.type || "";
     if (summary.startsWith("annullata")) continue;
-    if (summary.includes("evento")) {
+    if (eventType === "evento" || summary.includes("evento")) {
       eventoEvents.push(event);
       continue;
     }
@@ -1453,10 +1454,14 @@ async function reserveTableForSession(session, { commit } = { commit: false }) {
 
   let availableOverride = null;
   if (eventoEvents.length > 0) {
+    const validTableIds = new Set(TABLES.map((table) => table.id));
     const eventTables = eventoEvents
       .flatMap((event) => extractTablesFromEvent(event))
-      .flatMap((id) => expandTableLocks(id));
-    availableOverride = new Set(eventTables);
+      .flatMap((id) => expandTableLocks(id))
+      .filter((id) => validTableIds.has(id));
+    if (eventTables.length > 0) {
+      availableOverride = new Set(eventTables);
+    }
   }
 
   const selection = pickTableForParty(session.people, occupied, availableOverride, session);
