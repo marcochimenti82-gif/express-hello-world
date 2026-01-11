@@ -40,6 +40,13 @@ const BASE_URL = process.env.BASE_URL || "";
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_VOICE_FROM = process.env.TWILIO_VOICE_FROM || "";
+// ======================= OPENAI (per risposte intelligenti su WhatsApp) =======================
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const AI_ENABLED = (process.env.AI_ENABLED || "true").toLowerCase() === "true";
+const AI_MAX_OUTPUT_TOKENS = Number(process.env.AI_MAX_OUTPUT_TOKENS || 250);
+const BUSINESS_NAME = process.env.BUSINESS_NAME || "TuttiBrilli";
+const BUSINESS_CONTEXT = process.env.BUSINESS_CONTEXT || "";
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "";
 const GOOGLE_CALENDAR_TZ = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
@@ -1827,7 +1834,410 @@ function buildMessagingTwimlReply(text) {
   return mr.toString();
 }
 
-function handleTwilioInboundMessage(req, res) {
+// ======================= WHATSAPP AI / CHAT FLOW =======================
+// Nota: questa sezione riguarda SOLO i messaggi WhatsApp/SMS (webhook /twilio/inbound).
+// Il flusso vocale (chiamate) resta invariato.
+
+function stripWhatsAppPrefix(value) {
+  const s = String(value || "").trim();
+  return s.toLowerCase().startsWith("whatsapp:") ? s.slice("whatsapp:".length) : s;
+}
+
+function getWaSession(from) {
+  const key = `wa:${from || "unknown"}`;
+  const session = getSession(key);
+  if (!session) return null;
+
+  // Informazioni utili per log e prenotazioni
+  const phone = stripWhatsAppPrefix(from);
+  if (phone) session.phone = phone;
+
+  if (!session.wa) {
+    session.wa = {
+      step: "idle",
+      history: [],
+      lastActivityTs: Date.now(),
+    };
+  }
+  session.wa.lastActivityTs = Date.now();
+  return session;
+}
+
+function pruneWaHistory(session, max = 12) {
+  if (!session?.wa?.history) return;
+  if (session.wa.history.length > max) {
+    session.wa.history = session.wa.history.slice(session.wa.history.length - max);
+  }
+}
+
+function waAddToHistory(session, role, content) {
+  if (!session?.wa) return;
+  session.wa.history.push({ role, content: String(content || "").slice(0, 2000) });
+  pruneWaHistory(session);
+}
+
+function buildBusinessFactsForAI() {
+  const parts = [];
+  parts.push(`Nome attività: ${BUSINESS_NAME}`);
+  if (BUSINESS_CONTEXT) parts.push(`Contesto: ${BUSINESS_CONTEXT}`);
+
+  // Orari dal file
+  parts.push(`Giorno di chiusura: Lunedì.`);
+  parts.push(`Orari ristorante: ${OPENING.restaurant.default.start}-${OPENING.restaurant.default.end} (Ven/Sab fino alle ${OPENING.restaurant.friSat.end}).`);
+  parts.push(`Orari drink: ${OPENING.drinksOnly.start}-${OPENING.drinksOnly.end}.`);
+  parts.push(`Serate musica: Mercoledì e Venerdì.`);
+
+  // Preordine
+  parts.push(
+    `Preordine: opzionale. Opzioni: ${PREORDER_OPTIONS.map((o) => o.label).join(", ")}.`
+  );
+
+  return parts.join("\n");
+}
+
+function buildWaSystemPrompt() {
+  return [
+    `Sei un assistente WhatsApp di ${BUSINESS_NAME}.`,
+    `Obiettivo: rispondere in modo utile e rapido, e guidare l'utente alla prenotazione quando serve.`,
+    `Regole:`,
+    `- Non inventare informazioni non presenti nei "Fatti". Se manca un dato, fai UNA domanda breve per chiarire.`,
+    `- Se l’utente vuole prenotare un tavolo, raccogli: nome, data (YYYY-MM-DD), numero persone, ora (HH:MM), eventuali note e preordine (se vuole).`,
+    `- Tono: cordiale, italiano, frasi brevi.`,
+    ``,
+    `Fatti:\n${buildBusinessFactsForAI()}`,
+  ].join("\n");
+}
+
+async function callOpenAIResponses({ input, jsonMode } = {}) {
+  if (!AI_ENABLED || !OPENAI_API_KEY) return null;
+
+  const controller = new AbortController();
+  const timeoutMs = 12000;
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const body = {
+      model: OPENAI_MODEL,
+      max_output_tokens: AI_MAX_OUTPUT_TOKENS,
+      input,
+    };
+
+    if (jsonMode) {
+      body.text = { format: { type: "json_object" } };
+    }
+
+    const resp = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      console.error("[OPENAI] error:", resp.status, data);
+      return null;
+    }
+
+    // L'SDK espone output_text; qui facciamo un parsing robusto
+    const outputText =
+      data?.output_text ||
+      data?.output?.[0]?.content?.find((c) => c?.type === "output_text")?.text ||
+      data?.output?.[0]?.content?.[0]?.text ||
+      null;
+
+    return { data, outputText };
+  } catch (err) {
+    console.error("[OPENAI] call failed:", err);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function aiGeneralReply(session, userText) {
+  const system = buildWaSystemPrompt();
+  const history = session?.wa?.history || [];
+
+  const input = [
+    { role: "system", content: system },
+    ...history.map((m) => ({ role: m.role, content: m.content })),
+    { role: "user", content: String(userText || "") },
+  ];
+
+  const result = await callOpenAIResponses({ input });
+  const text = result?.outputText;
+  if (!text) return null;
+
+  return String(text).trim();
+}
+
+async function aiExtractBookingFields(userText) {
+  if (!AI_ENABLED || !OPENAI_API_KEY) return null;
+
+  const instructions = [
+    `Estrai informazioni per una prenotazione tavolo.`,
+    `Rispondi SOLO con JSON valido (nessun testo fuori dal JSON).`,
+    `Chiavi: intent (\"table\" oppure \"other\"), name (string|null), dateISO (YYYY-MM-DD|null), time24 (HH:MM|null), people (number|null), notes (string|null), preorder (string|null).`,
+    `Se non sei sicuro, usa null.`,
+    `Testo utente: """${String(userText || "").slice(0, 1000)}"""`,
+  ].join("\n");
+
+  const input = [{ role: "user", content: instructions }];
+  const result = await callOpenAIResponses({ input, jsonMode: true });
+  if (!result?.outputText) return null;
+
+  try {
+    const obj = JSON.parse(result.outputText);
+    return obj && typeof obj === "object" ? obj : null;
+  } catch {
+    return null;
+  }
+}
+
+function isBookingIntentText(text) {
+  const t = normalizeText(text || "");
+  return (
+    t.includes("prenot") ||
+    t.includes("riserv") ||
+    t.includes("tavolo") ||
+    t.includes("cena") ||
+    t.includes("apericena") ||
+    t.includes("dopocena")
+  );
+}
+
+function resetWaBooking(session) {
+  if (!session) return;
+  session.intent = null;
+  session.name = null;
+  session.dateISO = null;
+  session.time24 = null;
+  session.people = null;
+  session.specialRequestsRaw = null;
+  session.preorderChoiceKey = null;
+  session.preorderLabel = null;
+  if (session.wa) session.wa.step = "idle";
+}
+
+function buildBookingSummary(session) {
+  const dateLabel = session.dateISO ? formatDateLabel(session.dateISO) : "";
+  const preorder = session.preorderLabel ? session.preorderLabel : "nessuno";
+  const note = session.specialRequestsRaw ? buildSpecialRequestsText(session) : "nessuna";
+  return [
+    `Riepilogo prenotazione:`,
+    `- Nome: ${session.name || "-"}`,
+    `- Data: ${dateLabel || "-"}`,
+    `- Ora: ${session.time24 || "-"}`,
+    `- Persone: ${session.people || "-"}`,
+    `- Note: ${note}`,
+    `- Preordine: ${preorder}`,
+    ``,
+    `Confermi? (sì/no)`,
+  ].join("\n");
+}
+
+async function computeWhatsAppReply(session, userText) {
+  const text = String(userText || "").trim();
+  const normalized = normalizeText(text);
+  const step = session?.wa?.step || "idle";
+
+  // Comandi globali
+  if (normalized && isCancelCommand(normalized)) {
+    resetWaBooking(session);
+    return "Ok, ho annullato la procedura. Se vuoi, dimmi cosa ti serve 🙂";
+  }
+  if (normalized && isBackCommand(normalized)) {
+    // piccolo "indietro" per la prenotazione
+    if (step === "ask_time") session.wa.step = "ask_people";
+    else if (step === "ask_people") session.wa.step = "ask_date";
+    else if (step === "ask_date") session.wa.step = "ask_name";
+    else session.wa.step = "idle";
+
+    return "Ok, torniamo indietro. Dimmi pure.";
+  }
+
+  // IDLE: capisco intento (prenotazione vs info)
+  if (step === "idle") {
+    if (isBookingIntentText(text)) {
+      session.intent = "table";
+
+      // Tentativo “intelligente”: estrazione campi in una sola frase
+      const extracted = await aiExtractBookingFields(text);
+      if (extracted?.name) session.name = String(extracted.name).slice(0, 60);
+      if (extracted?.dateISO) session.dateISO = String(extracted.dateISO);
+      if (extracted?.time24) session.time24 = String(extracted.time24);
+      if (typeof extracted?.people === "number") session.people = extracted.people;
+      if (extracted?.notes) session.specialRequestsRaw = String(extracted.notes).slice(0, 200);
+      if (extracted?.preorder) session.preorderLabel = String(extracted.preorder).slice(0, 60);
+
+      // Determina prossimo passo mancante
+      if (!session.name) {
+        session.wa.step = "ask_name";
+        return "Perfetto 🙂 Come ti chiami?";
+      }
+      if (!session.dateISO) {
+        session.wa.step = "ask_date";
+        return `Piacere ${session.name}! Per quale giorno vuoi prenotare? (es. 12/01 o domani)`;
+      }
+      if (!session.people) {
+        session.wa.step = "ask_people";
+        return "In quante persone siete?";
+      }
+      if (!session.time24) {
+        session.wa.step = "ask_time";
+        return "A che ora? (es. 20:30)";
+      }
+      session.wa.step = "ask_notes";
+      return "Hai intolleranze o richieste particolari? (se no scrivi: nessuna)";
+    }
+
+    // Non è una prenotazione → risposta AI (se configurata) oppure risposta base
+    const ai = await aiGeneralReply(session, text);
+    if (ai) return ai;
+
+    return "Ciao! Posso aiutarti con una prenotazione tavolo o con informazioni. Scrivimi cosa ti serve 🙂";
+  }
+
+  // Prenotazione: step-by-step
+  if (step === "ask_name") {
+    if (!text) return "Come ti chiami?";
+    session.name = text.slice(0, 60);
+    session.wa.step = "ask_date";
+    return `Piacere ${session.name}! Per quale giorno vuoi prenotare? (es. 12/01 o domani)`;
+  }
+
+  if (step === "ask_date") {
+    const dateISO = parseDateIT(text);
+    if (!dateISO) return "Non ho capito la data 😅 Puoi scriverla tipo 12/01 o domani?";
+    session.dateISO = dateISO;
+
+    // Controllo chiusura (giorno di riposo / festivi / calendario)
+    const events = await listCalendarEvents(session.dateISO);
+    const date = new Date(`${session.dateISO}T00:00:00`);
+    const isHoliday = HOLIDAYS_SET.has(session.dateISO);
+    const isClosedDay = date.getDay() === OPENING.closedDay;
+    if (isHoliday || isClosedDay || isDateClosedByCalendar(events)) {
+      return "Mi dispiace, quel giorno risulta chiuso. Vuoi scegliere un'altra data?";
+    }
+
+    session.liveMusicNoticePending = hasLiveMusicEvent(events);
+    session.wa.step = "ask_people";
+    return "Perfetto. In quante persone siete?";
+  }
+
+  if (step === "ask_people") {
+    const people = parsePeopleIT(text);
+    if (!people) return "Non ho capito il numero di persone. Puoi scrivere ad es. 2, 4, 6?";
+    session.people = people;
+    session.wa.step = "ask_time";
+    return "A che ora? (es. 20:30)";
+  }
+
+  if (step === "ask_time") {
+    const time24 = parseTimeIT(text);
+    if (!time24) return "Non ho capito l'orario. Puoi scriverlo tipo 20:30?";
+    session.time24 = time24;
+    session.wa.step = "ask_notes";
+    return "Hai intolleranze o richieste particolari? (se no scrivi: nessuna)";
+  }
+
+  if (step === "ask_notes") {
+    if (!text) return "Hai richieste particolari? Se no scrivi: nessuna";
+    session.specialRequestsRaw = normalizeText(text).includes("nessun") ? "nessuna" : text.slice(0, 200);
+    session.wa.step = "ask_preorder";
+    return "Vuoi preordinare qualcosa? (cena, apericena, dopocena, piatto apericena, piatto apericena promo) — oppure scrivi: nessuno";
+  }
+
+  if (step === "ask_preorder") {
+    const normalized = normalizeText(text);
+    const glutenIntolerance = hasGlutenIntolerance(session.specialRequestsRaw);
+    const isFriday = session.dateISO ? new Date(`${session.dateISO}T00:00:00`).getDay() === 5 : false;
+
+    if (normalized.includes("nessuno") || normalized.includes("niente") || normalized === "no") {
+      session.preorderChoiceKey = null;
+      session.preorderLabel = "nessuno";
+    } else if (normalized.includes("apericena promo")) {
+      const promoOption = getPreorderOptionByKey("piatto_apericena_promo");
+      if (isFriday) return "L’apericena promo non è disponibile il venerdì. Scegli un’altra opzione oppure scrivi: nessuno";
+      session.preorderChoiceKey = promoOption?.key || "piatto_apericena_promo";
+      session.preorderLabel = promoOption?.label || "Piatto Apericena in promo (previa registrazione)";
+      if (glutenIntolerance) {
+        // non blocchiamo, ma avvisiamo
+      }
+    } else if (normalized.includes("apericena") && !normalized.includes("piatto")) {
+      if (glutenIntolerance) return "L’apericena non è disponibile per celiaci o intolleranti al glutine. Vuoi scegliere un’alternativa o scrivere: nessuno?";
+      const option = getPreorderOptionByKey("apericena");
+      session.preorderChoiceKey = option?.key || "apericena";
+      session.preorderLabel = option?.label || "Apericena";
+    } else {
+      const option =
+        PREORDER_OPTIONS.find(
+          (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
+        ) || null;
+      if (!option) return "Non ho capito la scelta. Puoi scrivere: cena, apericena, dopocena, piatto apericena, piatto apericena promo — oppure: nessuno";
+      session.preorderChoiceKey = option.key;
+      session.preorderLabel = option.label;
+    }
+
+    session.wa.step = "confirm";
+    return buildBookingSummary(session);
+  }
+
+  if (step === "confirm") {
+    const n = normalizeText(text);
+    const yes = YES_WORDS.some((w) => n.includes(normalizeText(w)));
+    const no = NO_WORDS.some((w) => n.includes(normalizeText(w)));
+
+    if (!yes && !no) return "Confermi la prenotazione? Rispondi con sì oppure no.";
+
+    if (no) {
+      resetWaBooking(session);
+      return "Ok, nessun problema. Se vuoi riprovare, dimmi data/ora e numero persone 🙂";
+    }
+
+    // YES: tentiamo creazione evento e inviamo email operatore
+    let calendarResult = null;
+    try {
+      calendarResult = await createCalendarEvent(session);
+    } catch (err) {
+      console.error("[WHATSAPP] createCalendarEvent failed:", err);
+      calendarResult = null;
+    }
+
+    // Avviso operatore (best-effort)
+    try {
+      void sendOperatorEmail(session, { body: { From: session.phone } }, "whatsapp_booking_confirmed");
+    } catch (err) {
+      console.error("[WHATSAPP] sendOperatorEmail failed:", err);
+    }
+
+    if (calendarResult?.status === "closed") {
+      session.wa.step = "ask_date";
+      return "Quel giorno risulta chiuso. Vuoi scegliere un'altra data?";
+    }
+    if (calendarResult?.status === "unavailable") {
+      session.wa.step = "ask_time";
+      return "A quell’orario siamo al completo 😅 Vuoi provare un altro orario? (es. 20:00 oppure 21:30)";
+    }
+
+    const dateLabel = session.dateISO ? formatDateLabel(session.dateISO) : "";
+    const musicNote = session.liveMusicNoticePending ? " Nota: quella sera è prevista musica dal vivo." : "";
+    resetWaBooking(session);
+    return `Perfetto! Prenotazione registrata per ${dateLabel} alle ${session.time24} per ${session.people} persone.${musicNote} A presto 🙂`;
+  }
+
+  // Fallback: se per qualche motivo step sconosciuto
+  session.wa.step = "idle";
+  const ai = await aiGeneralReply(session, text);
+  if (ai) return ai;
+  return "Ok! Dimmi pure cosa ti serve 🙂";
+}
+
+async function handleTwilioInboundMessage(req, res) {
   try {
     const from = req.body?.From || "";
     const to = req.body?.To || "";
@@ -1836,8 +2246,16 @@ function handleTwilioInboundMessage(req, res) {
 
     console.log("[WHATSAPP] inbound", { from, to, messageSid, body });
 
-    // Risposta di test: conferma ricezione
-    const xml = buildMessagingTwimlReply("Messaggio ricevuto ✅");
+    const session = getWaSession(from);
+
+    // Storico per risposte AI (solo se il session esiste)
+    if (session) waAddToHistory(session, "user", body);
+
+    const reply = session ? await computeWhatsAppReply(session, body) : "OK";
+
+    if (session && reply) waAddToHistory(session, "assistant", reply);
+
+    const xml = buildMessagingTwimlReply(reply || "");
 
     res.set("Content-Type", "text/xml; charset=utf-8");
     return res.status(200).send(xml);
