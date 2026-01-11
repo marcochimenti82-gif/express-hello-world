@@ -1815,6 +1815,46 @@ async function safeCreateFailedCallCalendarEvent(session, req, reason) {
 // ======================= ROUTES =======================
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+// ======================= WHATSAPP / SMS INBOUND (TWILIO) =======================
+// Twilio invia i messaggi in arrivo come HTTP POST (application/x-www-form-urlencoded).
+// Per test rapido da browser abbiamo anche un GET che risponde "OK".
+app.get("/twilio/inbound", (req, res) => res.status(200).send("OK - Twilio inbound endpoint"));
+app.get("/twilio", (req, res) => res.status(200).send("OK - Twilio inbound endpoint"));
+
+function buildMessagingTwimlReply(text) {
+  const mr = new twilio.twiml.MessagingResponse();
+  if (text) mr.message(text);
+  return mr.toString();
+}
+
+function handleTwilioInboundMessage(req, res) {
+  try {
+    const from = req.body?.From || "";
+    const to = req.body?.To || "";
+    const body = req.body?.Body || "";
+    const messageSid = req.body?.MessageSid || "";
+
+    console.log("[WHATSAPP] inbound", { from, to, messageSid, body });
+
+    // Risposta di test: conferma ricezione
+    const xml = buildMessagingTwimlReply("Messaggio ricevuto ✅");
+
+    res.set("Content-Type", "text/xml; charset=utf-8");
+    return res.status(200).send(xml);
+  } catch (err) {
+    console.error("[WHATSAPP] inbound error:", err);
+    // Risposta vuota ma valida (evita retry aggressivi)
+    res.set("Content-Type", "text/xml; charset=utf-8");
+    return res.status(200).send(buildMessagingTwimlReply(""));
+  }
+}
+
+// Endpoint consigliato da usare come webhook (Request URL) in Twilio Console
+app.post("/twilio/inbound", handleTwilioInboundMessage);
+
+// Compatibilità: se in console hai configurato /twilio (o /twilio/) invece di /twilio/inbound
+app.post("/twilio", handleTwilioInboundMessage);
+
 app.post("/call/outbound", async (req, res) => {
   try {
     const to = String(req.body?.to || "").trim();
