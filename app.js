@@ -383,13 +383,15 @@ function sayIt(response, text) {
   response.say({ language: "it-IT" }, xmlEscape(text));
 }
 
-function gatherSpeech(response, promptText) {
+function gatherSpeech(response, promptText, opts = {}) {
   const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice` : "/twilio/voice";
   const gather = response.gather({
-    input: "speech",
+    input: opts.input || "speech",
     language: "it-IT",
-    speechTimeout: "auto",
-    timeout: 3,
+    speechTimeout: opts.speechTimeout || "auto",
+    timeout: Number.isFinite(Number(opts.timeout)) ? Number(opts.timeout) : 5,
+    enhanced: true,
+    speechModel: "phone_call",
     action: actionUrl,
     method: "POST",
   });
@@ -845,7 +847,7 @@ function promptForStep(vr, session) {
       );
       return;
     case 8:
-      gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
+      gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
       return;
     case 9:
       gatherSpeech(vr, "Hai altre richieste particolari? Ad esempio sala esterna.");
@@ -896,7 +898,8 @@ function parseDateIT(speech) {
     const next = new Date(today.getTime() + 24 * 60 * 60 * 1000);
     return toISODate(next);
   }
-  // "stasera" / "questa sera" => oggi
+
+  // "stasera" / "questa sera" -> oggi
   if (tt.includes("stasera") || tt.includes("questa sera") || tt.includes("in serata")) {
     return toISODate(today);
   }
@@ -944,20 +947,14 @@ function parsePeopleIT(speech) {
   const tt = normalizeText(speech);
   if (!tt) return null;
 
-  // 1) digits anywhere: "8", "siamo in 8", "8 persone"
+  // digits anywhere: "8", "siamo in 8", "8 persone"
   const m = tt.match(/\b(\d{1,2})\b/);
   if (m) {
     const n = Number(m[1]);
     if (Number.isFinite(n) && n > 0) return n;
   }
 
-  // 2) italian number words: "otto", "siamo otto", "in otto"
-  const words = tt
-    .replace(/[^a-zàèéìòù\s]/g, " ")
-    .split(/\s+/)
-    .map((w) => w.trim())
-    .filter(Boolean);
-
+  // italian number words (common for speech): "otto", "siamo otto", "in otto"
   const map = {
     uno: 1,
     una: 1,
@@ -982,10 +979,16 @@ function parsePeopleIT(speech) {
     venti: 20,
   };
 
+  const words = tt
+    .replace(/[^a-zàèéìòù\s]/g, " ")
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter(Boolean);
+
   for (const w of words) {
     if (Object.prototype.hasOwnProperty.call(map, w)) {
       const n = map[w];
-      if (n > 0) return n;
+      if (Number.isFinite(n) && n > 0) return n;
     }
   }
 
@@ -1066,15 +1069,58 @@ function buildExtraRequestsText(session) {
 
 function parsePhoneNumber(speech) {
   if (!speech) return null;
-  if (isValidPhoneE164(speech)) return speech.trim();
-  let digits = String(speech).replace(/[^\d]/g, "");
-  if (digits.startsWith("00")) {
-    digits = digits.slice(2);
+  const raw = String(speech || "").trim();
+
+  // Already E.164
+  if (isValidPhoneE164(raw)) return raw;
+
+  // Extract digits from raw (handles "388 166 9661", "20.30" etc.)
+  let digits = raw.replace(/[^\d]/g, "");
+  if (digits.startsWith("00")) digits = digits.slice(2);
+
+  // If no digits, try to convert spoken Italian digits: "tre otto otto ..."
+  if (!digits) {
+    const tt = normalizeText(raw)
+      .replace(/[^a-zàèéìòù\d\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const wordToDigit = {
+      zero: "0",
+      uno: "1",
+      una: "1",
+      due: "2",
+      tre: "3",
+      quattro: "4",
+      cinque: "5",
+      sei: "6",
+      sette: "7",
+      otto: "8",
+      nove: "9",
+    };
+    const parts = tt.split(" ").filter(Boolean);
+    const out = [];
+    for (const part of parts) {
+      if (/^\d+$/.test(part)) {
+        out.push(part);
+        continue;
+      }
+      const d = wordToDigit[part];
+      if (d) out.push(d);
+    }
+    digits = out.join("");
+    if (digits.startsWith("00")) digits = digits.slice(2);
   }
+
+  if (!digits) return null;
+
+  // Normalize lengths
   if (digits.length >= 8 && digits.length <= 15) {
+    // If likely Italian local number (<=10 digits), prefix +39
     if (digits.length <= 10) return `+39${digits}`;
+    // If starts with country code without '+'
     return `+${digits}`;
   }
+
   return null;
 }
 
@@ -2366,7 +2412,7 @@ app.post("/twilio/voice/outbound", (req, res) => {
 
 async function handleVoiceRequest(req, res) {
   const callSid = req.body.CallSid || "";
-  const speech = req.body.SpeechResult || "";
+  const speech = String(req.body.SpeechResult || req.body.Digits || "");
   const session = getSession(callSid);
   const vr = buildTwiml();
 
@@ -2898,7 +2944,7 @@ async function handleVoiceRequest(req, res) {
         resetRetries(session);
         session.step = 8;
         maybeSayDivanettiNotice(vr, session);
-        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
+        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
         break;
       }
 
@@ -2945,14 +2991,14 @@ async function handleVoiceRequest(req, res) {
         }
         resetRetries(session);
         session.step = 8;
-        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.");
+        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
         break;
       }
 
       case 8: {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?")
+            gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?", { input: "speech dtmf" })
           );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step8");
@@ -2965,7 +3011,7 @@ async function handleVoiceRequest(req, res) {
         }
         const phone = parsePhoneNumber(speech);
         if (!phone) {
-          gatherSpeech(vr, "Scusami, non ho capito il numero. Puoi ripeterlo?");
+          gatherSpeech(vr, "Scusami, non ho capito il numero. Puoi ripeterlo?", { input: "speech dtmf" });
           break;
         }
         session.phone = phone;
