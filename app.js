@@ -728,109 +728,6 @@ function normalizeText(s) {
     .replace(/\s+/g, " ");
 }
 
-
-// ======================= NLP HELPERS (ROBUST) =======================
-function escapeRegExp(str) {
-  return String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function hasWord(text, word) {
-  const w = String(word || "").trim().toLowerCase();
-  if (!w) return false;
-  if (w.includes(" ")) return String(text || "").includes(w);
-  return new RegExp(`\\b${escapeRegExp(w)}\\b`, "i").test(String(text || ""));
-}
-
-function hasAnyWord(text, words) {
-  const tt = String(text || "");
-  if (!tt) return false;
-  return (Array.isArray(words) ? words : []).some((w) => hasWord(tt, w));
-}
-
-function isNoSpecialRequestsText(speech) {
-  const tt = normalizeText(speech);
-  if (!tt) return false;
-
-  if (hasAnyWord(tt, ["nessuna", "nessuno", "nessun", "niente", "nulla", "no"])) return true;
-
-  if (tt.includes("non ci sono") || tt.includes("non ci sono intolleranze") || tt.includes("non ci sono allergie")) return true;
-  if (tt.includes("non ho") || tt.includes("non abbiamo")) return true;
-  if (tt.includes("non ci") && (tt.includes("intoller") || tt.includes("allerg"))) return true;
-
-  return false;
-}
-
-function isNoPreorderText(speech) {
-  const tt = normalizeText(speech);
-  if (!tt) return false;
-
-  if (hasAnyWord(tt, ["nessuno", "nessuna", "nessun", "niente", "nulla", "no"])) return true;
-
-  if (tt.includes("non voglio") || tt.includes("non desidero") || tt.includes("non preordin") || tt.includes("non ordin")) return true;
-
-  return false;
-}
-
-function italianWordToNumberToken(token) {
-  const t = String(token || "").toLowerCase().trim();
-  if (!t) return null;
-
-  const map = {
-    uno: 1,
-    un: 1,
-    una: 1,
-    due: 2,
-    tre: 3,
-    quattro: 4,
-    cinque: 5,
-    sei: 6,
-    sette: 7,
-    otto: 8,
-    nove: 9,
-    dieci: 10,
-    undici: 11,
-    dodici: 12,
-    tredici: 13,
-    quattordici: 14,
-    quindici: 15,
-    sedici: 16,
-    diciassette: 17,
-    diciotto: 18,
-    diciannove: 19,
-    venti: 20,
-    trenta: 30,
-  };
-  if (Object.prototype.hasOwnProperty.call(map, t)) return map[t];
-
-  if (t.startsWith("vent")) {
-    const suffix = t.replace(/^vent(i)?/, "");
-    const base = 20;
-    const sufMap = { uno: 1, una: 1, un: 1, due: 2, tre: 3, quattro: 4, cinque: 5, sei: 6, sette: 7, otto: 8, nove: 9 };
-    if (Object.prototype.hasOwnProperty.call(sufMap, suffix)) return base + sufMap[suffix];
-  }
-  return null;
-}
-
-function parseItalianNumberFromText(speech) {
-  const tt = normalizeText(speech);
-  if (!tt) return null;
-  const tokens = tt.split(" ").map((x) => x.trim()).filter(Boolean);
-
-  for (const tok of tokens) {
-    const n = italianWordToNumberToken(tok);
-    if (Number.isFinite(n)) return n;
-  }
-
-  for (let i = 0; i < tokens.length - 1; i++) {
-    if (tokens[i] === "venti") {
-      const n2 = italianWordToNumberToken(tokens[i + 1]);
-      if (Number.isFinite(n2)) return 20 + n2;
-    }
-  }
-
-  return null;
-}
-
 function isPureConsent(speech) {
   const tt = normalizeText(speech);
   if (!tt) return false;
@@ -972,21 +869,8 @@ function promptForStep(vr, session) {
 
 // ====== parsing basilari (per arrivare al punto: FIX crash step 5) ======
 function parseTimeIT(speech) {
-  // NOTE: do NOT use normalizeText here because it strips dots, while users may write "20.30"
-  const raw = String(speech || "").trim().toLowerCase();
-  if (!raw) return null;
-
-  let tt = raw
-    .replace(/[!?]/g, " ")
-    .replace(/h/g, ":")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  // allow dot as separator
-  tt = tt.replace(/\./g, ":");
-
-  // 20:30 or 20 30
-  let hm = tt.match(/(\d{1,2})\s*[:\s]\s*(\d{2})/);
+  const tt = normalizeText(speech);
+  const hm = tt.match(/(\d{1,2})[:\s](\d{2})/);
   if (hm) {
     const hh = Number(hm[1]);
     const mm = Number(hm[2]);
@@ -994,24 +878,11 @@ function parseTimeIT(speech) {
       return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
     }
   }
-
-  // 2030 -> 20:30
-  const compact = tt.match(/\b(\d{1,2})(\d{2})\b/);
-  if (compact) {
-    const hh = Number(compact[1]);
-    const mm = Number(compact[2]);
-    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
-      return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`; 
-    }
-  }
-
-  // only hour
   const onlyH = tt.match(/\b(\d{1,2})\b/);
   if (onlyH) {
     const hh = Number(onlyH[1]);
     if (hh >= 0 && hh <= 23) return `${String(hh).padStart(2, "0")}:00`;
   }
-
   return null;
 }
 
@@ -1019,10 +890,15 @@ function parseDateIT(speech) {
   const tt = normalizeText(speech).replace(/[,\.]/g, " ").replace(/\s+/g, " ").trim();
   const today = new Date();
 
+  // relative keywords
   if (tt.includes("oggi")) return toISODate(today);
   if (tt.includes("domani")) {
     const next = new Date(today.getTime() + 24 * 60 * 60 * 1000);
     return toISODate(next);
+  }
+  // "stasera" / "questa sera" => oggi
+  if (tt.includes("stasera") || tt.includes("questa sera") || tt.includes("in serata")) {
+    return toISODate(today);
   }
 
   const dmY = tt.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
@@ -1066,17 +942,52 @@ function parseDateIT(speech) {
 
 function parsePeopleIT(speech) {
   const tt = normalizeText(speech);
+  if (!tt) return null;
 
-  // digits first (handles: "8", "siamo in 8", "8 persone")
+  // 1) digits anywhere: "8", "siamo in 8", "8 persone"
   const m = tt.match(/\b(\d{1,2})\b/);
   if (m) {
     const n = Number(m[1]);
     if (Number.isFinite(n) && n > 0) return n;
   }
 
-  // italian words (handles: "otto", "siamo otto", "in otto")
-  const w = parseItalianNumberFromText(tt);
-  if (Number.isFinite(w) && w > 0) return w;
+  // 2) italian number words: "otto", "siamo otto", "in otto"
+  const words = tt
+    .replace(/[^a-zàèéìòù\s]/g, " ")
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter(Boolean);
+
+  const map = {
+    uno: 1,
+    una: 1,
+    due: 2,
+    tre: 3,
+    quattro: 4,
+    cinque: 5,
+    sei: 6,
+    sette: 7,
+    otto: 8,
+    nove: 9,
+    dieci: 10,
+    undici: 11,
+    dodici: 12,
+    tredici: 13,
+    quattordici: 14,
+    quindici: 15,
+    sedici: 16,
+    diciassette: 17,
+    diciotto: 18,
+    diciannove: 19,
+    venti: 20,
+  };
+
+  for (const w of words) {
+    if (Object.prototype.hasOwnProperty.call(map, w)) {
+      const n = map[w];
+      if (n > 0) return n;
+    }
+  }
 
   return null;
 }
@@ -1084,10 +995,8 @@ function parsePeopleIT(speech) {
 function parseYesNo(speech) {
   const tt = normalizeText(speech);
   if (!tt) return null;
-
-  if (hasAnyWord(tt, YES_WORDS)) return true;
-  if (hasAnyWord(tt, NO_WORDS)) return false;
-
+  if (YES_WORDS.some((w) => tt.includes(w))) return true;
+  if (NO_WORDS.some((w) => tt.includes(w))) return false;
   return null;
 }
 
@@ -2286,7 +2195,7 @@ async function computeWhatsAppReply(session, userText) {
 
   if (step === "ask_notes") {
     if (!text) return "Hai richieste particolari? Se no scrivi: nessuna";
-    session.specialRequestsRaw = (isNoSpecialRequestsText(text) ? "nessuna" : text.slice(0, 200));
+    session.specialRequestsRaw = normalizeText(text).includes("nessun") ? "nessuna" : text.slice(0, 200);
     session.wa.step = "ask_preorder";
     return "Vuoi preordinare qualcosa? (cena, apericena, dopocena, piatto apericena, piatto apericena promo) — oppure scrivi: nessuno";
   }
@@ -2296,7 +2205,7 @@ async function computeWhatsAppReply(session, userText) {
     const glutenIntolerance = hasGlutenIntolerance(session.specialRequestsRaw);
     const isFriday = session.dateISO ? new Date(`${session.dateISO}T00:00:00`).getDay() === 5 : false;
 
-    if (isNoPreorderText(normalized)) {
+    if (normalized.includes("nessuno") || normalized.includes("niente") || normalized === "no") {
       session.preorderChoiceKey = null;
       session.preorderLabel = "nessuno";
     } else if (normalized.includes("apericena promo")) {
@@ -2800,7 +2709,7 @@ async function handleVoiceRequest(req, res) {
         }
         const people = parsePeopleIT(speech);
         if (!people) {
-          gatherSpeech(vr, t("step5_party_size_ask_notes.error") || "Non ho capito. In quante persone siete?");
+          gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
           break;
         }
         session.people = people;
@@ -2865,7 +2774,7 @@ async function handleVoiceRequest(req, res) {
           gatherSpeech(vr, "Quali? Dimmi pure le intolleranze o la richiesta.");
           break;
         }
-        session.specialRequestsRaw = (emptySpeech || isNoSpecialRequestsText(speech)) ? "nessuna" : speech.trim().slice(0, 200);
+        session.specialRequestsRaw = emptySpeech ? "nessuna" : speech.trim().slice(0, 200);
         resetRetries(session);
         session.step = 6;
         gatherSpeech(
@@ -2892,7 +2801,7 @@ async function handleVoiceRequest(req, res) {
         const isFriday = session.dateISO ? new Date(`${session.dateISO}T00:00:00`).getDay() === 5 : false;
         session.glutenPiattoNotice = false;
         session.promoRegistrationNotice = false;
-        if (isNoPreorderText(normalized)) {
+        if (normalized.includes("nessuno") || normalized.includes("niente") || normalized.includes("no")) {
           session.preorderChoiceKey = null;
           session.preorderLabel = "nessuno";
         } else {
