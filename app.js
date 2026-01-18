@@ -741,49 +741,138 @@ function isOperatorRequest(speech) {
     tt.includes("aiuto")
   );
 }
-function toISODate(date) {
-  const dt = date instanceof Date ? date : new Date();
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: GOOGLE_CALENDAR_TZ,
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function getPartsInTimeZone(date, timeZone) {
+  const d = date instanceof Date ? date : new Date(date);
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).formatToParts(dt);
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = fmt.formatToParts(d);
   const map = {};
   for (const p of parts) {
     if (p.type !== "literal") map[p.type] = p.value;
   }
-  return `${map.year}-${map.month}-${map.day}`;
+  return {
+    year: Number(map.year),
+    month: Number(map.month),
+    day: Number(map.day),
+    hour: Number(map.hour),
+    minute: Number(map.minute),
+    second: Number(map.second),
+  };
 }
+
+function formatISODateInTimeZone(date, timeZone) {
+  try {
+    const p = getPartsInTimeZone(date, timeZone);
+    if (!p.year) throw new Error("bad parts");
+    return `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
+  } catch {
+    const d = date instanceof Date ? date : new Date(date);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
+}
+
+function formatTimeInTimeZone(date, timeZone) {
+  const p = getPartsInTimeZone(date, timeZone);
+  return `${pad2(p.hour)}:${pad2(p.minute)}`;
+}
+
+function makeUtcDateFromZoned(dateISO, time24, timeZone) {
+  const [y, m, d] = String(dateISO || "").split("-").map((n) => Number(n));
+  const [hh, mm] = String(time24 || "").split(":").map((n) => Number(n));
+  if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return null;
+  const H = Number.isFinite(hh) ? hh : 0;
+  const M = Number.isFinite(mm) ? mm : 0;
+
+  const naiveUtcMs = Date.UTC(y, m - 1, d, H, M, 0);
+  const approx = new Date(naiveUtcMs);
+  const local = getPartsInTimeZone(approx, timeZone);
+  const asUtcMs = Date.UTC(local.year, local.month - 1, local.day, local.hour, local.minute, local.second);
+  const offsetMs = asUtcMs - approx.getTime();
+  return new Date(naiveUtcMs - offsetMs);
+}
+
+function addDaysToISODate(dateISO, days) {
+  const [y, m, d] = String(dateISO || "").split("-").map((n) => Number(n));
+  if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return null;
+  const ms = Date.UTC(y, m - 1, d, 12, 0, 0);
+  const next = new Date(ms + Number(days || 0) * 86400000);
+  const yy = next.getUTCFullYear();
+  const mm = pad2(next.getUTCMonth() + 1);
+  const dd = pad2(next.getUTCDate());
+  return `${yy}-${mm}-${dd}`;
+}
+
+function computeEndDateTime(dateISO, time24, durationMinutes, timeZone) {
+  const startUtc = makeUtcDateFromZoned(dateISO, time24, timeZone);
+  if (!startUtc) return null;
+  const endUtc = new Date(startUtc.getTime() + (Number(durationMinutes) || 120) * 60000);
+  const endDateISO = formatISODateInTimeZone(endUtc, timeZone);
+  const endTime24 = formatTimeInTimeZone(endUtc, timeZone);
+  return `${endDateISO}T${endTime24}:00`;
+}
+
+function toISODate(d) {
+  return formatISODateInTimeZone(d, GOOGLE_CALENDAR_TZ || "Europe/Rome");
+}
+
 
 
 function formatDateLabel(dateISO) {
-  const date = new Date(`${dateISO}T00:00:00`);
-  const weekdays = [
-    "domenica",
-    "lunedì",
-    "martedì",
-    "mercoledì",
-    "giovedì",
-    "venerdì",
-    "sabato",
-  ];
-  const months = [
-    "gennaio",
-    "febbraio",
-    "marzo",
-    "aprile",
-    "maggio",
-    "giugno",
-    "luglio",
-    "agosto",
-    "settembre",
-    "ottobre",
-    "novembre",
-    "dicembre",
-  ];
-  return `${weekdays[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
+  try {
+    const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+    const d = makeUtcDateFromZoned(dateISO, "12:00", tz) || new Date(`${dateISO}T00:00:00`);
+    return new Intl.DateTimeFormat("it-IT", {
+      timeZone: tz,
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    }).format(d);
+  } catch {
+    const date = new Date(`${dateISO}T00:00:00`);
+    const weekdays = [
+      "domenica",
+      "lunedì",
+      "martedì",
+      "mercoledì",
+      "giovedì",
+      "venerdì",
+      "sabato",
+    ];
+    const months = [
+      "gennaio",
+      "febbraio",
+      "marzo",
+      "aprile",
+      "maggio",
+      "giugno",
+      "luglio",
+      "agosto",
+      "settembre",
+      "ottobre",
+      "novembre",
+      "dicembre",
+    ];
+    return `${weekdays[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
+  }
 }
+
 
 // ---- Back/edit commands
 function isBackCommand(speech) {
@@ -1180,75 +1269,13 @@ function buildCalendarClient() {
   });
   return google.calendar({ version: "v3", auth });
 }
-function getTimeZoneOffsetMinutes(utcDate, timeZone) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).formatToParts(utcDate);
-  const map = {};
-  for (const p of parts) {
-    if (p.type !== "literal") map[p.type] = p.value;
-  }
-  const asUtc = Date.UTC(
-    Number(map.year),
-    Number(map.month) - 1,
-    Number(map.day),
-    Number(map.hour),
-    Number(map.minute),
-    Number(map.second)
-  );
-  return (asUtc - utcDate.getTime()) / 60000;
-}
 
-function zonedDateTimeToUtc(dateISO, time24, timeZone) {
-  const [y, m, d] = String(dateISO).split("-").map((n) => Number(n));
-  const [hh, mm] = String(time24).split(":").map((n) => Number(n));
-  // initial guess
-  let utcMillis = Date.UTC(y, m - 1, d, hh, mm, 0);
-  // refine twice to handle DST boundaries
-  for (let i = 0; i < 2; i++) {
-    const guess = new Date(utcMillis);
-    const offsetMin = getTimeZoneOffsetMinutes(guess, timeZone);
-    utcMillis = Date.UTC(y, m - 1, d, hh, mm, 0) - offsetMin * 60000;
-  }
-  return new Date(utcMillis);
-}
-
-function utcToZonedParts(utcDate, timeZone) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(utcDate);
-  const map = {};
-  for (const p of parts) {
-    if (p.type !== "literal") map[p.type] = p.value;
-  }
-  return {
-    dateISO: `${map.year}-${map.month}-${map.day}`,
-    time24: `${map.hour}:${map.minute}`,
-  };
-}
-
-function addDaysISO(dateISO, days) {
-  const d = new Date(`${dateISO}T12:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + Number(days || 0));
-  return d.toISOString().slice(0, 10);
-}
 
 function getTimeRangeForDate(dateISO) {
-  const start = zonedDateTimeToUtc(dateISO, "00:00", GOOGLE_CALENDAR_TZ);
-  const end = zonedDateTimeToUtc(addDaysISO(dateISO, 1), "00:00", GOOGLE_CALENDAR_TZ);
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const start = makeUtcDateFromZoned(dateISO, "00:00", tz) || new Date(`${dateISO}T00:00:00`);
+  const endBase = makeUtcDateFromZoned(dateISO, "23:59", tz) || new Date(`${dateISO}T23:59:00`);
+  const end = new Date(endBase.getTime() + 59 * 1000);
   return { start, end };
 }
 
@@ -1296,12 +1323,12 @@ function normalizeTableId(raw) {
   if (!cleaned) return null;
   return cleaned.startsWith("T") ? cleaned : `T${cleaned}`;
 }
-function expandTableLocks(tableId) {
-  const normalized = normalizeTableId(tableId);
-  if (!normalized) return [];
-  return [normalized];
-}
 
+function expandTableLocks(tableId) {
+  const combo = TABLE_COMBINATIONS.find((c) => c.displayId === tableId);
+  if (combo) return combo.replaces;
+  return [tableId];
+}
 
 function isValidTableSelection(selection) {
   if (!selection || !Array.isArray(selection.locks) || selection.locks.length === 0) return false;
@@ -1328,39 +1355,6 @@ function buildAvailableTables(occupied, availableOverride, session) {
 function getTableById(id) {
   return TABLES.find((table) => table.id === id) || null;
 }
-
-function getEventPrivateType(event) {
-  const p = event?.extendedProperties?.private || {};
-  const raw = p.tb_type || p.type || "";
-  return String(raw || "").trim().toLowerCase();
-}
-
-function isKnownTableId(id) {
-  const normalized = normalizeTableId(id);
-  return Boolean(normalized && getTableById(normalized));
-}
-
-function extractKnownTablesFromEvent(event) {
-  return extractTablesFromEvent(event).map(normalizeTableId).filter(isKnownTableId);
-}
-
-function isSystemCalendarEvent(event) {
-  const summary = String(event?.summary || "").trim().toLowerCase();
-  const type = getEventPrivateType(event);
-  if (type === "availability" || summary.includes("tavoli disponibili")) return true;
-  if (type === "failed_call" || summary.includes("tentativo non completato")) return true;
-  if (type === "operator_callback" || (summary.includes("richiamare") && summary.includes("operatore"))) return true;
-  return false;
-}
-
-function isReservationLikeEvent(event) {
-  const type = getEventPrivateType(event);
-  if (type === "prenotazione" || type === "reservation") return true;
-  const summary = String(event?.summary || "").toLowerCase();
-  const descr = String(event?.description || "").toLowerCase();
-  return summary.includes("tav") || summary.includes("pax") || descr.includes("tavolo:");
-}
-
 
 function buildAvailableTableSet(availableTables) {
   return new Set(availableTables.map((table) => table.id));
@@ -1447,8 +1441,9 @@ function pickSplitTables(people, availableTables, session) {
     notes: "tavoli separati",
   };
 }
+
 function getNextDateISO(dateISO) {
-  return addDaysISO(dateISO, 1);
+  return addDaysToISODate(dateISO, 1);
 }
 
 
@@ -1471,41 +1466,48 @@ async function listCalendarEvents(dateISO) {
     return [];
   }
 }
-function formatTimeSlot(date, startDate) {
-  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return "";
 
-  const parts = new Intl.DateTimeFormat("it-IT", {
-    timeZone: GOOGLE_CALENDAR_TZ,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).formatToParts(date);
-  const map = {};
-  for (const p of parts) {
-    if (p.type !== "literal") map[p.type] = p.value;
-  }
-  const hm = `${map.hour}:${map.minute}`;
 
-  if (startDate instanceof Date && !Number.isNaN(startDate.getTime())) {
-    const startParts = new Intl.DateTimeFormat("it-IT", {
-      timeZone: GOOGLE_CALENDAR_TZ,
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    }).formatToParts(startDate);
-    const startMap = {};
-    for (const p of startParts) {
-      if (p.type !== "literal") startMap[p.type] = p.value;
+async function findExistingEventByPrivateProps({ calendar, dateISO, props }) {
+  try {
+    if (!calendar || !GOOGLE_CALENDAR_ID || !dateISO || !props) return null;
+    const { start, end } = getTimeRangeForDate(dateISO);
+    const privateExtendedProperty = [];
+    for (const [k, v] of Object.entries(props)) {
+      if (!k) continue;
+      privateExtendedProperty.push(`${k}=${String(v ?? "")}`);
     }
-    const startHm = `${startMap.hour}:${startMap.minute}`;
+    const result = await calendar.events.list({
+      calendarId: GOOGLE_CALENDAR_ID,
+      timeMin: start.toISOString(),
+      timeMax: end.toISOString(),
+      singleEvents: true,
+      orderBy: "startTime",
+      privateExtendedProperty,
+    });
+    const items = result?.data?.items || [];
+    return items.length ? items[0] : null;
+  } catch (err) {
+    console.error("[GOOGLE] Calendar list (privateExtendedProperty) failed:", err);
+    return null;
+  }
+}
 
-    // If the end is midnight in the target TZ and it is after the start, show 24:00
-    if (hm === "00:00" && startHm !== "00:00" && date.getTime() > startDate.getTime()) {
+
+
+function formatTimeSlot(date, startDate) {
+  if (!date) return "";
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const p = getPartsInTimeZone(date, tz);
+  if (startDate) {
+    const sp = getPartsInTimeZone(startDate, tz);
+    const dateIso = `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
+    const startIso = `${sp.year}-${pad2(sp.month)}-${pad2(sp.day)}`;
+    if (p.hour == 0 && p.minute == 0 && dateIso != startIso) {
       return "24:00";
     }
   }
-
-  return hm;
+  return `${pad2(p.hour)}:${pad2(p.minute)}`;
 }
 
 
@@ -1553,176 +1555,234 @@ function maybeSayDivanettiNotice(vr, session) {
   sayIt(vr, "Ti abbiamo riservato l’area divanetti, ideale per aperitivo e dopocena.");
   session.divanettiNoticeSpoken = true;
 }
-function buildAvailabilityDescription(events, dateISO) {
-  const lines = [];
-  const occupiedByTable = new Map();
+
+function buildAvailabilityDescription(dateISO, events) {
+  const tableIds = TABLES.map((table) => table.id);
+  const occupancy = new Map(tableIds.map((id) => [id, []]));
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const bookingRange = {
+    start: makeUtcDateFromZoned(dateISO, "00:00", tz) || new Date(`${dateISO}T00:00:00`),
+    end: (function(){
+      const endBase = makeUtcDateFromZoned(dateISO, "23:59", tz) || new Date(`${dateISO}T23:59:00`);
+      return new Date(endBase.getTime() + 59 * 1000);
+    })(),
+  };
 
   for (const event of events) {
-    const summary = String(event?.summary || "").toLowerCase();
-    if (!summary) continue;
-
-    // ignora eventi di sistema
-    if (isSystemCalendarEvent(event)) continue;
+    const summary = String(event.summary || "").toLowerCase();
+    const eventType = event.extendedProperties?.private?.type || "";
+    if (summary.startsWith("annullata")) continue;
     if (summary.includes("tavoli disponibili")) continue;
     if (summary.includes("locale chiuso")) continue;
-    if (summary.includes("evento")) continue;
-    if (summary.includes("annullata")) continue;
-
-    // ignora all-day
-    if (event?.start?.date && !event?.start?.dateTime) continue;
-
+    if (summary.includes("evento") || eventType === "evento") continue;
     const eventRange = getEventTimeRange(event);
-    if (!eventRange) continue;
-
-    const tables = extractKnownTablesFromEvent(event);
-    if (tables.length === 0) continue;
-
-    const startLabel = formatTimeSlot(eventRange.start, null);
-    const endLabel = formatTimeSlot(eventRange.end, eventRange.start);
-    const slot = `${startLabel} - ${endLabel}`;
-
-    for (const t of tables) {
-      if (!occupiedByTable.has(t)) occupiedByTable.set(t, []);
-      occupiedByTable.get(t).push(slot);
+    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
+    const tableIdsForEvent = extractTablesFromEvent(event)
+      .filter((id) => occupancy.has(id));
+    for (const tableId of tableIdsForEvent) {
+      occupancy.get(tableId).push({
+        start: eventRange.start,
+        end: eventRange.end,
+      });
     }
   }
 
-  const allTableIds = TABLES.map((t) => t.id).sort((a, b) => a.localeCompare(b));
-  for (const tableId of allTableIds) {
-    const slots = occupiedByTable.get(tableId) || [];
+  const lines = tableIds.map((tableId) => {
+    const slots = occupancy.get(tableId) || [];
+    slots.sort((a, b) => a.start - b.start);
     if (slots.length === 0) {
-      lines.push(`${tableId}:`);
-    } else {
-      lines.push(`${tableId}: occupato dalle ${slots.join(", ")};`);
+      return `${tableId}:`;
     }
-  }
-
-  // intestazione leggibile
-  lines.unshift(`Disponibilita tavoli per ${dateISO} (orario ${GOOGLE_CALENDAR_TZ})`);
+    const slotText = slots
+      .map((slot) => {
+        const start = formatTimeSlot(slot.start);
+        const end = formatTimeSlot(slot.end, slot.start);
+        return `occupato dalle ${start} alle ${end};`;
+      })
+      .join(" ");
+    return `${tableId}: ${slotText}`;
+  });
 
   return lines.join("\n");
 }
-async function upsertAvailabilityEvent(calendar, dateISO, availabilityDescription) {
-  const nextDateISO = getNextDateISO(dateISO);
 
-  // Cerca un evento "Tavoli disponibili" all-day per quella data
+async function upsertAvailabilityEvent(dateISO) {
+  if (!GOOGLE_CALENDAR_ID) return null;
+  const calendar = buildCalendarClient();
+  if (!calendar) return null;
   const events = await listCalendarEvents(dateISO);
-  const existing = events.find((e) => {
-    const summary = String(e?.summary || "").toLowerCase();
-    const type = getEventPrivateType(e);
-    if (!(type === "availability" || summary.includes("tavoli disponibili"))) return false;
-    return String(e?.start?.date || "") === String(dateISO);
-  });
-
-  const bodyBase = {
+  const availabilityEvent = events.find((event) =>
+    String(event.summary || "").toLowerCase().includes("tavoli disponibili")
+  );
+  const description = buildAvailabilityDescription(dateISO, events);
+  const requestBody = {
     summary: "Tavoli disponibili",
-    description: availabilityDescription,
+    description,
     start: { date: dateISO },
-    end: { date: nextDateISO },
-    extendedProperties: {
-      private: {
-        tb_type: "availability",
-        tb_date: String(dateISO),
-      },
-    },
+    end: { date: getNextDateISO(dateISO) },
   };
 
-  if (existing?.id) {
-    await calendar.events.patch({
+  try {
+    if (availabilityEvent?.id) {
+      const result = await calendar.events.patch({
+        calendarId: GOOGLE_CALENDAR_ID,
+        eventId: availabilityEvent.id,
+        requestBody,
+      });
+      return result?.data || null;
+    }
+    const result = await calendar.events.insert({
       calendarId: GOOGLE_CALENDAR_ID,
-      eventId: existing.id,
-      requestBody: bodyBase,
+      requestBody,
     });
-    return { updated: true, id: existing.id };
+    return result?.data || null;
+  } catch (err) {
+    console.error("[GOOGLE] Availability event update failed:", err);
+    return null;
   }
-
-  const created = await calendar.events.insert({
-    calendarId: GOOGLE_CALENDAR_ID,
-    requestBody: bodyBase,
-  });
-
-  return { created: true, id: created?.data?.id || null };
 }
 
 async function reserveTableForSession(session, { commit } = { commit: false }) {
-  const dateISO = session.dateISO;
-  const time24 = session.time24;
-  const durationMinutes = computeDurationMinutes(session, session.cachedDayEvents || []);
+  const events = await listCalendarEvents(session.dateISO);
+  if (isDateClosedByCalendar(events)) {
+    return { status: "closed" };
+  }
 
-  const bookingStartUtc = zonedDateTimeToUtc(dateISO, time24, GOOGLE_CALENDAR_TZ);
-  const bookingEndUtc = new Date(bookingStartUtc.getTime() + durationMinutes * 60 * 1000);
-  const bookingRange = { start: bookingStartUtc, end: bookingEndUtc };
+  session.forceOperatorFallback = false;
+  session.divanettiNotice = false;
+  session.divanettiNoticeSpoken = false;
+  session.durationMinutes = computeDurationMinutes(session, events);
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const bookingStart = makeUtcDateFromZoned(session.dateISO, session.time24, tz);
+  const bookingEnd = new Date(bookingStart.getTime() + (session.durationMinutes || 120) * 60 * 1000);
+  const bookingRange = { start: bookingStart, end: bookingEnd };
+  const occupied = new Set();
+  const eventoEvents = [];
 
-  const events = await listCalendarEvents(dateISO);
-
-  // 1) EVENTI: se ci sono eventi che definiscono esplicitamente i tavoli disponibili, li usiamo come vincolo.
-  //    Importante: se un evento NON contiene tavoli, non deve bloccare tutto.
-  let availableOverride = null;
   for (const event of events) {
-    const summary = String(event?.summary || "").toLowerCase();
-    const eventType = getEventPrivateType(event);
-    if (!(eventType === "evento" || summary.startsWith("evento"))) continue;
-
-    const eventRange = getEventTimeRange(event);
-    if (!eventRange) continue;
-    if (!overlapsRange(bookingRange, eventRange)) continue;
-
-    const eventTables = extractKnownTablesFromEvent(event);
-    if (eventTables.length === 0) {
-      // Evento generico: NON applicare override
+    const summary = String(event.summary || "").toLowerCase();
+    if (summary.startsWith("annullata")) continue;
+    if (summary.includes("evento")) {
+      eventoEvents.push(event);
       continue;
     }
-
-    availableOverride = new Set(eventTables);
-    break;
-  }
-
-  // 2) OCCUPATI: estrai solo da prenotazioni reali (ignora eventi di sistema, all-day non pertinenti).
-  const occupied = new Set();
-  for (const event of events) {
-    if (!event) continue;
-    if (isSystemCalendarEvent(event)) continue;
-
-    const summary = String(event.summary || "").toLowerCase();
-    const eventType = getEventPrivateType(event);
-    if (eventType === "evento" || summary.startsWith("evento")) continue;
-    if (summary.includes("annullata")) continue;
-
-    // ignora eventi all-day (tranne "locale chiuso" che viene gestito altrove)
-    if (event?.start?.date && !event?.start?.dateTime) continue;
-
-    if (!isReservationLikeEvent(event)) continue;
-
     const eventRange = getEventTimeRange(event);
-    if (!eventRange) continue;
-    if (!overlapsRange(bookingRange, eventRange)) continue;
-
-    const eventTables = extractKnownTablesFromEvent(event);
-    for (const id of eventTables) occupied.add(id);
+    if (!eventRange || !overlapsRange(bookingRange, eventRange)) continue;
+    const tableIds = extractTablesFromEvent(event);
+    tableIds.forEach((id) => occupied.add(id));
   }
 
-  const allTablesPool = buildTablePool(session.areaPreference);
-  const availableTables = buildAvailableTables(allTablesPool, occupied, availableOverride);
+  let availableOverride = null;
+  if (eventoEvents.length > 0) {
+    const eventTables = eventoEvents
+      .flatMap((event) => extractTablesFromEvent(event))
+      ;
+    availableOverride = new Set(eventTables);
+  }
 
-  let selection = pickBestTableSelection({
-    availableTables,
-    numberPeople: session.people,
-    allowSplit: session.allowSplit,
-  });
-
-  // Se non abbiamo selezione, fallback: nessun tavolo
+  const selection = pickTableForParty(session.people, occupied, availableOverride, session);
   if (!selection) {
-    return { ok: false, reason: "unavailable", occupied: Array.from(occupied), availableOverride: availableOverride ? Array.from(availableOverride) : null };
+    const availableTables = buildAvailableTables(occupied, availableOverride, session);
+    const availableSet = buildAvailableTableSet(availableTables);
+    if (session.people === 12) {
+      const comboT14 = TABLE_COMBINATIONS.find(
+        (combo) => combo.displayId === "T14" && combo.replaces.length === 2 && combo.replaces.includes("T15")
+      );
+      const comboT7T11 = TABLE_COMBINATIONS.find(
+        (combo) =>
+          combo.displayId === "T11" &&
+          combo.replaces.length === 4 &&
+          combo.replaces.includes("T7") &&
+          combo.replaces.includes("T11") &&
+          combo.replaces.includes("T12") &&
+          combo.replaces.includes("T13")
+      );
+      const hasComboT14 = comboT14 && comboT14.replaces.every((id) => availableSet.has(id));
+      const hasComboT7T11 = comboT7T11 && comboT7T11.replaces.every((id) => availableSet.has(id));
+      if (!hasComboT14 && !hasComboT7T11) {
+        session.criticalReservation = true;
+        session.tableDisplayId = "T10";
+        session.tableLocks = ["T10"];
+        session.tableNotes = null;
+        session.divanettiNotice = false;
+        session.divanettiNoticeSpoken = false;
+        session.splitRequired = false;
+        session.outsideRequired = false;
+        return { status: "ok", selection: { displayId: "T10", locks: ["T10"], notes: null } };
+      }
+    }
+    const insideTables = availableTables.filter((table) => table.area === "inside");
+    const insideSplit = pickSplitTables(session.people, insideTables, session);
+    if (insideSplit) {
+      session.tableDisplayId = insideSplit.displayIds.join(" e ");
+      session.tableLocks = insideSplit.locks;
+      session.tableNotes = insideSplit.notes;
+      session.divanettiNotice = insideSplit.locks.some((id) => isDivanettiTableId(id));
+      session.divanettiNoticeSpoken = false;
+      session.splitRequired = true;
+      session.outsideRequired = false;
+      return { status: "needs_split" };
+    }
+
+    const anySplit = pickSplitTables(session.people, availableTables, session);
+    if (anySplit) {
+      session.tableDisplayId = anySplit.displayIds.join(" e ");
+      session.tableLocks = anySplit.locks;
+      session.tableNotes = anySplit.notes;
+      session.divanettiNotice = anySplit.locks.some((id) => isDivanettiTableId(id));
+      session.divanettiNoticeSpoken = false;
+      session.splitRequired = true;
+      session.outsideRequired = anySplit.locks.some((id) => getTableById(id)?.area === "outside");
+      return { status: "needs_outside" };
+    }
+
+    return { status: "unavailable" };
+  }
+  if (!isValidTableSelection(selection)) {
+    session.forceOperatorFallback = true;
+    session.tableDisplayId = null;
+    session.tableLocks = [];
+    session.tableNotes = null;
+    return { status: "unavailable" };
+  }
+  session.tableDisplayId = selection.displayId;
+  session.tableLocks = selection.locks;
+  session.tableNotes = selection.notes;
+  session.divanettiNotice = selection.locks.some((id) => isDivanettiTableId(id));
+  session.divanettiNoticeSpoken = false;
+  session.splitRequired = false;
+  session.outsideRequired = selection.locks.some((id) => getTableById(id)?.area === "outside");
+
+  if (commit && eventoEvents.length > 0) {
+    const calendar = buildCalendarClient();
+    if (calendar) {
+      for (const event of eventoEvents) {
+        const eventTables = extractTablesFromEvent(event);
+        const remaining = eventTables.filter((id) => !selection.locks.includes(id));
+        const availableCount = remaining.length;
+        const updatedSummary = `Evento - tavoli disponibili: ${availableCount}`;
+        const baseDescription = String(event.description || "");
+        const updatedDescription = baseDescription.match(/Tavolo:\s*/i)
+          ? baseDescription.replace(/Tavolo:\s*[^\n]*/i, `Tavolo: ${remaining.join(", ")}`)
+          : `${baseDescription}\nTavolo: ${remaining.join(", ")}`.trim();
+        try {
+          await calendar.events.patch({
+            calendarId: GOOGLE_CALENDAR_ID,
+            eventId: event.id,
+            requestBody: {
+              summary: updatedSummary,
+              description: updatedDescription,
+            },
+          });
+        } catch (err) {
+          console.error("[GOOGLE] Calendar event update failed:", err);
+        }
+      }
+    }
   }
 
-  if (commit) {
-    session.tableDisplayId = selection.displayId;
-    session.tableLocks = selection.locks;
-  }
-
-  return { ok: true, selection, occupied: Array.from(occupied), availableOverride: availableOverride ? Array.from(availableOverride) : null };
+  return { status: "ok", selection };
 }
-
 
 async function cancelCalendarEvent(session) {
   if (!session?.calendarEventId) return null;
@@ -1759,94 +1819,83 @@ async function cancelCalendarEvent(session) {
     return null;
   }
 }
-async function createCalendarEvent(session, tableSelection) {
-  const calendar = await getCalendarClient();
 
-  const callSid = session.callSid || session.twilioCallSid || "";
+async function createCalendarEvent(session) {
+  if (!GOOGLE_CALENDAR_ID) return null;
+  const calendar = buildCalendarClient();
+  if (!calendar) return null;
+  if (!session?.dateISO || !session?.time24 || !session?.name || !session?.people) return null;
 
-  // Idempotenza: se esiste gia un evento prenotazione con questo CallSid, non crearne altri
+  const reservation = await reserveTableForSession(session, { commit: true });
+  if (reservation.status === "closed") return { status: "closed" };
+  if (reservation.status === "unavailable") return { status: "unavailable" };
+
+  // Idempotenza: evita doppie prenotazioni su retry
+  const callSid = session.callSid || session.sid || "";
   if (callSid) {
-    try {
-      const range = getTimeRangeForDate(session.dateISO);
-      const existing = await calendar.events.list({
-        calendarId: GOOGLE_CALENDAR_ID,
-        timeMin: range.start.toISOString(),
-        timeMax: range.end.toISOString(),
-        singleEvents: true,
-        orderBy: "startTime",
-        privateExtendedProperty: [`tb_callSid=${callSid}`],
-      });
-      const found = (existing?.data?.items || []).find((e) => {
-        const p = e?.extendedProperties?.private || {};
-        return String(p.tb_type || p.type || "").toLowerCase() === "prenotazione";
-      });
-      if (found) {
-        session.bookingCompleted = true;
-        session.calendarEventId = found.id || null;
-        session.tableDisplayId = session.tableDisplayId || tableSelection?.displayId || "";
-        session.tableLocks = session.tableLocks || tableSelection?.locks || [];
-        return found;
-      }
-    } catch (err) {
-      console.warn("[CAL] Idempotency check failed (continue):", err?.message || err);
+    const existing = await findExistingEventByPrivateProps({
+      calendar,
+      dateISO: session.dateISO,
+      props: { ai_call_sid: callSid, ai_kind: "booking" },
+    });
+    if (existing?.id) {
+      session.calendarEventId = existing.id;
+      session.calendarEventSummary = existing.summary || session.calendarEventSummary;
+      session.bookingCompleted = true;
+      await upsertAvailabilityEvent(session.dateISO);
+      return existing;
     }
   }
 
-  const durationMinutes = computeDurationMinutes(session, session.cachedDayEvents || []);
-  const startLocal = { dateISO: session.dateISO, time24: session.time24 };
-  const startUtc = zonedDateTimeToUtc(startLocal.dateISO, startLocal.time24, GOOGLE_CALENDAR_TZ);
-  const endUtc = new Date(startUtc.getTime() + durationMinutes * 60 * 1000);
-  const endLocal = utcToZonedParts(endUtc, GOOGLE_CALENDAR_TZ);
+  const startDateTime = `${session.dateISO}T${session.time24}:00`;
 
-  const tableLabel = Array.isArray(tableSelection?.locks) && tableSelection.locks.length > 0 ? tableSelection.locks.join(" e ") : tableSelection?.displayId || "";
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const endDateTime = computeEndDateTime(session.dateISO, session.time24, session.durationMinutes || 120, tz);
 
+  const tableLabel = session.tableLocks?.length
+    ? session.tableLocks.join(" e ")
+    : session.tableDisplayId || "da assegnare";
   const event = {
     summary: `Ore ${session.time24}, tav ${tableLabel}, ${session.name}, ${session.people} pax`,
     description: [
-      `Telefono: ${session.phone || ""}`,
-      `Nome: ${session.name || ""}`,
-      `Persone: ${session.people || ""}`,
-      `Data: ${session.dateISO || ""}`,
-      `Ora: ${session.time24 || ""}`,
-      `Tavolo: ${tableSelection?.displayId || ""}`,
-      `Locks: ${(tableSelection?.locks || []).join(",")}`,
-      `Richieste: ${buildSpecialRequestsText(session)}`,
-      "",
-      "[TB_META]",
-      `tb_callSid=${callSid}`,
+      `Nome: ${session.name}`,
+      `Persone: ${session.people}`,
+      `Note: ${buildSpecialRequestsText(session)}`,
+      `Preordine: ${session.preorderLabel || "nessuno"}`,
+      `Tavolo: ${tableLabel}`,
+      `Telefono: ${session.phone || "non fornito"}`,
     ].join("\n"),
-    start: { dateTime: `${startLocal.dateISO}T${startLocal.time24}:00`, timeZone: GOOGLE_CALENDAR_TZ },
-    end: { dateTime: `${endLocal.dateISO}T${endLocal.time24}:00`, timeZone: GOOGLE_CALENDAR_TZ },
+    start: { dateTime: startDateTime, timeZone: GOOGLE_CALENDAR_TZ },
+    end: { dateTime: endDateTime, timeZone: GOOGLE_CALENDAR_TZ },
     extendedProperties: {
       private: {
-        tb_type: "prenotazione",
-        tb_callSid: callSid,
-        tb_table: String(tableSelection?.displayId || ""),
-        tb_locks: String((tableSelection?.locks || []).join(",")),
+        ai_call_sid: session.callSid || session.sid || "",
+        ai_kind: "booking",
       },
     },
   };
-
-  const created = await calendar.events.insert({
-    calendarId: GOOGLE_CALENDAR_ID,
-    requestBody: event,
-  });
-
-  session.bookingCompleted = true;
-  session.calendarEventId = created?.data?.id || null;
-
-  // aggiorna subito l'evento tavoli disponibili (descrizione coerente con TZ)
-  try {
-    const dayEvents = await listCalendarEvents(session.dateISO);
-    const availabilityDescription = buildAvailabilityDescription(dayEvents, session.dateISO);
-    await upsertAvailabilityEvent(calendar, session.dateISO, availabilityDescription);
-  } catch (err) {
-    console.warn("[CAL] Availability update failed:", err?.message || err);
+  if (session.criticalReservation) {
+    event.colorId = CRITICAL_COLOR_ID;
   }
 
-  return created?.data;
+  try {
+    const result = await calendar.events.insert({
+      calendarId: GOOGLE_CALENDAR_ID,
+      requestBody: event,
+    });
+    const data = result?.data || null;
+    if (data?.id) {
+      session.calendarEventId = data.id;
+      session.calendarEventSummary = data.summary || event.summary;
+    }
+    session.bookingCompleted = true;
+    await upsertAvailabilityEvent(session.dateISO);
+    return data;
+  } catch (err) {
+    console.error("[GOOGLE] Calendar insert failed:", err);
+    return null;
+  }
 }
-
 
 async function createEventCalendarEvent(session) {
   if (!GOOGLE_CALENDAR_ID) return null;
@@ -1855,13 +1904,9 @@ async function createEventCalendarEvent(session) {
   if (!session?.eventDateISO || !session?.eventTime24 || !session?.eventName) return null;
 
   const startDateTime = `${session.eventDateISO}T${session.eventTime24}:00`;
-  const endDate = new Date(`${session.eventDateISO}T${session.eventTime24}:00`);
-  endDate.setMinutes(endDate.getMinutes() + 120);
-  const endDateTime = `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, "0")}-${String(
-    endDate.getDate()
-  ).padStart(2, "0")}T${String(endDate.getHours()).padStart(2, "0")}:${String(
-    endDate.getMinutes()
-  ).padStart(2, "0")}:00`;
+
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const endDateTime = computeEndDateTime(session.eventDateISO, session.eventTime24, 120, tz);
 
   const event = {
     summary: `Evento - ${session.eventName}`,
@@ -1890,159 +1935,158 @@ async function createEventCalendarEvent(session) {
     return null;
   }
 }
+
+
+
+function buildFailedCallEventPayload(session, req, reason) {
+  const callSid = (session && (session.callSid || session.sid)) || req?.body?.CallSid || "";
+  const from = (session && session.phone) || req?.body?.From || "";
+  const state = (session && session.step) || "unknown";
+  const intent = (session && session.intent) || "";
+
+  const lines = [];
+  lines.push(`Numero di telefono: ${from || "-"}`);
+  if (session?.name) lines.push(`Nome: ${session.name}`);
+  if (session?.dateISO) lines.push(`Data richiesta: ${session.dateISO}`);
+  if (session?.time24) lines.push(`Orario richiesto: ${session.time24}`);
+  if (session?.people) lines.push(`Numero persone: ${session.people}`);
+  if (intent) lines.push(`Tipo richiesta: ${intent}`);
+  const note = buildSpecialRequestsText(session || {});
+  if (note) lines.push(`Richieste / note: ${note}`);
+  if (session?.preorderLabel) lines.push(`Preordine: ${session.preorderLabel}`);
+  if (session?.operatorReasonRaw) lines.push(`Motivo operatore: ${session.operatorReasonRaw}`);
+  lines.push(`Stato finale: ${reason || "chiamata interrotta"}`);
+  lines.push(`Step: ${state}`);
+  if (callSid) lines.push(`CallSid: ${callSid}`);
+
+  return {
+    summary: "⚠️ TENTATIVO NON COMPLETATO – Chiamata interrotta",
+    description: lines.join("\n"),
+  };
+}
+
 async function createFailedCallCalendarEvent(session, req, reason) {
-  const calendar = await getCalendarClient();
+  if (!GOOGLE_CALENDAR_ID) return null;
+  const calendar = buildCalendarClient();
+  if (!calendar) return null;
 
-  const callSid = session?.callSid || req?.body?.CallSid || "";
-  const phone = session?.phone || req?.body?.From || "";
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const callSid = (session && (session.callSid || session.sid)) || req?.body?.CallSid || "";
 
-  // usa la data locale del call (timezone calendario)
-  const dateISO = toISODate(new Date());
-  const nextDateISO = getNextDateISO(dateISO);
-
+  // Dedup: se esiste gia' un evento per questo CallSid, non crearne altri
   if (callSid) {
-    // Se esiste gia una prenotazione o una callback operatore per questo CallSid, NON creare "tentativo non completato"
-    try {
-      const range = getTimeRangeForDate(dateISO);
-      const existing = await calendar.events.list({
-        calendarId: GOOGLE_CALENDAR_ID,
-        timeMin: range.start.toISOString(),
-        timeMax: range.end.toISOString(),
-        singleEvents: true,
-        orderBy: "startTime",
-        privateExtendedProperty: [`tb_callSid=${callSid}`],
-      });
-      const items = existing?.data?.items || [];
-      const hasReservation = items.some((e) => {
-        const p = e?.extendedProperties?.private || {};
-        const t = String(p.tb_type || p.type || "").toLowerCase();
-        return t === "prenotazione";
-      });
-      const hasOperator = items.some((e) => {
-        const p = e?.extendedProperties?.private || {};
-        const t = String(p.tb_type || p.type || "").toLowerCase();
-        return t === "operator_callback";
-      });
-      const hasFailed = items.some((e) => {
-        const p = e?.extendedProperties?.private || {};
-        const t = String(p.tb_type || p.type || "").toLowerCase();
-        return t === "failed_call";
-      });
-
-      if (hasReservation || hasOperator || hasFailed) {
-        session.fallbackEventCreated = true;
-        return null;
-      }
-    } catch (err) {
-      console.warn("[CAL] Failed-call idempotency check failed (continue):", err?.message || err);
-    }
+    const existing = await findExistingEventByPrivateProps({
+      calendar,
+      dateISO: formatISODateInTimeZone(new Date((session && session.createdAt) || Date.now()), tz),
+      props: { ai_call_sid: callSid, ai_kind: "failed_call" },
+    });
+    if (existing?.id) return existing;
   }
 
-  const description = [
-    `Numero: ${phone}`,
-    `CallSid: ${callSid}`,
-    `Motivo: ${reason || ""}`,
-    `Stato: ${session?.step || ""}`,
-    "",
-    "Dati raccolti:",
-    `Nome: ${session?.name || ""}`,
-    `Persone: ${session?.people || ""}`,
-    `Data: ${session?.dateISO || ""}`,
-    `Ora: ${session?.time24 || ""}`,
-    `Richieste: ${buildSpecialRequestsText(session)}`,
-  ].join("\n");
+  const createdAt = (session && session.createdAt) || Date.now();
+  const dayISO = formatISODateInTimeZone(new Date(createdAt), tz);
+  const nextDayISO = addDaysToISODate(dayISO, 1) || getNextDateISO(dayISO);
 
-  const created = await calendar.events.insert({
-    calendarId: GOOGLE_CALENDAR_ID,
-    requestBody: {
-      summary: "⚠️ TENTATIVO NON COMPLETATO – Chiamata interrotta",
-      description,
-      start: { date: dateISO },
-      end: { date: nextDateISO },
-      colorId: "11",
-      extendedProperties: {
-        private: {
-          tb_type: "failed_call",
-          tb_callSid: callSid,
-        },
+  const fromNumber = (session && session.phone) || req?.body?.From || "";
+  const payload = buildFailedCallEventPayload(session || {}, req, reason);
+
+  const event = {
+    summary: payload.summary || "⚠️ TENTATIVO NON COMPLETATO – Chiamata interrotta",
+    description: payload.description || "",
+    start: { date: dayISO },
+    end: { date: nextDayISO },
+    extendedProperties: {
+      private: {
+        ai_call_sid: callSid,
+        ai_kind: "failed_call",
       },
     },
-  });
+  };
 
-  session.fallbackEventCreated = true;
-  return created?.data || null;
+  try {
+    const result = await calendar.events.insert({
+      calendarId: GOOGLE_CALENDAR_ID,
+      requestBody: event,
+    });
+    return result?.data || null;
+  } catch (err) {
+    console.error("[GOOGLE] Failed-call event insert failed:", err);
+    return null;
+  }
 }
-async function createOperatorCallbackCalendarEvent(session, req, reason, operatorReasonText) {
-  const calendar = await getCalendarClient();
 
-  const callSid = session?.callSid || req?.body?.CallSid || "";
-  const phone = session?.phone || req?.body?.From || "";
 
-  const dateISO = toISODate(new Date());
-  const nextDateISO = getNextDateISO(dateISO);
 
-  if (callSid) {
-    try {
-      const range = getTimeRangeForDate(dateISO);
-      const existing = await calendar.events.list({
-        calendarId: GOOGLE_CALENDAR_ID,
-        timeMin: range.start.toISOString(),
-        timeMax: range.end.toISOString(),
-        singleEvents: true,
-        orderBy: "startTime",
-        privateExtendedProperty: [`tb_callSid=${callSid}`],
+async function createOperatorCallbackCalendarEvent(session, req, dialStatus) {
+  if (!session) return null;
+  if (session.operatorCallbackEventCreated === true) return null;
+  if (!GOOGLE_CALENDAR_ID) {
+    session.operatorCallbackEventCreated = true;
+    return null;
+  }
+  const calendar = buildCalendarClient();
+  if (!calendar) {
+    session.operatorCallbackEventCreated = true;
+    return null;
+  }
+
+  try {
+    const todayISO = toISODate(new Date());
+    const phone = req?.body?.From || session.phone || "";
+    const callSid = req?.body?.CallSid || "";
+    const status = String(dialStatus || "").trim() || "callback";
+
+    if (callSid) {
+      const existing = await findExistingEventByPrivateProps({
+        calendar,
+        dateISO: todayISO,
+        props: { ai_call_sid: callSid, ai_kind: "operator_callback" },
       });
-      const found = (existing?.data?.items || []).find((e) => {
-        const p = e?.extendedProperties?.private || {};
-        const t = String(p.tb_type || p.type || "").toLowerCase();
-        return t === "operator_callback";
-      });
-      if (found) {
+      if (existing?.id) {
         session.operatorCallbackEventCreated = true;
-        return found;
+        return existing;
       }
-    } catch (err) {
-      console.warn("[CAL] Operator-callback idempotency check failed (continue):", err?.message || err);
     }
-  }
 
-  const description = [
-    `Numero: ${phone}`,
-    `CallSid: ${callSid}`,
-    `Motivo trasferimento: ${reason || ""}`,
-    `Motivo cliente: ${operatorReasonText || ""}`,
-    "",
-    "Contesto:",
-    `Intent: ${session?.intent || ""}`,
-    `Stato: ${session?.step || ""}`,
-    `Nome: ${session?.name || ""}`,
-    `Persone: ${session?.people || ""}`,
-    `Data: ${session?.dateISO || ""}`,
-    `Ora: ${session?.time24 || ""}`,
-    `Richieste: ${buildSpecialRequestsText(session)}`,
-  ].join("\n");
+    const lines = [];
+    lines.push(`Numero: ${phone || "-"}`);
+    if (session.name) lines.push(`Nome: ${session.name}`);
+    if (session.dateISO) lines.push(`Data richiesta: ${session.dateISO}`);
+    if (session.time24) lines.push(`Orario richiesto: ${session.time24}`);
+    if (session.people) lines.push(`Persone: ${session.people}`);
+    if (session.intent) lines.push(`Tipo richiesta: ${session.intent}`);
+    if (session.extraRequestsRaw) lines.push(`Richieste: ${session.extraRequestsRaw}`);
+    if (session.operatorReasonRaw) lines.push(`Motivo operatore: ${session.operatorReasonRaw}`);
+    lines.push(`DialCallStatus: ${status}`);
+    lines.push(`Step: ${session.step || "-"}`);
+    lines.push(`CallSid: ${callSid || "-"}`);
 
-  const created = await calendar.events.insert({
-    calendarId: GOOGLE_CALENDAR_ID,
-    requestBody: {
-      summary: "🟡 RICHIAMARE OPERATORE – Richiesta cliente",
-      description,
-      start: { date: dateISO },
-      end: { date: nextDateISO },
-      colorId: "5",
+    const requestBody = {
+      summary: "🟡 RICHIAMARE – richiesta operatore",
+      description: lines.join("\n"),
+      start: { date: todayISO },
+      end: { date: getNextDateISO(todayISO) },
+      colorId: CRITICAL_COLOR_ID,
       extendedProperties: {
         private: {
-          tb_type: "operator_callback",
-          tb_callSid: callSid,
+          ai_call_sid: callSid,
+          ai_kind: "operator_callback",
         },
       },
-    },
-  });
+    };
 
-  session.operatorCallbackEventCreated = true;
-  return created?.data || null;
+    const result = await calendar.events.insert({
+      calendarId: GOOGLE_CALENDAR_ID,
+      requestBody,
+    });
+    return result?.data || null;
+  } catch (err) {
+    console.error("[GOOGLE] Operator callback event insert failed:", err);
+    return null;
+  } finally {
+    session.operatorCallbackEventCreated = true;
+  }
 }
-
 
 async function safeCreateOperatorCallbackCalendarEvent(session, req, dialStatus) {
   try {
@@ -2054,14 +2098,52 @@ async function safeCreateOperatorCallbackCalendarEvent(session, req, dialStatus)
 
 async function safeCreateFailedCallCalendarEvent(session, req, reason) {
   try {
-    await createFailedCallCalendarEvent(session, req, reason);
+    if (session) {
+      if (session.bookingCompleted) return;
+      if (session.calendarEventId) return;
+      if (session.operatorCallbackEventCreated) return;
+      if (session.fallbackEventCreated) return;
+    }
+    await createFailedCallCalendarEvent(session || null, req, reason);
   } catch (err) {
     console.error("[GOOGLE] Failed call safe insert failed:", err);
+  } finally {
+    if (session) session.fallbackEventCreated = true;
   }
 }
 
+
 // ======================= ROUTES =======================
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+
+// ======================= TWILIO STATUS CALLBACK =======================
+// Configura questo endpoint come "Status Callback URL" del numero Twilio (Voice) per tracciare le chiamate concluse.
+app.post("/twilio/status", async (req, res) => {
+  try {
+    const callSid = String(req.body?.CallSid || "").trim();
+    const callStatus = String(req.body?.CallStatus || "").trim().toLowerCase();
+
+    // Stati terminali Twilio
+    const isTerminal = ["completed", "busy", "failed", "no-answer", "canceled"].includes(callStatus);
+    if (!isTerminal) {
+      return res.sendStatus(204);
+    }
+
+    const session = callSid ? getSession(callSid) : null;
+
+    // Se prenotazione completata o callback operatore gia' creata, non creare fallback
+    if (session && (session.bookingCompleted || session.calendarEventId || session.operatorCallbackEventCreated)) {
+      return res.sendStatus(204);
+    }
+
+    await safeCreateFailedCallCalendarEvent(session, req, `call_status_${callStatus}`);
+    return res.sendStatus(204);
+  } catch (err) {
+    console.error("[TWILIO] Status callback error:", err);
+    return res.sendStatus(204);
+  }
+});
 
 // ======================= WHATSAPP / SMS INBOUND (TWILIO) =======================
 // Twilio invia i messaggi in arrivo come HTTP POST (application/x-www-form-urlencoded).
@@ -2561,6 +2643,7 @@ async function handleVoiceRequest(req, res) {
   const callSid = req.body.CallSid || "";
   const speech = String(req.body.SpeechResult || req.body.Digits || "");
   const session = getSession(callSid);
+  if (session && !session.callSid) session.callSid = callSid;
   const vr = buildTwiml();
 
   try {
@@ -3365,67 +3448,6 @@ async function handleVoiceRequest(req, res) {
   }
 }
 
-
-
-function isFinalCallStatus(status) {
-  const s = String(status || "").toLowerCase();
-  return ["completed", "busy", "failed", "no-answer", "canceled"].includes(s);
-}
-
-app.post("/twilio/status", async (req, res) => {
-  try {
-    const callSid = req?.body?.CallSid || "";
-    const callStatus = String(req?.body?.CallStatus || "").toLowerCase();
-    const from = req?.body?.From || "";
-
-    if (!callSid || !isFinalCallStatus(callStatus)) {
-      return res.status(204).end();
-    }
-
-    // ricostruisci session minima (anche se l'istanza e' diversa)
-    const session = getSession(callSid);
-    session.callSid = callSid;
-    if (!session.phone && from) session.phone = from;
-
-    // Se esiste una prenotazione (tb_type=prenotazione) o una callback operatore per questo CallSid, non creare fallback.
-    const calendar = await getCalendarClient();
-    const dateISO = toISODate(new Date());
-    const range = getTimeRangeForDate(dateISO);
-
-    try {
-      const existing = await calendar.events.list({
-        calendarId: GOOGLE_CALENDAR_ID,
-        timeMin: range.start.toISOString(),
-        timeMax: range.end.toISOString(),
-        singleEvents: true,
-        orderBy: "startTime",
-        privateExtendedProperty: [`tb_callSid=${callSid}`],
-      });
-      const items = existing?.data?.items || [];
-      const hasReservation = items.some((e) => {
-        const p = e?.extendedProperties?.private || {};
-        const t = String(p.tb_type || p.type || "").toLowerCase();
-        return t === "prenotazione";
-      });
-      const hasOperator = items.some((e) => {
-        const p = e?.extendedProperties?.private || {};
-        const t = String(p.tb_type || p.type || "").toLowerCase();
-        return t === "operator_callback";
-      });
-      if (hasReservation || hasOperator) {
-        return res.status(204).end();
-      }
-    } catch (err) {
-      console.warn("[STATUS] Cannot check existing events:", err?.message || err);
-    }
-
-    await safeCreateFailedCallCalendarEvent(session, req, `callStatus=${callStatus}`);
-    return res.status(204).end();
-  } catch (err) {
-    console.error("[STATUS] Error:", err);
-    return res.status(204).end();
-  }
-});
 app.all("/twilio/voice", async (req, res) => {
   console.log(`[VOICE] ${req.method} /twilio/voice`);
   const payload = req.method === "POST" ? req.body : req.query;
