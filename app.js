@@ -371,8 +371,32 @@ function buildTwiml() {
   return new twilio.twiml.VoiceResponse();
 }
 
+
+
+function sanitizeForTTS(input) {
+  let t = String(input || "");
+  // normalizza spazi e caratteri
+  t = t.replace(/ /g, " ").replace(/\s+/g, " ").trim();
+
+  // espandi abbreviazioni frequenti (lettura voce)
+  t = t.replace(/\btav\b/gi, "tavolo");
+  t = t.replace(/\bpax\b/gi, "persone");
+  t = t.replace(/\bnr\.?\b/gi, "numero");
+  t = t.replace(/\bn[\.°º]?\s*(\d+)\b/gi, "numero $1");
+
+  // orari: 20:30 / 20.30 -> 20 e 30
+  t = t.replace(/(\d{1,2})[:.](\d{2})/g, "$1 e $2");
+
+  // simboli
+  t = t.replace(/\+/g, " piu ");
+  t = t.replace(/€/g, " euro ");
+
+  // ripulisci spazi
+  t = t.replace(/\s+/g, " ").trim();
+  return t;
+}
 function sayIt(response, text) {
-  response.say({ language: "it-IT" }, xmlEscape(text));
+  response.say({ language: "it-IT" }, xmlEscape(sanitizeForTTS(text)));
 }
 
 function gatherSpeech(response, promptText, opts = {}) {
@@ -387,7 +411,7 @@ function gatherSpeech(response, promptText, opts = {}) {
     action: actionUrl,
     method: "POST",
   });
-  gather.say({ language: "it-IT" }, xmlEscape(promptText));
+  gather.say({ language: "it-IT" }, xmlEscape(sanitizeForTTS(promptText)));
   response.redirect({ method: "POST" }, actionUrl);
 }
 
@@ -757,8 +781,78 @@ function normalizeText(s) {
   return String(s || "")
     .trim()
     .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/[.,!?]/g, "")
     .replace(/\s+/g, " ");
+}
+
+function extractSurnameFromSpeech(raw) {
+  const t0 = String(raw || "").trim();
+  if (!t0) return "";
+
+  let t = t0
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+  t = t
+    .replace(/[.,!?]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const stop = new Set([
+    "si",
+    "ok",
+    "eh",
+    "allora",
+    "diciamo",
+    "credo",
+    "penso",
+    "forse",
+    "magari",
+    "dovrebbe",
+    "dovrei",
+    "mi",
+    "sembra",
+    "pare",
+    "tipo",
+    "praticamente",
+    "cioe",
+    "cioe'",
+    "cioe’",
+    "il",
+    "la",
+    "lo",
+    "un",
+    "una",
+    "a",
+    "nome",
+    "cognome",
+    "prenotazione",
+    "intestata",
+    "intestato",
+    "per",
+  ]);
+
+  const connectors = new Set(["de", "di", "del", "della", "dello", "dei", "degli", "da", "d"]);
+
+  const tokens = t.split(" ").filter(Boolean);
+  // rimuovi stopword anche se ripetute
+  const cleaned = tokens.filter((w) => !stop.has(w));
+  if (cleaned.length === 0) return "";
+
+  // prendi gli ultimi 1-3 token, mantenendo eventuale connettore (es. De Luca)
+  const out = [];
+  for (let i = cleaned.length - 1; i >= 0 && out.length < 3; i--) {
+    out.unshift(cleaned[i]);
+    if (out.length === 1 && i - 1 >= 0 && connectors.has(cleaned[i - 1])) {
+      out.unshift(cleaned[i - 1]);
+      i -= 1;
+    }
+  }
+
+  return out.join(" ").trim().slice(0, 60);
 }
 
 function isPureConsent(speech) {
@@ -1463,10 +1557,28 @@ function resolveChristmasISO() {
 }
 
 function isMusicEventItem(event) {
-  const s = String(event?.summary || "").toLowerCase();
-  const d = String(event?.description || "").toLowerCase();
+  const summary = String(event?.summary || "");
+  const description = String(event?.description || "");
+  const s = summary.toLowerCase();
+  const d = description.toLowerCase();
+
+  const sNorm = normalizeText(summary);
+  if (!sNorm) return false;
+
+  // escludi eventi di sistema / disponibilita / richiami / prenotazioni
+  if (
+    sNorm.includes("tavoli disponibili") ||
+    sNorm.includes("richiamare") ||
+    sNorm.startsWith("annullat") ||
+    sNorm.includes("chiuso") ||
+    sNorm.includes("chiusura") ||
+    sNorm.startsWith("ore ")
+  ) {
+    return false;
+  }
+
   const blob = `${s} ${d}`;
-  return (
+  const hasMusicKeyword =
     blob.includes("dj") ||
     blob.includes("dj set") ||
     blob.includes("live") ||
@@ -1475,8 +1587,14 @@ function isMusicEventItem(event) {
     blob.includes("jazz") ||
     blob.includes("concerto") ||
     blob.includes("band") ||
-    blob.includes("quartet")
-  );
+    blob.includes("quartet") ||
+    blob.includes("quartetto") ||
+    blob.includes("quartetto");
+
+  if (!hasMusicKeyword) return false;
+
+  // include ALL-DAY solo se keyword in titolo o descrizione (gia' incluso nel blob)
+  return true;
 }
 
 function getEventStartDateISO(event) {
@@ -2105,7 +2223,17 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       return { kind: "vr", twiml: vr.toString() };
     }
     resetRetries(session);
-    session.manageSurname = speech.trim().slice(0, 60);
+    const cleanedSurname = extractSurnameFromSpeech(speech);
+    if (!cleanedSurname) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(`Richiesta annullamento prenotazione: cognome non riconosciuto (data ${session.manageDateISO || ""})`);
+      }
+      gatherSpeech(vr, "Non ho capito il cognome. Puoi ripeterlo?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    session.manageSurname = cleanedSurname;
     session.operatorState = "manage_cancel_time";
     gatherSpeech(vr, "Se ricordi anche l'orario dimmelo, altrimenti dì: non lo ricordo.");
     return { kind: "vr", twiml: vr.toString() };
@@ -2261,7 +2389,17 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     if (tt.includes("non lo ricordo") || tt.includes("non ricordo") || isNoRequestsText(speech)) {
       session.manageSurname = null;
     } else {
-      session.manageSurname = speech.trim().slice(0, 60);
+      const cleanedSurname = extractSurnameFromSpeech(speech);
+      if (!cleanedSurname) {
+        session.retries = (session.retries || 0) + 1;
+        if (session.retries >= 2) {
+          return forwardBecause(`Richiesta modifica prenotazione: cognome non riconosciuto (data ${session.manageDateISO || ""}, orario ${session.manageTime24 || ""})`);
+        }
+        gatherSpeech(vr, "Non ho capito il cognome. Puoi ripeterlo?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+      resetRetries(session);
+      session.manageSurname = cleanedSurname;
     }
     session.operatorState = "manage_modify_search";
     return handleManageBookingFlow(session, req, vr, speech, false);
