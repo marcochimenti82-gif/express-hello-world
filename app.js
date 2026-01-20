@@ -47,8 +47,8 @@ const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "
 
 const SMTP_HOST = process.env.SMTP_HOST || "";
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
-const SMTP_USER = process.env.EMAIL_USER || "";
-const SMTP_PASS = process.env.EMAIL_PASS || "";
+const SMTP_USER = process.env.EMAIL_USER || process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.EMAIL_PASS || process.env.SMTP_PASS || "";
 const SMTP_SECURE = (process.env.SMTP_SECURE || "false").toLowerCase() === "true";
 const EMAIL_TO = process.env.EMAIL_TO || "tuttibrillienoteca@gmail.com";
 const EMAIL_FROM = process.env.EMAIL_FROM || "no-reply@tuttibrilli.local";
@@ -413,22 +413,47 @@ function forwardToHumanTwiml(req) {
   sayIt(vr, t("step9_fallback_transfer_operator.main"));
 
   const operatorPhone = getOperatorPhoneE164();
-  if (operatorPhone) {
-    const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice/after-dial` : "/twilio/voice/after-dial";
-
-    const dialAttrs = { timeout: 25, action: actionUrl, method: "POST", answerOnBridge: true };
-
-    // callerId stabile (preferisci numero Twilio; fallback: numero chiamato in ingresso)
-    const candidates = [];
-    if (isValidPhoneE164(TWILIO_VOICE_FROM)) candidates.push(TWILIO_VOICE_FROM.trim());
-    const inboundTo = req?.body?.To || req?.body?.Called || "";
-    const inboundToE164 = parsePhoneNumber(inboundTo);
-    if (isValidPhoneE164(inboundToE164)) candidates.push(inboundToE164);
-    if (candidates.length > 0) dialAttrs.callerId = candidates[0];
-
-    vr.dial(dialAttrs, operatorPhone);
+  if (!operatorPhone) {
+    console.error("[DIAL] Operator phone missing/invalid:", { ENABLE_FORWARDING, OPERATOR_PHONE, HUMAN_FORWARD_TO });
+    return vr.toString();
   }
 
+  const inferredBaseUrl = (() => {
+    if (BASE_URL) return BASE_URL.replace(/\/+$/, "");
+    const proto = (req?.headers?.["x-forwarded-proto"] || req?.protocol || "https").toString();
+    const host = (req?.headers?.["x-forwarded-host"] || req?.headers?.host || "").toString();
+    if (!host) return "";
+    return `${proto}://${host}`.replace(/\/+$/, "");
+  })();
+
+  const actionUrl = inferredBaseUrl ? `${inferredBaseUrl}/twilio/voice/after-dial` : "/twilio/voice/after-dial";
+
+  const dialAttrs = { timeout: 25, action: actionUrl, method: "POST", answerOnBridge: true };
+
+  // CallerId: preferisci sempre TWILIO_VOICE_FROM (numero Twilio). Fallback: numero chiamato in ingresso se E.164.
+  let callerId = null;
+  if (isValidPhoneE164(TWILIO_VOICE_FROM)) {
+    callerId = TWILIO_VOICE_FROM.trim();
+  } else {
+    const inboundTo = req?.body?.To || req?.body?.Called || "";
+    const inboundToE164 = parsePhoneNumber(inboundTo);
+    if (isValidPhoneE164(inboundToE164)) callerId = inboundToE164;
+  }
+
+  if (callerId) {
+    dialAttrs.callerId = callerId;
+  } else {
+    console.error("[DIAL] Missing callerId (TWILIO_VOICE_FROM invalid and no inbound To). Dial may fail.");
+  }
+
+  console.log("[DIAL] Dialing operator:", {
+    operatorPhone,
+    callerId: dialAttrs.callerId || "(default)",
+    actionUrl,
+    ENABLE_FORWARDING,
+  });
+
+  vr.dial(dialAttrs, operatorPhone);
   return vr.toString();
 }
 
@@ -568,28 +593,42 @@ function buildOperatorEmailPayload(session, req, reason) {
 
 async function sendOperatorEmail(session, req, reason) {
   const payload = buildOperatorEmailPayload(session, req, reason);
-  if (EMAIL_PROVIDER === "resend") {
+
+  // destinatario operatore (fallback: EMAIL_TO)
+  const toOperator = String(EMAIL_OPERATOR || EMAIL_TO || "").trim();
+  if (!toOperator) {
+    console.error("[EMAIL] EMAIL_OPERATOR/EMAIL_TO not set");
+    return;
+  }
+
+  // Se hai configurato Resend, usa Resend; altrimenti SMTP.
+  // (mantiene compatibilità: non cambia dipendenze)
+  if ((EMAIL_PROVIDER || "").toLowerCase() === "resend") {
     await sendEmailWithResend({
-      to: EMAIL_OPERATOR,
+      to: toOperator,
       subject: payload.subject,
       text: payload.text,
     });
     return;
   }
+
   try {
     if (!SMTP_HOST) {
-      console.error("[EMAIL] SMTP_HOST is not set");
+      console.error("[EMAIL] SMTP_HOST is not set (operator email not sent)");
       return;
     }
+
     const transporter = nodemailer.createTransport({
       host: SMTP_HOST,
       port: SMTP_PORT,
       secure: SMTP_SECURE,
       auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
     });
+
     await transporter.sendMail({
       from: EMAIL_FROM,
-      to: EMAIL_TO,
+      to: toOperator, // operatore
+      cc: EMAIL_TO || undefined, // opzionale: copia a indirizzo principale
       subject: payload.subject,
       text: payload.text,
     });
@@ -1365,6 +1404,369 @@ async function patchBookingAsModified({
   }
 }
 
+/* ===========================
+CRITICITA 1 — INFO “SMART”
+- musica: gestisce anche “prossima settimana / settimana prossima / questa settimana”
+- disponibilita: controlla PRIMA se il locale e' chiuso (es. lunedi) e lo dice subito
+- migliora matching “mercoledi c'e musica” (cerca eventi musicali del giorno)
+- usa calendario per risposte (musica / apertura / disponibilita)
+=========================== */
+
+function parseWeekdayIndexIT(text) {
+  const t = normalizeText(text || "");
+  if (!t) return null;
+  // 0=Sun ... 6=Sat
+  const map = [
+    { keys: ["domenica"], dow: 0 },
+    { keys: ["lunedi", "lunedì"], dow: 1 },
+    { keys: ["martedi", "martedì"], dow: 2 },
+    { keys: ["mercoledi", "mercoledì"], dow: 3 },
+    { keys: ["giovedi", "giovedì"], dow: 4 },
+    { keys: ["venerdi", "venerdì"], dow: 5 },
+    { keys: ["sabato"], dow: 6 },
+  ];
+  for (const item of map) {
+    if (item.keys.some((k) => t.includes(k))) return item.dow;
+  }
+  return null;
+}
+
+function getWeekdayIndexInTimeZone(dateISO, tz) {
+  const d = makeUtcDateFromZoned(dateISO, "12:00", tz) || new Date(`${dateISO}T12:00:00`);
+  const wd = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).format(d);
+  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  return map[wd] ?? null;
+}
+
+function getCurrentWeekRangeISO(todayISO, tz) {
+  const dow = getWeekdayIndexInTimeZone(todayISO, tz);
+  if (dow === null) return { startISO: todayISO, endISO: todayISO };
+  const deltaToMonday = dow === 0 ? 6 : dow - 1; // Monday=1
+  const startISO = addDaysToISODate(todayISO, -deltaToMonday);
+  const endISO = addDaysToISODate(startISO, 6);
+  return { startISO, endISO };
+}
+
+function getNextWeekRangeISO(todayISO, tz) {
+  const curr = getCurrentWeekRangeISO(todayISO, tz);
+  const startISO = addDaysToISODate(curr.startISO, 7);
+  const endISO = addDaysToISODate(startISO, 6);
+  return { startISO, endISO };
+}
+
+function resolveChristmasISO() {
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const todayISO = formatISODateInTimeZone(new Date(), tz);
+  const year = Number(String(todayISO).slice(0, 4)) || new Date().getFullYear();
+  const thisYear = `${year}-12-25`;
+  return todayISO <= thisYear ? thisYear : `${year + 1}-12-25`;
+}
+
+function isMusicEventItem(event) {
+  const s = String(event?.summary || "").toLowerCase();
+  const d = String(event?.description || "").toLowerCase();
+  const blob = `${s} ${d}`;
+  return (
+    blob.includes("dj") ||
+    blob.includes("dj set") ||
+    blob.includes("live") ||
+    blob.includes("live music") ||
+    blob.includes("musica") ||
+    blob.includes("jazz") ||
+    blob.includes("concerto") ||
+    blob.includes("band") ||
+    blob.includes("quartet")
+  );
+}
+
+function getEventStartDateISO(event) {
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const start = event?.start?.dateTime || event?.start?.date;
+  if (!start) return null;
+  const d = new Date(start);
+  return formatISODateInTimeZone(d, tz);
+}
+
+async function listCalendarEventsBetweenISO(startISO, endISOInclusive) {
+  if (!GOOGLE_CALENDAR_ID) return [];
+  const calendar = buildCalendarClient();
+  if (!calendar) return [];
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const timeMin = makeUtcDateFromZoned(startISO, "00:00", tz) || new Date(`${startISO}T00:00:00`);
+  const endExclusiveISO = addDaysToISODate(endISOInclusive, 1);
+  const timeMax = makeUtcDateFromZoned(endExclusiveISO, "00:00", tz) || new Date(`${endExclusiveISO}T00:00:00`);
+  try {
+    const result = await calendar.events.list({
+      calendarId: GOOGLE_CALENDAR_ID,
+      timeMin: timeMin.toISOString(),
+      timeMax: timeMax.toISOString(),
+      singleEvents: true,
+      orderBy: "startTime",
+    });
+    return result?.data?.items || [];
+  } catch (err) {
+    console.error("[GOOGLE] Calendar list (range) failed:", err);
+    return [];
+  }
+}
+
+function isBusinessClosedOnDateISO(dateISO, eventsForDate) {
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const dow = getWeekdayIndexInTimeZone(dateISO, tz);
+  const isClosedDay = dow === OPENING.closedDay;
+  const isHoliday = HOLIDAYS_SET.has(dateISO);
+  const isClosedByCalendar = isDateClosedByCalendar(eventsForDate || []);
+  return Boolean(isClosedDay || isHoliday || isClosedByCalendar);
+}
+
+function formatOpeningHoursForDateISO(dateISO) {
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const dow = getWeekdayIndexInTimeZone(dateISO, tz);
+  const isFriSat = dow === 5 || dow === 6;
+  const kitchen = isFriSat ? OPENING.restaurant.friSat : OPENING.restaurant.default;
+  return `Siamo aperti dalle ${OPENING.drinksOnly.start}. Cucina dalle ${kitchen.start} alle ${kitchen.end}.`;
+}
+
+function formatMusicAnswerForRange(musicEvents, startISO, endISO) {
+  if (!musicEvents || musicEvents.length === 0) {
+    if (startISO === endISO) {
+      return `Non risulta musica in calendario per ${formatDateLabel(startISO)}.`;
+    }
+    return `Non risultano eventi musicali in calendario nel periodo ${formatDateLabel(startISO)} - ${formatDateLabel(endISO)}.`;
+  }
+
+  // raggruppa per giorno
+  const byDay = new Map();
+  for (const ev of musicEvents) {
+    const dISO = getEventStartDateISO(ev) || startISO;
+    if (!byDay.has(dISO)) byDay.set(dISO, []);
+    byDay.get(dISO).push(ev);
+  }
+
+  const days = Array.from(byDay.keys()).sort();
+  const lines = [];
+  for (const dayISO of days.slice(0, 7)) {
+    const items = (byDay.get(dayISO) || [])
+      .slice(0, 3)
+      .map((e) => String(e.summary || "").trim())
+      .filter(Boolean);
+
+    const label = new Intl.DateTimeFormat("it-IT", {
+      timeZone: GOOGLE_CALENDAR_TZ || "Europe/Rome",
+      weekday: "long",
+    }).format(makeUtcDateFromZoned(dayISO, "12:00", GOOGLE_CALENDAR_TZ || "Europe/Rome") || new Date(`${dayISO}T12:00:00`));
+
+    if (items.length === 0) continue;
+    lines.push(`${label}: ${items.join(", ")}`);
+  }
+
+  if (startISO === endISO) return `Per ${formatDateLabel(startISO)} risulta: ${lines.join(" ")}`;
+  return `Nel periodo ${formatDateLabel(startISO)} - ${formatDateLabel(endISO)} risultano: ${lines.join(" ")}`;
+}
+
+function buildPromoAnswer(textRaw) {
+  const t = normalizeText(textRaw || "");
+  const isPromo = t.includes("promo") || t.includes("brilli") || t.includes("tasting") || t.includes("piatto apericena");
+  if (!isPromo) return null;
+
+  const wantsContents =
+    t.includes("cosa comprende") ||
+    t.includes("comprende") ||
+    t.includes("include") ||
+    t.includes("quali") ||
+    t.includes("portate") ||
+    t.includes("assaggi");
+
+  if (!wantsContents) {
+    return "La promo BrilliTasting prevede il piatto apericena a 18 euro invece di 25: 13 portate, coperto e drink incluso (vino o drink base). E' obbligatoria la registrazione e la prenotazione.";
+  }
+
+  return "Il piatto apericena BrilliTasting comprende 13 assaggi: polpetta di cervo al ginepro, polpetta agnello con menta fresca e scorza di limone, falafel croccante all'aglio, mini tartare di fassona al coltello con vinaigrette agli agrumi e crema di capperi, olive e menta, paninetti con porchetta cunzata e panelle, bruschetta classica, bruschetta con stracciatella di bufala, crudo, tartare di gambero con cipolla e olive, cazzilli, verdura pastellata, caprino agli agrumi, stinco Brillo con patata al forno, millefoglie di patate e carciofi con fonduta di pecorino romano DOP. Cocktail o vino o birra e coperto inclusi.";
+}
+
+function buildDietAnswer(textRaw) {
+  const t = normalizeText(textRaw || "");
+  if (t.includes("senza glutine") || t.includes("glutine") || t.includes("celiac")) {
+    return "Si', abbiamo opzioni senza glutine, ma e' sempre meglio comunicarlo durante la prenotazione e ricordarlo al personale di sala.";
+  }
+  if (t.includes("vegano") || t.includes("vegana") || t.includes("vegetar")) {
+    return "Si', abbiamo opzioni vegetariane e anche vegane, ma e' sempre meglio comunicarlo durante la prenotazione e ricordarlo al personale di sala.";
+  }
+  if (t.includes("cane") || t.includes("gatto") || t.includes("animale")) {
+    return "Si', e' possibile portare un animale domestico, purché venga comunicato in fase di prenotazione specificando taglia e razza.";
+  }
+  if (t.includes("compleanno") || t.includes("cena aziendale") || t.includes("evento") || t.includes("festa")) {
+    return "Si', e' possibile. Spiegami in sintesi la tua esigenza e ti faremo ricontattare al piu' presto.";
+  }
+  return null;
+}
+
+async function checkAvailabilityQuickVoice(session, dateISO, people, time24) {
+  const events = await listCalendarEvents(dateISO);
+  if (isBusinessClosedOnDateISO(dateISO, events)) {
+    return { handled: true, answer: `Mi dispiace, ${formatDateLabel(dateISO)} risulta chiuso.` };
+  }
+  if (!Number.isFinite(people) || !time24) {
+    return {
+      handled: true,
+      needsDetails: true,
+      pending: { type: "availability", dateISO, people: Number.isFinite(people) ? people : null, time24: time24 || null },
+    };
+  }
+
+  // preview su session clone per non sporcare la session reale
+  let tmp;
+  try {
+    tmp = JSON.parse(JSON.stringify(session || {}));
+  } catch {
+    tmp = { ...(session || {}) };
+  }
+  tmp.dateISO = dateISO;
+  tmp.people = people;
+  tmp.time24 = time24;
+
+  const res = await reserveTableForSession(tmp, { commit: false });
+  if (res?.status === "closed") {
+    return { handled: true, answer: `Mi dispiace, ${formatDateLabel(dateISO)} risulta chiuso.` };
+  }
+  if (res?.status === "ok") {
+    return {
+      handled: true,
+      answer: `Sì, in linea di massima c'e' disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ${time24}. Se vuoi, possiamo procedere con la prenotazione.`,
+    };
+  }
+  if (res?.status === "needs_split" || res?.status === "needs_outside") {
+    return {
+      handled: true,
+      answer: `Potrebbe esserci disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ${time24}, ma potremmo dovervi sistemare su tavoli separati o anche in esterno. Se vuoi, posso metterti in contatto con un operatore.`,
+    };
+  }
+  return {
+    handled: true,
+    answer: `Al momento non risulta disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ${time24}. Vuoi provare un altro orario?`,
+  };
+}
+
+async function tryAnswerInfoQuestionVoiceSmart(session, questionRaw) {
+  const raw = String(questionRaw || "").trim();
+  const q = normalizeText(raw);
+  if (!q) return { handled: false };
+
+  // 1) PROMO / MENU / FAQ
+  const promo = buildPromoAnswer(raw);
+  if (promo) return { handled: true, answer: promo };
+
+  const diet = buildDietAnswer(raw);
+  if (diet) return { handled: true, answer: diet };
+
+  // 2) MUSICA / EVENTI MUSICALI
+  const asksMusic = q.includes("musica") || q.includes("dj") || q.includes("live") || q.includes("jazz");
+  if (asksMusic) {
+    const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+    const todayISO = formatISODateInTimeZone(new Date(), tz);
+
+    // range default: giorno specifico se presente, altrimenti prossimi 7 giorni
+    let startISO = null;
+    let endISO = null;
+
+    const explicitDate = parseDateIT(raw);
+    if (explicitDate) {
+      startISO = explicitDate;
+      endISO = explicitDate;
+    } else if (q.includes("prossima settimana") || q.includes("settimana prossima")) {
+      const r = getNextWeekRangeISO(todayISO, tz);
+      startISO = r.startISO;
+      endISO = r.endISO;
+    } else if (q.includes("questa settimana")) {
+      const r = getCurrentWeekRangeISO(todayISO, tz);
+      startISO = r.startISO;
+      endISO = r.endISO;
+    } else {
+      const wd = parseWeekdayIndexIT(raw);
+      if (wd !== null) {
+        const todayDow = getWeekdayIndexInTimeZone(todayISO, tz);
+        const delta = (wd - todayDow + 7) % 7;
+        const targetISO = addDaysToISODate(todayISO, delta);
+        startISO = targetISO;
+        endISO = targetISO;
+      } else {
+        startISO = todayISO;
+        endISO = addDaysToISODate(todayISO, 6);
+      }
+    }
+
+    const all = await listCalendarEventsBetweenISO(startISO, endISO);
+    const music = all.filter(isMusicEventItem);
+    const answer = formatMusicAnswerForRange(music, startISO, endISO);
+    return { handled: true, answer };
+  }
+
+  // 3) APERTURE / CHIUSURE
+  const asksOpen = q.includes("apert") || q.includes("chius") || q.includes("orari") || q.includes("natale") || q.includes("capodanno");
+  if (asksOpen) {
+    let dateISO = parseDateIT(raw);
+    if (!dateISO && q.includes("natale")) dateISO = resolveChristmasISO();
+    if (!dateISO) {
+      const wd = parseWeekdayIndexIT(raw);
+      if (wd !== null) {
+        const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+        const todayISO = formatISODateInTimeZone(new Date(), tz);
+        const todayDow = getWeekdayIndexInTimeZone(todayISO, tz);
+        const delta = (wd - todayDow + 7) % 7;
+        dateISO = addDaysToISODate(todayISO, delta);
+      }
+    }
+    if (!dateISO) {
+      return { handled: true, answer: "Dimmi per quale giorno vuoi sapere se siamo aperti." };
+    }
+
+    const events = await listCalendarEvents(dateISO);
+    if (isBusinessClosedOnDateISO(dateISO, events)) {
+      const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+      const dow = getWeekdayIndexInTimeZone(dateISO, tz);
+      if (dow === OPENING.closedDay) {
+        return { handled: true, answer: `Mi dispiace, ${formatDateLabel(dateISO)} e' il nostro giorno di chiusura.` };
+      }
+      return { handled: true, answer: `Mi dispiace, ${formatDateLabel(dateISO)} risulta chiuso.` };
+    }
+    return { handled: true, answer: `${formatDateLabel(dateISO)} ${formatOpeningHoursForDateISO(dateISO)}` };
+  }
+
+  // 4) DISPONIBILITA' TAVOLO (anche con giorno della settimana)
+  const asksAvailability = q.includes("disponibil") || q.includes("posto") || q.includes("posti") || q.includes("tavolo") || q.includes("prenot");
+  if (asksAvailability) {
+    let dateISO = parseDateIT(raw);
+    const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+    const todayISO = formatISODateInTimeZone(new Date(), tz);
+
+    if (!dateISO) {
+      const wd = parseWeekdayIndexIT(raw);
+      if (wd !== null) {
+        const todayDow = getWeekdayIndexInTimeZone(todayISO, tz);
+        const delta = (wd - todayDow + 7) % 7;
+        dateISO = addDaysToISODate(todayISO, delta);
+      }
+    }
+    if (!dateISO) {
+      return { handled: true, answer: "Certo. Per quale giorno vuoi verificare la disponibilita'?" };
+    }
+
+    // PRIMA controlla se chiuso
+    const events = await listCalendarEvents(dateISO);
+    if (isBusinessClosedOnDateISO(dateISO, events)) {
+      return { handled: true, answer: `Mi dispiace, ${formatDateLabel(dateISO)} risulta chiuso.` };
+    }
+
+    const people = parsePeopleIT(raw);
+    const time24 = parseTimeIT(raw);
+
+    return await checkAvailabilityQuickVoice(session, dateISO, people, time24);
+  }
+
+  return { handled: false };
+}
+
+
 async function tryAnswerInfoQuestionVoice(questionRaw) {
   const q = String(questionRaw || "").trim();
   const tt = normalizeText(q);
@@ -1379,7 +1781,7 @@ async function tryAnswerInfoQuestionVoice(questionRaw) {
 
   if (tt.includes("cosa comprende") || tt.includes("comprende") || (tt.includes("piatto") && tt.includes("apericena"))) {
     const reply =
-      "Il piatto BrilliTasting comprende 13 assaggi: Polpetta di cervo al ginepro, polpetta di agnello con menta e scorza di limone, falafel croccante all’aglio, mini tartare di fassona con vinaigrette agli agrumi, crema di capperi, olive e menta, paninetti con porchetta cunzata e panelle, bruschetta classica, bruschetta con stracciatella di bufala, crudo, tartare di gambero, cipolla di tropea e olive taggiasche, cazzilli di patata croccante, verdura pastellata, caprino aromatizzato agli agrumi, stinco Brillo con patata al forno, e millefoglie di patate e carciofi con fonduta di pecorino romano DOP. Coperto e cocktail o vino o birra inclusi.";
+      "Il piatto BrilliTasting comprende 13 assaggi: Polpetta di cervo al ginepro, polpetta di agnello con menta e scorza di limone, falafel croccante all'aglio, mini tartare di fassona con vinaigrette agli agrumi, crema di capperi, olive e menta, paninetti con porchetta cunzata e panelle, bruschetta classica, bruschetta con stracciatella di bufala, crudo, tartare di gambero, cipolla di tropea e olive taggiasche, cazzilli di patata croccante, verdura pastellata, caprino aromatizzato agli agrumi, stinco Brillo con patata al forno, e millefoglie di patate e carciofi con fonduta di pecorino romano DOP. Coperto e cocktail o vino o birra inclusi.";
     return { handled: true, reply };
   }
 
@@ -1407,7 +1809,7 @@ async function tryAnswerInfoQuestionVoice(questionRaw) {
   if (tt.includes("comple") || tt.includes("festa") || tt.includes("azienda") || tt.includes("evento")) {
     return {
       handled: true,
-      reply: "Sì, è possibile organizzare compleanni, eventi o cene aziendali. Spiegami in sintesi l’esigenza e ti faremo ricontattare al più presto.",
+      reply: "Sì, è possibile organizzare compleanni, eventi o cene aziendali. Spiegami in sintesi l'esigenza e ti faremo ricontattare al più presto.",
     };
   }
 
@@ -1456,10 +1858,10 @@ async function tryAnswerInfoQuestionVoice(questionRaw) {
       return { handled: true, reply: `Mi dispiace, per ${formatDateLabel(dateISO)} alle ${time24} non vedo disponibilità.` };
     }
     if (availability.status === "needs_split") {
-      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ${time24} c’è disponibilità, ma probabilmente in tavoli separati.` };
+      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ${time24} c'è disponibilità, ma probabilmente in tavoli separati.` };
     }
     if (availability.status === "needs_outside") {
-      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ${time24} c’è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.` };
+      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.` };
     }
     return { handled: true, reply: `Sì, per ${formatDateLabel(dateISO)} alle ${time24} vedo disponibilità.` };
   }
@@ -1501,7 +1903,7 @@ async function forwardToOperatorWithReason(session, req, vr, reason, kind) {
   const inboundToE164 = parsePhoneNumber(inboundTo);
   if (isValidPhoneE164(inboundToE164)) callerCandidates.push(inboundToE164);
   const callerId = callerCandidates[0] || "";
-  const canDialLive = Boolean(ENABLE_FORWARDING && operatorPhone && isValidPhoneE164(callerId));
+  const canDialLive = Boolean(ENABLE_FORWARDING && operatorPhone);
 
   // reset stato operatore
   session.operatorState = null;
@@ -1589,9 +1991,9 @@ async function handleInfoFlow(session, req, vr, speech, emptySpeech) {
           : availability.status === "unavailable"
           ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} alle ${payload.time24} non vedo disponibilità.`
           : availability.status === "needs_split"
-          ? `Per ${formatDateLabel(payload.dateISO)} alle ${payload.time24} c’è disponibilità, ma probabilmente in tavoli separati.`
+          ? `Per ${formatDateLabel(payload.dateISO)} alle ${payload.time24} c'è disponibilità, ma probabilmente in tavoli separati.`
           : availability.status === "needs_outside"
-          ? `Per ${formatDateLabel(payload.dateISO)} alle ${payload.time24} c’è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.`
+          ? `Per ${formatDateLabel(payload.dateISO)} alle ${payload.time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.`
           : `Sì, per ${formatDateLabel(payload.dateISO)} alle ${payload.time24} vedo disponibilità.`;
       sayIt(vr, reply);
       vr.hangup();
@@ -1632,9 +2034,9 @@ async function handleInfoFlow(session, req, vr, speech, emptySpeech) {
         : availability.status === "unavailable"
         ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} alle ${time24} non vedo disponibilità.`
         : availability.status === "needs_split"
-        ? `Per ${formatDateLabel(payload.dateISO)} alle ${time24} c’è disponibilità, ma probabilmente in tavoli separati.`
+        ? `Per ${formatDateLabel(payload.dateISO)} alle ${time24} c'è disponibilità, ma probabilmente in tavoli separati.`
         : availability.status === "needs_outside"
-        ? `Per ${formatDateLabel(payload.dateISO)} alle ${time24} c’è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.`
+        ? `Per ${formatDateLabel(payload.dateISO)} alle ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.`
         : `Sì, per ${formatDateLabel(payload.dateISO)} alle ${time24} vedo disponibilità.`;
 
     sayIt(vr, reply);
@@ -2473,7 +2875,7 @@ function computeDurationMinutes(session, events) {
 
 function maybeSayDivanettiNotice(vr, session) {
   if (!session?.divanettiNotice || session.divanettiNoticeSpoken) return;
-  sayIt(vr, "Ti abbiamo riservato l’area divanetti, ideale per aperitivo e dopocena.");
+  sayIt(vr, "Ti abbiamo riservato l'area divanetti, ideale per aperitivo e dopocena.");
   session.divanettiNoticeSpoken = true;
 }
 
@@ -3144,7 +3546,7 @@ function buildWaSystemPrompt() {
     `Obiettivo: rispondere in modo utile e rapido, e guidare l'utente alla prenotazione quando serve.`,
     `Regole:`,
     `- Non inventare informazioni non presenti nei "Fatti". Se manca un dato, fai UNA domanda breve per chiarire.`,
-    `- Se l’utente vuole prenotare un tavolo, raccogli: nome, data (YYYY-MM-DD), numero persone, ora (HH:MM), eventuali note e preordine (se vuole).`,
+    `- Se l'utente vuole prenotare un tavolo, raccogli: nome, data (YYYY-MM-DD), numero persone, ora (HH:MM), eventuali note e preordine (se vuole).`,
     `- Tono: cordiale, italiano, frasi brevi.`,
     ``,
     `Fatti:\n${buildBusinessFactsForAI()}`,
@@ -3405,14 +3807,14 @@ async function computeWhatsAppReply(session, userText) {
       session.preorderLabel = "nessuno";
     } else if (normalized.includes("apericena promo")) {
       const promoOption = getPreorderOptionByKey("piatto_apericena_promo");
-      if (isFriday) return "L’apericena promo non è disponibile il venerdì. Scegli un’altra opzione oppure scrivi: nessuno";
+      if (isFriday) return "L'apericena promo non è disponibile il venerdì. Scegli un'altra opzione oppure scrivi: nessuno";
       session.preorderChoiceKey = promoOption?.key || "piatto_apericena_promo";
       session.preorderLabel = promoOption?.label || "Piatto Apericena in promo (previa registrazione)";
       if (glutenIntolerance) {
         // non blocchiamo, ma avvisiamo
       }
     } else if (normalized.includes("apericena") && !normalized.includes("piatto")) {
-      if (glutenIntolerance) return "L’apericena non è disponibile per celiaci o intolleranti al glutine. Vuoi scegliere un’alternativa o scrivere: nessuno?";
+      if (glutenIntolerance) return "L'apericena non è disponibile per celiaci o intolleranti al glutine. Vuoi scegliere un'alternativa o scrivere: nessuno?";
       const option = getPreorderOptionByKey("apericena");
       session.preorderChoiceKey = option?.key || "apericena";
       session.preorderLabel = option?.label || "Apericena";
@@ -3464,7 +3866,7 @@ async function computeWhatsAppReply(session, userText) {
     }
     if (calendarResult?.status === "unavailable") {
       session.wa.step = "ask_time";
-      return "A quell’orario siamo al completo 😅 Vuoi provare un altro orario? (es. 20:00 oppure 21:30)";
+      return "A quell'orario siamo al completo 😅 Vuoi provare un altro orario? (es. 20:00 oppure 21:30)";
     }
 
     const dateLabel = session.dateISO ? formatDateLabel(session.dateISO) : "";
@@ -3590,67 +3992,328 @@ async function handleVoiceRequest(req, res) {
       return res.send(r.twiml);
     }
 
-    if (session.operatorState && String(session.operatorState).startsWith("info_")) {
+    if (session.operatorState && ["info_question", "info_avail_people", "info_avail_time"].includes(String(session.operatorState))) {
       const r = await handleInfoFlow(session, req, vr, speech, emptySpeech);
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(r.twiml);
     }
 
-// Richiesta operatore (modalità ibrida): chiedi il motivo, poi trasferisci se possibile, altrimenti richiamo.
-    if (session.operatorState === "await_reason") {
-      if (emptySpeech || isPureConsent(speech)) {
-        session.operatorReasonTries = Number(session.operatorReasonTries || 0) + 1;
-        if (session.operatorReasonTries < 2) {
-          gatherSpeech(vr, session.operatorRetryPrompt || "Qual è il motivo della richiesta?");
+    // Richiesta operatore / Info: stato macchina che evita chiusure secche
+    if (
+      session.operatorState === "await_reason" ||
+      session.operatorState === "info_need_details" ||
+      session.operatorState === "info_more" ||
+      session.operatorState === "info_offer_booking"
+    ) {
+      const kind =
+        session.operatorKind || (session.intent === "event" ? "event" : session.intent === "info" ? "info" : "generic");
+      const n = normalizeText(speech);
+      const emptySpeech = !n;
+
+      const isNoLike = (tt) => {
+        const t = normalizeText(tt || "");
+        if (!t) return false;
+        return (
+          t === "no" ||
+          t.includes("nessun") ||
+          t.includes("nessuna") ||
+          t.includes("nessuno") ||
+          t.includes("niente") ||
+          t.includes("nulla") ||
+          t.includes("basta") ||
+          t.includes("stop") ||
+          t.includes("non serve") ||
+          t.includes("a posto") ||
+          t.includes("va bene cosi") ||
+          t.includes("va bene così")
+        );
+      };
+
+      const isYesLike = (tt) => {
+        const t = normalizeText(tt || "");
+        if (!t) return false;
+        return YES_WORDS.some((w) => t.includes(normalizeText(w)));
+      };
+
+      const askMorePrompt = "Ti serve qualche altra informazione?";
+      const offerBookingPrompt = "Vuoi prenotare un tavolo?";
+      const softGoodbye = "Perfetto. Grazie e a presto.";
+
+      // --- STATO: OFFERTA PRENOTAZIONE ---
+      if (session.operatorState === "info_offer_booking") {
+        session.infoOfferTries = Number(session.infoOfferTries || 0);
+
+        if (emptySpeech) {
+          session.infoOfferTries += 1;
+          if (session.infoOfferTries >= 2) {
+            sayIt(vr, softGoodbye);
+            vr.hangup();
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
+          gatherSpeech(vr, offerBookingPrompt);
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(vr.toString());
         }
-        session.operatorReasonRaw = "non specificato";
-      } else {
-        session.operatorReasonRaw = String(speech || "").trim();
-      }
 
-      // Decidi dial live o richiamo
-      await sendFallbackEmail(session, req, "operator_request");
-      void sendOperatorEmail(session, req, "operator_request");
+        if (isYesLike(speech)) {
+          // entra nel flusso tavolo senza rompere routing/step esistenti
+          session.operatorState = null;
+          session.operatorPrompt = null;
+          session.operatorRetryPrompt = null;
+          session.operatorKind = null;
+          session.infoPending = null;
+          session.intent = "table";
+          session.step = 1;
+          resetRetries(session);
+          gatherSpeech(vr, "Perfetto, prenotiamo il tuo tavolo. Come ti chiami?");
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
 
-      const operatorPhone = getOperatorPhoneE164();
-      const callerCandidates = [];
-      if (isValidPhoneE164(TWILIO_VOICE_FROM)) callerCandidates.push(TWILIO_VOICE_FROM.trim());
-      const inboundTo = req?.body?.To || req?.body?.Called || "";
-      const inboundToE164 = parsePhoneNumber(inboundTo);
-      if (isValidPhoneE164(inboundToE164)) callerCandidates.push(inboundToE164);
-      const callerId = callerCandidates[0] || "";
-
-      const canDialLive = Boolean(ENABLE_FORWARDING && operatorPhone && isValidPhoneE164(callerId));
-
-      // Evita la creazione automatica dell'evento "chiamata interrotta" su ogni risposta HTTP
-      session.fallbackEventCreated = true;
-
-      
-
-      // Registra sempre la richiesta di ricontatto prima di tentare il trasferimento live
-      void safeCreateOperatorCallbackCalendarEvent(session, req, "requested");
-
-      session.operatorState = null;
-      session.operatorPrompt = null;
-      session.operatorRetryPrompt = null;
-
-      if (canDialLive) {
+        // NO -> chiudi con cortesia
+        sayIt(vr, softGoodbye);
+        vr.hangup();
         res.set("Content-Type", "text/xml; charset=utf-8");
-        return res.send(forwardToHumanTwiml(req));
+        return res.send(vr.toString());
       }
 
-      const goodbye =
-        session.operatorKind === "info"
-          ? "Va benissimo. Ho preso nota della tua richiesta e ti faremo richiamare al più presto. Grazie e a presto."
-          : session.operatorKind === "event"
-          ? "Va benissimo. Ho preso nota dei dettagli e ti faremo ricontattare al più presto. Grazie e a presto."
-          : "Va benissimo. Ti faremo richiamare al più presto. Grazie e a presto.";
-      sayIt(vr, goodbye);
-      vr.hangup();
-      res.set("Content-Type", "text/xml; charset=utf-8");
-      return res.send(vr.toString());
+      // --- STATO: INFO_MORE (ciclo “altre info?”) ---
+      if (session.operatorState === "info_more") {
+        session.infoMoreSilence = Number(session.infoMoreSilence || 0);
+
+        if (emptySpeech) {
+          session.infoMoreSilence += 1;
+          if (session.infoMoreSilence >= 2) {
+            session.operatorState = "info_offer_booking";
+            session.infoOfferTries = 0;
+            gatherSpeech(vr, offerBookingPrompt);
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
+          gatherSpeech(vr, askMorePrompt);
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
+
+        session.infoMoreSilence = 0;
+
+        if (isNoLike(speech)) {
+          session.operatorState = "info_offer_booking";
+          session.infoOfferTries = 0;
+          gatherSpeech(vr, offerBookingPrompt);
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
+
+        // nuova domanda info: prova a rispondere
+        const attempt = await tryAnswerInfoQuestionVoiceSmart(session, speech);
+
+        if (attempt?.handled && attempt?.needsDetails && attempt?.pending) {
+          session.infoPending = attempt.pending;
+          // domanda di dettaglio (manca time/persone)
+          if (attempt.pending.type === "availability") {
+            const needPeople = !Number.isFinite(attempt.pending.people);
+            const needTime = !attempt.pending.time24;
+            const p =
+              needPeople && needTime
+                ? "Per quante persone e a che ora?"
+                : needPeople
+                ? "Per quante persone?"
+                : "A che ora?";
+            session.operatorState = "info_need_details";
+            session.infoNeedSilence = 0;
+            gatherSpeech(vr, p);
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
+          session.operatorState = "info_need_details";
+          session.infoNeedSilence = 0;
+          gatherSpeech(vr, "Puoi darmi un dettaglio in piu'?" );
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
+
+        if (attempt?.handled && attempt?.answer) {
+          sayIt(vr, attempt.answer);
+          session.operatorState = "info_more";
+          gatherSpeech(vr, askMorePrompt);
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
+
+        // non so rispondere: registro richiesta operatore (una sola volta) ma NON chiudo secco
+        session.operatorReasonRaw = (session.operatorReasonRaw ? `${session.operatorReasonRaw}\n` : "") +
+          String(speech || "").trim();
+
+        if (!session.operatorCallbackEventCreated) {
+          await sendFallbackEmail(session, req, "operator_request");
+          void sendOperatorEmail(session, req, "operator_request");
+          void safeCreateOperatorCallbackCalendarEvent(session, req, "requested");
+          sayIt(vr, "Va bene. Ho preso nota della richiesta e ti faremo ricontattare al piu' presto.");
+        } else {
+          sayIt(vr, "Ok. Ho aggiunto anche questa richiesta e ti faremo ricontattare al piu' presto.");
+        }
+
+        session.operatorState = "info_more";
+        gatherSpeech(vr, askMorePrompt);
+        res.set("Content-Type", "text/xml; charset=utf-8");
+        return res.send(vr.toString());
+      }
+
+      // --- STATO: INFO_NEED_DETAILS (completa dati mancanti, poi risponde) ---
+      if (session.operatorState === "info_need_details") {
+        session.infoNeedSilence = Number(session.infoNeedSilence || 0);
+
+        if (emptySpeech) {
+          session.infoNeedSilence += 1;
+          if (session.infoNeedSilence >= 2) {
+            session.operatorState = "info_more";
+            gatherSpeech(vr, askMorePrompt);
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
+          const pending = session.infoPending || {};
+          if (pending.type === "availability") {
+            const needPeople = !Number.isFinite(pending.people);
+            const needTime = !pending.time24;
+            const p =
+              needPeople && needTime
+                ? "Per quante persone e a che ora?"
+                : needPeople
+                ? "Per quante persone?"
+                : "A che ora?";
+            gatherSpeech(vr, p);
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
+          gatherSpeech(vr, "Puoi darmi un dettaglio in piu'?" );
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
+
+        const pending = session.infoPending || {};
+        if (pending.type === "availability") {
+          const maybePeople = parsePeopleIT(speech);
+          const maybeTime = parseTimeIT(speech);
+          if (!Number.isFinite(pending.people) && Number.isFinite(maybePeople)) pending.people = maybePeople;
+          if (!pending.time24 && maybeTime) pending.time24 = maybeTime;
+
+          if (!Number.isFinite(pending.people) || !pending.time24) {
+            const needPeople = !Number.isFinite(pending.people);
+            const needTime = !pending.time24;
+            const p =
+              needPeople && needTime
+                ? "Per quante persone e a che ora?"
+                : needPeople
+                ? "Per quante persone?"
+                : "A che ora?";
+            session.infoPending = pending;
+            gatherSpeech(vr, p);
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
+
+          const resp = await checkAvailabilityQuickVoice(session, pending.dateISO, pending.people, pending.time24);
+          if (resp?.answer) sayIt(vr, resp.answer);
+
+          session.infoPending = null;
+          session.operatorState = "info_more";
+          gatherSpeech(vr, askMorePrompt);
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
+
+        // generic pending: prova a rieseguire smart
+        const attempt = await tryAnswerInfoQuestionVoiceSmart(session, String(speech || "").trim());
+        if (attempt?.handled && attempt?.answer) sayIt(vr, attempt.answer);
+        session.infoPending = null;
+        session.operatorState = "info_more";
+        gatherSpeech(vr, askMorePrompt);
+        res.set("Content-Type", "text/xml; charset=utf-8");
+        return res.send(vr.toString());
+      }
+
+      // --- STATO: await_reason (prima domanda) ---
+      if (session.operatorState === "await_reason") {
+        // raccolta domanda (come prima, ma se info -> prova a rispondere e NON chiude secco)
+        if (emptySpeech || isPureConsent(speech)) {
+          session.operatorReasonTries = Number(session.operatorReasonTries || 0) + 1;
+          if (session.operatorReasonTries < 2) {
+            gatherSpeech(vr, session.operatorRetryPrompt || "Qual e' la richiesta?");
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
+          session.operatorReasonRaw = "non specificato";
+        } else {
+          session.operatorReasonRaw = String(speech || "").trim();
+        }
+
+        // INFO: prova risposta smart
+        if (kind === "info") {
+          const attempt = await tryAnswerInfoQuestionVoiceSmart(session, session.operatorReasonRaw);
+
+          if (attempt?.handled && attempt?.needsDetails && attempt?.pending) {
+            session.infoPending = attempt.pending;
+            session.operatorState = "info_need_details";
+            session.infoNeedSilence = 0;
+            const needPeople = !Number.isFinite(attempt.pending.people);
+            const needTime = !attempt.pending.time24;
+            const p =
+              needPeople && needTime
+                ? "Per quante persone e a che ora?"
+                : needPeople
+                ? "Per quante persone?"
+                : "A che ora?";
+            gatherSpeech(vr, p);
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
+
+          if (attempt?.handled && attempt?.answer) {
+            sayIt(vr, attempt.answer);
+            session.operatorState = "info_more";
+            session.infoMoreSilence = 0;
+            gatherSpeech(vr, askMorePrompt);
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            return res.send(vr.toString());
+          }
+
+          // non so rispondere -> registro callback, ma continuo con “altre info?”
+          await sendFallbackEmail(session, req, "operator_request");
+          void sendOperatorEmail(session, req, "operator_request");
+          void safeCreateOperatorCallbackCalendarEvent(session, req, "requested");
+          sayIt(vr, "Va bene. Ho preso nota della richiesta e ti faremo ricontattare al piu' presto.");
+          session.operatorState = "info_more";
+          session.infoMoreSilence = 0;
+          gatherSpeech(vr, askMorePrompt);
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(vr.toString());
+        }
+
+        // EVENTO (o altro): comportamento invariato, ma con dial più robusto
+        await sendFallbackEmail(session, req, "operator_request");
+        void sendOperatorEmail(session, req, "operator_request");
+
+        const operatorPhone = getOperatorPhoneE164();
+        const canDialLive = Boolean(ENABLE_FORWARDING && operatorPhone);
+
+        void safeCreateOperatorCallbackCalendarEvent(session, req, "requested");
+
+        session.operatorState = null;
+        session.operatorPrompt = null;
+        session.operatorRetryPrompt = null;
+
+        if (canDialLive) {
+          res.set("Content-Type", "text/xml; charset=utf-8");
+          return res.send(forwardToHumanTwiml(req));
+        }
+
+        sayIt(vr, "Va benissimo. Ho preso nota e ti faremo ricontattare al piu' presto. Grazie e a presto.");
+        vr.hangup();
+        res.set("Content-Type", "text/xml; charset=utf-8");
+        return res.send(vr.toString());
+      }
     }
 
     if (!emptySpeech && isOperatorRequest(speech)) {
@@ -3791,12 +4454,13 @@ async function handleVoiceRequest(req, res) {
         }
 
         if (intent === "info") {
-          session.operatorState = "info_question";
+          session.operatorState = "await_reason";
           session.operatorKind = "info";
           session.operatorReasonRaw = null;
           session.operatorReasonTries = 0;
-          session.infoPayload = null;
-          gatherSpeech(vr, "Va bene. Dimmi pure cosa vuoi sapere.");
+          session.operatorPrompt = "Va bene. Dimmi pure cosa vuoi sapere.";
+          session.operatorRetryPrompt = "Qual e' la richiesta?";
+          gatherSpeech(vr, session.operatorPrompt);
           break;
         }
 
@@ -4071,7 +4735,7 @@ async function handleVoiceRequest(req, res) {
             if (isFriday) {
               gatherSpeech(
                 vr,
-                "L’apericena promo non è disponibile il venerdì. Puoi scegliere l’apericena standard oppure un altro piatto."
+                "L'apericena promo non è disponibile il venerdì. Puoi scegliere l'apericena standard oppure un altro piatto."
               );
               break;
             }
@@ -4086,7 +4750,7 @@ async function handleVoiceRequest(req, res) {
             if (glutenIntolerance) {
               gatherSpeech(
                 vr,
-                "L’apericena non è disponibile per celiaci o intolleranti al glutine. Puoi scegliere un’alternativa."
+                "L'apericena non è disponibile per celiaci o intolleranti al glutine. Puoi scegliere un'alternativa."
               );
               break;
             }
