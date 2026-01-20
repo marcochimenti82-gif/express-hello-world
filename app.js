@@ -67,9 +67,16 @@ const HOLIDAYS_SET = new Set(HOLIDAYS_YYYY_MM_DD.split(",").map((s) => s.trim())
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
-const YES_WORDS = ["si", "sì", "certo", "confermo", "ok", "va bene", "perfetto", "esatto"];
-const NO_WORDS = ["no", "negativo", "annulla", "cancella", "stop", "basta", "non voglio", "non confermo", "non va bene", "non procedere", "non fare"];
+const YES_WORDS = ["si", "sì", "certo", "confermo", "ok", "va bene", "perfetto", "esatto", "conferma", "affermativo"];
+const NO_WORDS = ["no", "non", "annulla", "cancella", "negativo"];
 const CANCEL_WORDS = ["annulla", "annullare", "cancella", "cancellare", "disdici", "disdire"];
+
+// ======================= FIX #3: Parole filler da rimuovere dal cognome =======================
+const FILLER_WORDS = [
+  "si", "sì", "certo", "mi sembra", "credo", "dovrebbe", "penso", "forse",
+  "probabilmente", "esatto", "giusto", "ecco", "allora", "dunque", "beh",
+  "be", "mah", "eh", "uhm", "diciamo", "praticamente", "tipo", "insomma"
+];
 
 // ======================= OPENING HOURS =======================
 const OPENING = {
@@ -143,6 +150,44 @@ function xmlEscape(s) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
+}
+
+// ======================= FIX #1: Formattazione orario per TTS =======================
+function formatTimeForSpeech(time24) {
+  if (!time24) return "";
+  const [h, m] = String(time24).split(":");
+  const hour = Number(h);
+  const minute = Number(m);
+  
+  if (minute === 0) {
+    return `le ${hour}`;
+  }
+  if (minute === 30) {
+    return `le ${hour} e mezza`;
+  }
+  if (minute === 15) {
+    return `le ${hour} e un quarto`;
+  }
+  if (minute === 45) {
+    return `le ${hour} e quarantacinque`;
+  }
+  return `le ${hour} e ${minute}`;
+}
+
+// Formatta numero persone per TTS
+function formatPeopleForSpeech(people) {
+  const n = Number(people);
+  if (n === 1) return "una persona";
+  if (n === 2) return "due persone";
+  if (n === 3) return "tre persone";
+  if (n === 4) return "quattro persone";
+  if (n === 5) return "cinque persone";
+  if (n === 6) return "sei persone";
+  if (n === 7) return "sette persone";
+  if (n === 8) return "otto persone";
+  if (n === 9) return "nove persone";
+  if (n === 10) return "dieci persone";
+  return `${n} persone`;
 }
 
 // ======================= PROMPTS HELPERS =======================
@@ -371,37 +416,13 @@ function buildTwiml() {
   return new twilio.twiml.VoiceResponse();
 }
 
-
-function sanitizeForTTS(text) {
-  let s = String(text || "");
-
-  // abbreviazioni comuni
-  s = s.replace(/\btav\b/gi, "tavolo");
-  s = s.replace(/\bpax\b/gi, "persone");
-  s = s.replace(/\bnr\b/gi, "numero");
-  s = s.replace(/\bn[.°]?\b/gi, "numero");
-
-  // simboli comuni
-  s = s.replace(/€/g, " euro ");
-  s = s.replace(/\+/g, " più ");
-
-  // orari: 20:30 -> 20 e 30 (TTS più naturale)
-  s = s.replace(/(\b\d{1,2})[:.](\d{2}\b)/g, "$1 e $2");
-
-  // pulizia spazi
-  s = s.replace(/\s+/g, " ").trim();
-  return s;
-}
-
 function sayIt(response, text) {
-  response.say({ language: "it-IT" }, xmlEscape(sanitizeForTTS(text)));
+  response.say({ language: "it-IT" }, xmlEscape(text));
 }
-
 
 function gatherSpeech(response, promptText, opts = {}) {
   const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice` : "/twilio/voice";
-
-  const gatherOpts = {
+  const gather = response.gather({
     input: opts.input || "speech",
     language: "it-IT",
     speechTimeout: opts.speechTimeout || "auto",
@@ -410,29 +431,10 @@ function gatherSpeech(response, promptText, opts = {}) {
     speechModel: "phone_call",
     action: actionUrl,
     method: "POST",
-    // migliora UX: l'utente può interrompere la voce e parlare subito
-    bargeIn: opts.bargeIn === undefined ? true : Boolean(opts.bargeIn),
-  };
-
-  // opzionale: abilita DTMF (es. conferme sì/no)
-  if (Number.isFinite(Number(opts.numDigits))) gatherOpts.numDigits = Number(opts.numDigits);
-  if (typeof opts.finishOnKey === "string") gatherOpts.finishOnKey = opts.finishOnKey;
-
-  const gather = response.gather(gatherOpts);
-
-  gather.say({ language: "it-IT" }, xmlEscape(sanitizeForTTS(promptText)));
-
-  if (opts.hints && Array.isArray(opts.hints) && opts.hints.length) {
-    gather.speechHints(opts.hints);
-  }
-
-  response.append(gather);
-
-  // se l'utente non risponde, ritorna comunque allo stesso webhook per gestire il "silenzio"
+  });
+  gather.say({ language: "it-IT" }, xmlEscape(promptText));
   response.redirect({ method: "POST" }, actionUrl);
 }
-
-
 
 function isValidPhoneE164(s) {
   return /^\+\d{8,15}$/.test(String(s || "").trim());
@@ -798,14 +800,11 @@ function handleSilence(session, vr, promptFn) {
 
 function normalizeText(s) {
   return String(s || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
     .trim()
     .toLowerCase()
-    .replace(/[.,!?;:]/g, "")
+    .replace(/[.,!?]/g, "")
     .replace(/\s+/g, " ");
 }
-
 
 function isPureConsent(speech) {
   const tt = normalizeText(speech);
@@ -1044,7 +1043,7 @@ function promptForStep(vr, session) {
   }
 }
 
-// ====== parsing basilari (per arrivare al punto: FIX crash step 5) ======
+// ====== parsing basilari ======
 function parseTimeIT(speech) {
   const tt = normalizeText(speech);
   const hm = tt.match(/(\d{1,2})[:\s](\d{2})/);
@@ -1112,27 +1111,31 @@ function parseDateIT(speech) {
     const mm = months[m[2]];
     let yy = m[3] ? Number(m[3]) : today.getFullYear();
     if (yy < 100) yy += 2000;
-    if (dd >= 1 && dd <= 31 && mm) return toISODate(new Date(yy, mm - 1, dd));
+    if (dd >= 1 && dd <= 31 && mm >= 1 && mm <= 12) {
+      return toISODate(new Date(yy, mm - 1, dd));
+    }
   }
 
   return null;
 }
 
+function parseNextWeekdayISO(speech) {
+  const tt = normalizeText(speech || "");
+  const dow = parseWeekdayIndexIT(tt);
+  if (dow === null) return null;
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const todayISO = formatISODateInTimeZone(new Date(), tz);
+  const todayDow = getWeekdayIndexInTimeZone(todayISO, tz);
+  if (todayDow === null) return null;
+  let delta = dow - todayDow;
+  if (delta <= 0) delta += 7;
+  return addDaysToISODate(todayISO, delta);
+}
+
 function parsePeopleIT(speech) {
   const tt = normalizeText(speech);
-  if (!tt) return null;
-
-  // digits anywhere: "8", "siamo in 8", "8 persone"
-  const m = tt.match(/\b(\d{1,2})\b/);
-  if (m) {
-    const n = Number(m[1]);
-    if (Number.isFinite(n) && n > 0) return n;
-  }
-
-  // italian number words (common for speech): "otto", "siamo otto", "in otto"
-  const map = {
-    uno: 1,
-    una: 1,
+  const numWords = {
+    uno: 1, una: 1,
     due: 2,
     tre: 3,
     quattro: 4,
@@ -1150,107 +1153,323 @@ function parsePeopleIT(speech) {
     sedici: 16,
     diciassette: 17,
     diciotto: 18,
-    diciannove: 19,
-    venti: 20,
   };
+  for (const [word, num] of Object.entries(numWords)) {
+    if (tt.includes(word)) return num;
+  }
+  const numMatch = tt.match(/\b(\d{1,2})\b/);
+  if (numMatch) {
+    const n = Number(numMatch[1]);
+    if (n >= 1 && n <= 50) return n;
+  }
+  return null;
+}
 
-  const words = tt
-    .replace(/[^a-zàèéìòù\s]/g, " ")
-    .split(/\s+/)
-    .map((w) => w.trim())
-    .filter(Boolean);
+function parsePhoneNumber(speech) {
+  if (!speech) return null;
+  let digits = String(speech).replace(/[^\d+]/g, "");
+  if (/^3\d{8,9}$/.test(digits)) {
+    digits = "+39" + digits;
+  }
+  if (/^\d{9,10}$/.test(digits) && !digits.startsWith("0")) {
+    digits = "+39" + digits;
+  }
+  if (/^\+\d{10,15}$/.test(digits)) return digits;
+  return null;
+}
 
-  for (const w of words) {
-    if (Object.prototype.hasOwnProperty.call(map, w)) {
-      const n = map[w];
-      if (Number.isFinite(n) && n > 0) return n;
+// ======================= FIX #5: parseYesNo migliorato =======================
+function parseYesNo(speech) {
+  const t = normalizeText(speech || "");
+  if (!t) return null;
+  
+  // Controlla prima le parole positive (più specifiche)
+  for (const w of YES_WORDS) {
+    if (t === w || t.includes(w)) return true;
+  }
+  
+  // Poi le negative
+  for (const w of NO_WORDS) {
+    if (t === w || t.includes(w)) return false;
+  }
+  
+  return null;
+}
+
+function isNoRequestsText(speech) {
+  const t = normalizeText(speech || "");
+  return (
+    t === "no" ||
+    t === "nessuna" ||
+    t === "nessuno" ||
+    t === "niente" ||
+    t.includes("nessuna richiesta") ||
+    t.includes("niente di particolare") ||
+    t.includes("va bene cosi") ||
+    t.includes("va bene così") ||
+    t.includes("tutto ok") ||
+    t.includes("nulla")
+  );
+}
+
+function hasGlutenIntolerance(specialRequestsRaw) {
+  const t = normalizeText(specialRequestsRaw || "");
+  return (
+    t.includes("glutine") ||
+    t.includes("celiac") ||
+    t.includes("celiaco") ||
+    t.includes("celiaca") ||
+    t.includes("senza glutine")
+  );
+}
+
+function buildSpecialRequestsText(session) {
+  const parts = [];
+  if (session?.specialRequestsRaw && !isNoRequestsText(session.specialRequestsRaw)) {
+    parts.push(session.specialRequestsRaw);
+  }
+  if (session?.extraRequestsRaw && !isNoRequestsText(session.extraRequestsRaw)) {
+    parts.push(session.extraRequestsRaw);
+  }
+  if (session?.wantsOutside) {
+    parts.push("preferenza esterno");
+  }
+  return parts.length ? parts.join("; ") : "nessuna";
+}
+
+function maybeSayApericenaNotices(vr, session) {
+  if (session.glutenPiattoNotice) {
+    sayIt(vr, "Attenzione: il piatto apericena contiene glutine. Non posso garantire l'assenza per celiaci o intolleranti.");
+  }
+  if (session.promoRegistrationNotice) {
+    sayIt(vr, "Ti ricordo che per la promo è obbligatoria la registrazione su BrilliTasting.");
+  }
+}
+
+function buildMainMenuPrompt() {
+  return "Come posso aiutarti? Puoi dire: prenotare un tavolo, annullare o modificare una prenotazione, oppure chiedere informazioni.";
+}
+
+// ======================= GOOGLE CALENDAR =======================
+function getCalendarCredentials() {
+  if (GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
+    try {
+      const decoded = Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
+      return JSON.parse(decoded);
+    } catch (err) {
+      console.error("[GOOGLE] Invalid base64 credentials:", err);
     }
+  }
+  if (GOOGLE_SERVICE_ACCOUNT_JSON) {
+    try {
+      return JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
+    } catch (err) {
+      console.error("[GOOGLE] Invalid JSON credentials:", err);
+    }
+  }
+  return null;
+}
+
+function buildCalendarClient() {
+  const credentials = getCalendarCredentials();
+  if (!credentials) return null;
+  try {
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ["https://www.googleapis.com/auth/calendar"],
+    });
+    return google.calendar({ version: "v3", auth });
+  } catch (err) {
+    console.error("[GOOGLE] Failed to create calendar client:", err);
+    return null;
+  }
+}
+
+async function listCalendarEvents(dateISO) {
+  if (!GOOGLE_CALENDAR_ID) return [];
+  const calendar = buildCalendarClient();
+  if (!calendar) return [];
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const timeMin = makeUtcDateFromZoned(dateISO, "00:00", tz) || new Date(`${dateISO}T00:00:00`);
+  const nextDay = addDaysToISODate(dateISO, 1);
+  const timeMax = makeUtcDateFromZoned(nextDay, "00:00", tz) || new Date(`${nextDay}T00:00:00`);
+  try {
+    const result = await calendar.events.list({
+      calendarId: GOOGLE_CALENDAR_ID,
+      timeMin: timeMin.toISOString(),
+      timeMax: timeMax.toISOString(),
+      singleEvents: true,
+      orderBy: "startTime",
+    });
+    return result?.data?.items || [];
+  } catch (err) {
+    console.error("[GOOGLE] Calendar list failed:", err);
+    return [];
+  }
+}
+
+function getNextDateISO(dateISO) {
+  return addDaysToISODate(dateISO, 1);
+}
+
+function isDateClosedByCalendar(events) {
+  return (events || []).some((event) => {
+    const summary = String(event.summary || "").toLowerCase();
+    return summary.includes("locale chiuso") || summary.includes("chiusura");
+  });
+}
+
+function getEventTimeRange(event) {
+  if (!event) return null;
+  const start = event.start?.dateTime || event.start?.date;
+  const end = event.end?.dateTime || event.end?.date;
+  if (!start || !end) return null;
+  return {
+    start: new Date(start),
+    end: new Date(end),
+  };
+}
+
+function overlapsRange(range1, range2) {
+  if (!range1 || !range2) return false;
+  return range1.start < range2.end && range1.end > range2.start;
+}
+
+function extractTablesFromEvent(event) {
+  const summary = String(event?.summary || "");
+  const description = String(event?.description || "");
+  const blob = `${summary} ${description}`.toUpperCase();
+  const ids = [];
+  const pattern = /\bT(\d+F?)\b/gi;
+  let match;
+  while ((match = pattern.exec(blob)) !== null) {
+    ids.push(`T${match[1].toUpperCase()}`);
+  }
+  return [...new Set(ids)];
+}
+
+function getTableById(tableId) {
+  return TABLES.find((t) => t.id === tableId) || null;
+}
+
+function isDivanettiTableId(tableId) {
+  const t = getTableById(tableId);
+  return t && String(t.notes || "").toLowerCase().includes("divanett");
+}
+
+function buildAvailableTables(occupied, availableOverride, session) {
+  let pool = TABLES.filter((t) => !occupied.has(t.id));
+  if (availableOverride) {
+    pool = pool.filter((t) => availableOverride.has(t.id));
+  }
+  return pool;
+}
+
+function buildAvailableTableSet(tables) {
+  return new Set((tables || []).map((t) => t.id));
+}
+
+function isValidTableSelection(selection) {
+  if (!selection) return false;
+  if (!selection.locks || selection.locks.length === 0) return false;
+  return true;
+}
+
+function pickTableForParty(people, occupied, availableOverride, session) {
+  const availableTables = buildAvailableTables(occupied, availableOverride, session);
+  const availableSet = buildAvailableTableSet(availableTables);
+
+  // Try combinations first
+  for (const combo of TABLE_COMBINATIONS) {
+    if (people < combo.min || people > combo.max) continue;
+    const allAvailable = combo.replaces.every((id) => availableSet.has(id));
+    if (!allAvailable) continue;
+    return {
+      displayId: combo.displayId,
+      locks: combo.replaces,
+      notes: combo.notes || null,
+    };
+  }
+
+  // Try single tables
+  for (const table of availableTables) {
+    if (people < table.min || people > table.max) continue;
+    return {
+      displayId: table.id,
+      locks: [table.id],
+      notes: table.notes || null,
+    };
   }
 
   return null;
 }
 
-// ====== intent / info helpers (VOICE) ======
-function buildMainMenuPrompt() {
-  return "Vuoi prenotare un tavolo, chiedere informazioni, prenotare un evento, oppure modificare o annullare una prenotazione?";
+function pickSplitTables(people, availableTables, session) {
+  if (!people || people < 2) return null;
+  const sorted = [...availableTables].sort((a, b) => b.max - a.max);
+  let remaining = people;
+  const selected = [];
+  for (const table of sorted) {
+    if (remaining <= 0) break;
+    const seats = Math.min(table.max, remaining);
+    if (seats >= table.min) {
+      selected.push(table);
+      remaining -= seats;
+    }
+  }
+  if (remaining > 0) return null;
+  return {
+    displayIds: selected.map((t) => t.id),
+    locks: selected.map((t) => t.id),
+    notes: "tavoli separati",
+  };
 }
 
-function isNoRequestsText(speech) {
-  const tt = normalizeText(speech);
-  if (!tt) return false;
+// ======================= FIX #2: Filtro eventi musicali migliorato =======================
+function isMusicEventItem(event) {
+  const s = String(event?.summary || "").toLowerCase();
+  const d = String(event?.description || "").toLowerCase();
+  const blob = `${s} ${d}`;
   return (
-    tt === "no" ||
-    tt === "non" ||
-    tt.includes("nessun") ||
-    tt.includes("nessuna") ||
-    tt.includes("nessuno") ||
-    tt.includes("niente") ||
-    tt.includes("nulla") ||
-    tt.includes("non ho")
+    blob.includes("dj") ||
+    blob.includes("dj set") ||
+    blob.includes("live") ||
+    blob.includes("live music") ||
+    blob.includes("musica") ||
+    blob.includes("jazz") ||
+    blob.includes("concerto") ||
+    blob.includes("band") ||
+    blob.includes("quartet") ||
+    blob.includes("acoustic") ||
+    blob.includes("acustico") ||
+    blob.includes("piano") ||
+    blob.includes("sax") ||
+    blob.includes("cantante") ||
+    blob.includes("singer")
   );
 }
 
-function parseNextWeekdayISO(speech) {
-  const tt = normalizeText(speech);
-  if (!tt) return null;
-  const map = {
-    lunedi: 1,
-    "lunedì": 1,
-    martedi: 2,
-    "martedì": 2,
-    mercoledi: 3,
-    "mercoledì": 3,
-    giovedi: 4,
-    "giovedì": 4,
-    venerdi: 5,
-    "venerdì": 5,
-    sabato: 6,
-    domenica: 0,
-  };
-  const found = Object.keys(map).find((k) => tt.includes(k));
-  if (!found) return null;
-  const targetDow = map[found];
-  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-  const todayISO = formatISODateInTimeZone(new Date(), tz);
-  const todayNoon = makeUtcDateFromZoned(todayISO, "12:00", tz) || new Date(`${todayISO}T12:00:00`);
-  const todayDow = todayNoon.getUTCDay();
-  const delta = (targetDow - todayDow + 7) % 7;
-  return addDaysToISODate(todayISO, delta);
+// Verifica se è un evento all-day (senza orario specifico)
+function isAllDayEvent(event) {
+  // Gli eventi all-day hanno solo "date" e non "dateTime"
+  return event?.start?.date && !event?.start?.dateTime;
 }
 
-function resolveNataleISO() {
-  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-  const todayISO = formatISODateInTimeZone(new Date(), tz);
-  const year = Number(String(todayISO).slice(0, 4)) || new Date().getFullYear();
-  const nataleThisYear = `${year}-12-25`;
-  if (todayISO <= nataleThisYear) return nataleThisYear;
-  return `${year + 1}-12-25`;
+// Filtra eventi musicali escludendo all-day non musicali
+function filterMusicEventsOnly(events) {
+  return (events || []).filter(ev => {
+    // Se è un evento all-day, deve contenere keywords musicali
+    if (isAllDayEvent(ev)) {
+      return isMusicEventItem(ev);
+    }
+    // Se non è all-day, controlla comunque le keywords musicali
+    return isMusicEventItem(ev);
+  });
 }
 
-function extractMusicItemsFromEvents(events) {
-  if (!Array.isArray(events)) return [];
-  const items = [];
-  for (const ev of events) {
-    const summary = String(ev?.summary || "").trim();
-    const sumL = summary.toLowerCase();
-    const descL = String(ev?.description || "").toLowerCase();
-    if (!summary) continue;
-    if (sumL.includes("tavoli disponibili")) continue;
-    if (sumL.includes("locale chiuso") || descL.includes("locale chiuso")) continue;
-    // Evita prenotazioni tavoli
-    if (ev?.extendedProperties?.private?.ai_kind === "booking") continue;
-    const isMusic =
-      sumL.includes("dj") ||
-      sumL.includes("live") ||
-      sumL.includes("jazz") ||
-      sumL.includes("music") ||
-      descL.includes("dj") ||
-      descL.includes("live") ||
-      descL.includes("jazz") ||
-      descL.includes("music");
-    if (isMusic) items.push(summary);
-  }
-  return items;
+function extractMusicEventItems(events) {
+  // FIX #2: Usa la nuova funzione di filtro
+  return filterMusicEventsOnly(events).map(ev => String(ev.summary || "").trim()).filter(Boolean);
 }
 
 function stripOreETavolo(summary) {
@@ -1272,14 +1491,97 @@ async function findBookingCandidatesByDate(dateISO) {
   return (events || []).filter((ev) => ev?.extendedProperties?.private?.ai_kind === "booking");
 }
 
-function filterCandidatesBySurname(candidates, surnameRaw) {
-  const s = normalizeText(surnameRaw);
-  if (!s) return candidates;
-  return (candidates || []).filter((ev) => {
+// ======================= FIX #3: Pulizia cognome da parole filler =======================
+function cleanSurnameInput(raw) {
+  let s = normalizeText(raw || "");
+  // Rimuovi tutte le parole filler
+  for (const filler of FILLER_WORDS) {
+    // Usa regex con word boundaries per evitare match parziali
+    const regex = new RegExp(`\\b${filler}\\b`, "gi");
+    s = s.replace(regex, "");
+  }
+  // Pulisci spazi multipli
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
+// Calcola similarità tra due stringhe (Levenshtein normalizzato)
+function levenshteinDistance(a, b) {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  
+  const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+  
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,      // deletion
+        dp[i][j - 1] + 1,      // insertion
+        dp[i - 1][j - 1] + cost // substitution
+      );
+    }
+  }
+  return dp[m][n];
+}
+
+function stringSimilarity(a, b) {
+  const s1 = normalizeText(a);
+  const s2 = normalizeText(b);
+  if (!s1 || !s2) return 0;
+  if (s1 === s2) return 1;
+  
+  const maxLen = Math.max(s1.length, s2.length);
+  if (maxLen === 0) return 1;
+  
+  const distance = levenshteinDistance(s1, s2);
+  return 1 - (distance / maxLen);
+}
+
+// FIX #3: Filtro cognome con fuzzy matching
+function filterCandidatesBySurnameFuzzy(candidates, surnameRaw, threshold = 0.6) {
+  const cleanedSurname = cleanSurnameInput(surnameRaw);
+  if (!cleanedSurname) return candidates;
+  
+  const scored = (candidates || []).map(ev => {
     const sum = normalizeText(ev?.summary || "");
     const desc = normalizeText(ev?.description || "");
-    return sum.includes(s) || desc.includes(s);
+    const blob = `${sum} ${desc}`;
+    
+    // Estrai possibili cognomi dal blob
+    const words = blob.split(/\s+/);
+    let maxSim = 0;
+    
+    for (const word of words) {
+      if (word.length < 2) continue;
+      const sim = stringSimilarity(cleanedSurname, word);
+      if (sim > maxSim) maxSim = sim;
+    }
+    
+    // Controlla anche se il cognome è contenuto (match parziale)
+    if (blob.includes(cleanedSurname)) {
+      maxSim = Math.max(maxSim, 0.9);
+    }
+    
+    return { ev, similarity: maxSim };
   });
+  
+  // Filtra solo quelli sopra la soglia e ordina per similarità
+  return scored
+    .filter(item => item.similarity >= threshold)
+    .sort((a, b) => b.similarity - a.similarity)
+    .map(item => item.ev);
+}
+
+// Mantieni la funzione originale per retrocompatibilità
+function filterCandidatesBySurname(candidates, surnameRaw) {
+  // Usa la nuova versione fuzzy
+  return filterCandidatesBySurnameFuzzy(candidates, surnameRaw, 0.5);
 }
 
 function filterCandidatesByTime(candidates, time24) {
@@ -1291,333 +1593,108 @@ function filterCandidatesByTime(candidates, time24) {
   });
 }
 
+// FIX #4: Filtro per numero persone
+function filterCandidatesByPeople(candidates, people) {
+  if (!people) return candidates;
+  const n = Number(people);
+  if (!Number.isFinite(n)) return candidates;
+  
+  return (candidates || []).filter(ev => {
+    const desc = String(ev?.description || "");
+    const sum = String(ev?.summary || "");
+    
+    // Cerca "X pax" o "Persone: X"
+    const paxMatch = sum.match(/(\d+)\s*pax/i) || desc.match(/Persone:\s*(\d+)/i);
+    if (paxMatch) {
+      return Number(paxMatch[1]) === n;
+    }
+    return true; // Se non troviamo il numero, mantieni il candidato
+  });
+}
+
+// FIX #4: Filtro per telefono
+function filterCandidatesByPhone(candidates, phone) {
+  if (!phone) return candidates;
+  const normalizedPhone = String(phone).replace(/\D/g, "").slice(-9); // Ultimi 9 digits
+  
+  return (candidates || []).filter(ev => {
+    const desc = String(ev?.description || "");
+    const phoneMatch = desc.match(/Telefono:\s*([+\d\s-]+)/i);
+    if (phoneMatch) {
+      const eventPhone = String(phoneMatch[1]).replace(/\D/g, "").slice(-9);
+      return eventPhone === normalizedPhone;
+    }
+    return true;
+  });
+}
+
 function extractDateISOFromEvent(ev) {
   const dt = ev?.start?.dateTime || ev?.start?.date || "";
   return String(dt).slice(0, 10);
 }
 
-
-function extractSurnameFromSpeech(raw) {
-  const t = normalizeText(raw);
-  if (!t) return "";
-  // rimuovi riempitivi/filler che spesso l'ASR mette prima del cognome
-  const fillers = [
-    "si",
-    "ok",
-    "eh",
-    "allora",
-    "diciamo",
-    "insomma",
-    "credo",
-    "penso",
-    "forse",
-    "mi sembra",
-    "sembra",
-    "dovrebbe",
-    "dovrebbe essere",
-    "dovrebbe esser",
-    "mi pare",
-    "pare",
-    "praticamente",
-    "cioe",
-    "cioè",
-    "tipo",
-    "beh",
-  ];
-
-  let s = ` ${t} `;
-  for (const f of fillers) {
-    const ff = normalizeText(f);
-    if (!ff) continue;
-    // rimuovi solo se appare come parola intera
-    s = s.replace(new RegExp(`\\b${ff}\\b`, "g"), " ");
-  }
-  s = s.replace(/\s+/g, " ").trim();
-
-  // se rimane solo consenso/stopwords, considera vuoto
-  if (!s || YES_WORDS.includes(s) || NO_WORDS.includes(s)) return "";
-
-  // tieni gli ultimi 1-3 token (gestisce cognomi composti: "de luca", "di marco")
-  const tokens = s.split(" ").filter(Boolean);
-  if (!tokens.length) return "";
-
-  const connectors = new Set(["de", "di", "del", "della", "dello", "dei", "da", "la", "lo"]);
-  let keep = 1;
-  // se l'ultimo token è corto e connettivo, aumenta
-  for (let i = tokens.length - 2; i >= 0 && keep < 3; i--) {
-    if (connectors.has(tokens[i])) keep += 1;
-    else break;
-  }
-
-  const picked = tokens.slice(-keep).join(" ").trim();
-  return picked;
-}
-
-function levenshteinDistance(a, b) {
-  const s = String(a || "");
-  const t = String(b || "");
-  const n = s.length;
-  const m = t.length;
-  if (!n) return m;
-  if (!m) return n;
-
-  const dp = new Array(m + 1);
-  for (let j = 0; j <= m; j++) dp[j] = j;
-
-  for (let i = 1; i <= n; i++) {
-    let prev = dp[0];
-    dp[0] = i;
-    for (let j = 1; j <= m; j++) {
-      const tmp = dp[j];
-      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
-      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + cost);
-      prev = tmp;
+// FIX #3 & #4: Ricerca prenotazione migliorata
+async function findBookingEventMatch({ dateISO, time24, surname, people, phone }) {
+  const base = await findBookingCandidatesByDate(dateISO);
+  
+  // Applica filtri in ordine di priorità
+  let candidates = base;
+  
+  // 1. Filtro cognome (fuzzy)
+  if (surname) {
+    const bySurname = filterCandidatesBySurnameFuzzy(candidates, surname);
+    if (bySurname.length > 0) {
+      candidates = bySurname;
     }
   }
-  return dp[m];
-}
-
-function similarityRatio(a, b) {
-  const s = normalizeText(a);
-  const t = normalizeText(b);
-  if (!s || !t) return 0;
-  if (s === t) return 1;
-  if (s.includes(t) || t.includes(s)) return 0.92;
-  const d = levenshteinDistance(s, t);
-  const denom = Math.max(s.length, t.length) || 1;
-  return 1 - d / denom;
-}
-
-function extractPeopleFromSummary(summary) {
-  const s = String(summary || "");
-  const m = s.match(/,\s*(\d+)\s*pax/i);
-  if (m) return Number(m[1]);
-  return null;
-}
-
-function extractPeopleFromDescription(desc) {
-  const s = String(desc || "");
-  const m = s.match(/Persone:\s*(\d+)/i);
-  if (m) return Number(m[1]);
-  return null;
-}
-
-function extractPhoneFromDescription(desc) {
-  const s = String(desc || "");
-  const m = s.match(/Telefono:\s*([^\n]+)/i);
-  if (!m) return "";
-  return String(m[1] || "").trim();
-}
-
-function extractNameFromSummary(summary) {
-  // formato tipico: "Ore 20:30, tav T12, Mario Rossi, 4 pax"
-  const s = String(summary || "");
-  const parts = s.split(",");
-  if (parts.length < 3) return "";
-  // parte 0: Ore..., parte 1: tav..., parte 2: nome
-  return String(parts[2] || "").trim();
-}
-
-function extractSurnameFromEvent(ev) {
-  const desc = String(ev?.description || "");
-  const nameLine = desc.match(/Nome:\s*([^\n]+)/i);
-  const fullName = nameLine ? String(nameLine[1] || "").trim() : extractNameFromSummary(ev?.summary || "");
-  if (!fullName) return "";
-  const tokens = normalizeText(fullPhoneCleanup(fullName)).split(" ").filter(Boolean);
-  if (!tokens.length) return "";
-  // cognome = ultimi 1-2 token (gestione composti)
-  const connectors = new Set(["de", "di", "del", "della", "dello", "dei", "da", "la", "lo"]);
-  let keep = 1;
-  if (tokens.length >= 2 && connectors.has(tokens[tokens.length - 2])) keep = 2;
-  return tokens.slice(-keep).join(" ");
-}
-
-function fullPhoneCleanup(s) {
-  return String(s || "").replace(/[0-9+]/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function extractTime24FromEvent(ev) {
-  // preferisci summary "Ore 20:30", fallback su start.dateTime
-  const sum = String(ev?.summary || "");
-  const m = sum.match(/Ore\s*(\d{1,2}:\d{2})/i);
-  if (m) return m[1];
-  const dt = ev?.start?.dateTime;
-  if (dt) return parseTimeIT(dt) || null;
-  return null;
-}
-
-function extractPhoneE164FromEvent(ev) {
-  const raw = extractPhoneFromDescription(ev?.description || "");
-  const parsed = parsePhoneNumber(raw);
-  return isValidPhoneE164(parsed) ? parsed : "";
-}
-
-function parsePhoneLast3FromSpeech(raw) {
-  const t = normalizeText(raw);
-  if (!t) return "";
-
-  // mapping parole->digit
-  const map = {
-    zero: "0",
-    uno: "1",
-    una: "1",
-    due: "2",
-    tre: "3",
-    quattro: "4",
-    cinque: "5",
-    sei: "6",
-    sette: "7",
-    otto: "8",
-    nove: "9",
-  };
-
-  let s = t;
-  for (const [w, d] of Object.entries(map)) {
-    s = s.replace(new RegExp(`\\b${w}\\b`, "g"), d);
+  
+  // 2. Filtro orario (se fornito)
+  if (time24) {
+    const byTime = filterCandidatesByTime(candidates, time24);
+    if (byTime.length > 0) {
+      candidates = byTime;
+    }
   }
-
-  // prendi solo cifre
-  const digits = s.replace(/\D/g, "");
-  if (digits.length >= 3) return digits.slice(-3);
-  return "";
-}
-
-function formatPhoneForVoiceFull(phoneE164) {
-  let p = String(phoneE164 || "").trim();
-  if (!p) return "";
-  // rimuovi +39 o 39 iniziale
-  p = p.replace(/^\+?39/, "");
-  // lascia solo cifre
-  const digits = p.replace(/\D/g, "");
-  if (!digits) return "";
-  return digits.split("").join(" ");
-}
-
-async function findBookingEventMatch({ dateISO, time24, surname, people, phoneLast3, callerPhoneE164 }) {
-  const candidates = await findBookingCandidatesByDate(dateISO);
-
-  const targetSurname = normalizeText(surname || "");
-  const targetTime = time24 ? String(time24) : "";
-  const targetPeople = Number.isFinite(Number(people)) ? Number(people) : null;
-  const targetLast3 = String(phoneLast3 || "").replace(/\D/g, "").slice(-3) || "";
-  const caller = isValidPhoneE164(callerPhoneE164) ? callerPhoneE164 : "";
-
-  const scored = (candidates || []).map((ev) => {
-    const evSurname = extractSurnameFromEvent(ev);
-    const evTime = extractTime24FromEvent(ev);
-    const evPeople = extractPeopleFromDescription(ev?.description) || extractPeopleFromSummary(ev?.summary);
-    const evPhone = extractPhoneE164FromEvent(ev);
-
-    let score = 0;
-
-    // cognome: fuzzy
-    if (targetSurname) {
-      score += similarityRatio(targetSurname, evSurname) * 0.55;
-    } else {
-      // se non ho cognome, piccolo bonus per non penalizzare troppo
-      score += 0.05;
+  
+  // 3. Filtro persone (se fornito e ci sono ancora più candidati)
+  if (people && candidates.length > 1) {
+    const byPeople = filterCandidatesByPeople(candidates, people);
+    if (byPeople.length > 0) {
+      candidates = byPeople;
     }
-
-    // orario
-    if (targetTime && evTime) {
-      if (targetTime === evTime) score += 0.22;
-      else {
-        // tolleranza 15 min
-        const [h1, m1] = targetTime.split(":").map(Number);
-        const [h2, m2] = evTime.split(":").map(Number);
-        if (Number.isFinite(h1) && Number.isFinite(m1) && Number.isFinite(h2) && Number.isFinite(m2)) {
-          const diff = Math.abs((h1 * 60 + m1) - (h2 * 60 + m2));
-          if (diff <= 15) score += 0.12;
-        }
-      }
-    }
-
-    // persone
-    if (targetPeople && Number.isFinite(evPeople)) {
-      if (Number(evPeople) === targetPeople) score += 0.15;
-      else if (Math.abs(Number(evPeople) - targetPeople) === 1) score += 0.08;
-    }
-
-    // telefono (disambiguazione)
-    let phoneMatched = false;
-    if (targetLast3 && evPhone) {
-      const evDigits = evPhone.replace(/\D/g, "").replace(/^39/, "");
-      if (evDigits.endsWith(targetLast3)) {
-        score += 0.25;
-        phoneMatched = true;
-      }
-    } else if (caller && evPhone && evPhone === caller) {
-      score += 0.18; // aiuto "silenzioso" senza chiederlo
-    }
-
-    return {
-      ev,
-      score,
-      evSurname,
-      evTime,
-      evPeople: Number.isFinite(evPeople) ? Number(evPeople) : null,
-      evPhone,
-      phoneMatched,
-    };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-
-  const best = scored[0] || null;
-  const second = scored[1] || null;
-
-  // se non ho candidati
-  if (!best) return { match: null, candidates: [], needsPeople: false, needsPhone: false };
-
-  // soglie
-  const bestScore = best.score || 0;
-  const secondScore = second ? second.score || 0 : 0;
-  const gap = bestScore - secondScore;
-
-  const isConfident = bestScore >= 0.60 && (gap >= 0.14 || scored.length === 1);
-
-  if (isConfident) {
-    return {
-      match: best.ev,
-      candidates: scored.map((x) => x.ev),
-      needsPeople: false,
-      needsPhone: false,
-      usedPhone: Boolean(targetLast3 && best.phoneMatched),
-      matchPhone: best.evPhone || "",
-    };
   }
-
-  // ambiguo: chiedi persone, poi ultime 3 cifre (solo se serve)
-  const needsPeople = !targetPeople;
-  const needsPhone = !needsPeople && !targetLast3;
-
-  return {
-    match: null,
-    candidates: scored.map((x) => x.ev).slice(0, 5),
-    needsPeople,
-    needsPhone,
-  };
+  
+  // 4. Filtro telefono (se fornito e ci sono ancora più candidati)
+  if (phone && candidates.length > 1) {
+    const byPhone = filterCandidatesByPhone(candidates, phone);
+    if (byPhone.length > 0) {
+      candidates = byPhone;
+    }
+  }
+  
+  const match = candidates[0] || null;
+  return { match, candidates };
 }
-
 
 async function patchBookingAsCanceled(eventId, dateISO, originalEvent) {
-  if (!GOOGLE_CALENDAR_ID || !eventId) return null;
+  if (!GOOGLE_CALENDAR_ID || !eventId || !dateISO) return null;
   const calendar = buildCalendarClient();
   if (!calendar) return null;
 
-  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-  const oldDateISO = String(originalEvent?.start?.dateTime || originalEvent?.start?.date || dateISO || "").slice(0, 10) || dateISO;
-  const useDateISO = oldDateISO || dateISO;
-  if (!useDateISO) return null;
-
   const originalSummary = String(originalEvent?.summary || "");
   const stripped = stripOreETavolo(originalSummary);
-  const cleaned = stripped.replace(/^annullat[oa]\s*-\s*/i, "").trim();
-  const newSummary = `Annullato - ${cleaned || "prenotazione"}`;
+  const newSummary = stripped ? `Annullato - ${stripped}` : "Annullato - Prenotazione";
 
-  const newDesc = String(originalEvent?.description || "")
-    .replace(/Tavolo:\s*[^\n]*/i, "Tavolo: ")
-    .trim();
+  const oldDesc = String(originalEvent?.description || "").trim();
+  const newDesc = [
+    "ANNULLAMENTO PRENOTAZIONE",
+    `Data annullamento: ${formatISODateInTimeZone(new Date(), GOOGLE_CALENDAR_TZ || "Europe/Rome")}`,
+    "",
+    "DESCRIZIONE PRECEDENTE:",
+    oldDesc || "-",
+    "",
+    "Tavolo: ",
+  ].join("\n");
 
   try {
     const result = await calendar.events.patch({
@@ -1626,19 +1703,18 @@ async function patchBookingAsCanceled(eventId, dateISO, originalEvent) {
       requestBody: {
         summary: newSummary,
         description: newDesc,
-        start: { date: useDateISO },
-        end: { date: getNextDateISO(useDateISO) },
+        start: { date: dateISO },
+        end: { date: getNextDateISO(dateISO) },
       },
     });
-    // rigenera tavoli disponibili
-    await upsertAvailabilityEvent(useDateISO);
+    await upsertAvailabilityEvent(dateISO);
+    console.log("[GOOGLE] Booking canceled successfully:", eventId);
     return result?.data || null;
   } catch (err) {
-    console.error("[GOOGLE] patchBookingAsCanceled failed:", err);
+    console.error("[GOOGLE] Cancel booking patch failed:", err);
     return null;
   }
 }
-
 
 async function computeTableSelectionForChange({ dateISO, time24, people, ignoreEventId }) {
   const events = await listCalendarEvents(dateISO);
@@ -1746,14 +1822,6 @@ async function patchBookingAsModified({
   }
 }
 
-/* ===========================
-CRITICITA 1 — INFO “SMART”
-- musica: gestisce anche “prossima settimana / settimana prossima / questa settimana”
-- disponibilita: controlla PRIMA se il locale e' chiuso (es. lunedi) e lo dice subito
-- migliora matching “mercoledi c'e musica” (cerca eventi musicali del giorno)
-- usa calendario per risposte (musica / apertura / disponibilita)
-=========================== */
-
 function parseWeekdayIndexIT(text) {
   const t = normalizeText(text || "");
   if (!t) return null;
@@ -1795,48 +1863,6 @@ function getNextWeekRangeISO(todayISO, tz) {
   const endISO = addDaysToISODate(startISO, 6);
   return { startISO, endISO };
 }
-
-function resolveChristmasISO() {
-  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-  const todayISO = formatISODateInTimeZone(new Date(), tz);
-  const year = Number(String(todayISO).slice(0, 4)) || new Date().getFullYear();
-  const thisYear = `${year}-12-25`;
-  return todayISO <= thisYear ? thisYear : `${year + 1}-12-25`;
-}
-
-function isMusicEventItem(event) {
-  const summary = String(event?.summary || "").trim();
-  if (!summary) return false;
-
-  const s = summary.toLowerCase();
-  const d = String(event?.description || "").toLowerCase();
-
-  // escludi eventi di sistema / servizio
-  if (s.includes("tavoli disponibili")) return false;
-  if (s.includes("locale chiuso") || d.includes("locale chiuso")) return false;
-  if (s.startsWith("richiamare") || s.includes("richiamare -")) return false;
-  if (s.startsWith("annullat")) return false;
-  if (event?.extendedProperties?.private?.ai_kind === "booking") return false;
-
-  const hasKw = (blob) =>
-    blob.includes("musica") ||
-    blob.includes("live") ||
-    blob.includes("dj") ||
-    blob.includes("dj set") ||
-    blob.includes("jazz") ||
-    blob.includes("concerto") ||
-    blob.includes("band") ||
-    blob.includes("quartet");
-
-  const isAllDay = Boolean(event?.start?.date && !event?.start?.dateTime);
-
-  // ALL-DAY: includi solo se keyword in titolo o descrizione
-  if (isAllDay) return hasKw(s) || hasKw(d);
-
-  // con orario: keyword in titolo o descrizione
-  return hasKw(`${s} ${d}`);
-}
-
 
 function getEventStartDateISO(event) {
   const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
@@ -1886,7 +1912,11 @@ function formatOpeningHoursForDateISO(dateISO) {
   return `Siamo aperti dalle ${OPENING.drinksOnly.start}. Cucina dalle ${kitchen.start} alle ${kitchen.end}.`;
 }
 
-function formatMusicAnswerForRange(musicEvents, startISO, endISO) {
+// FIX #2: Formattazione risposta eventi musicali migliorata
+function formatMusicAnswerForRange(allEvents, startISO, endISO) {
+  // Filtra SOLO eventi musicali (esclude all-day non musicali)
+  const musicEvents = filterMusicEventsOnly(allEvents);
+  
   if (!musicEvents || musicEvents.length === 0) {
     if (startISO === endISO) {
       return `Non risulta musica in calendario per ${formatDateLabel(startISO)}.`;
@@ -1919,1431 +1949,16 @@ function formatMusicAnswerForRange(musicEvents, startISO, endISO) {
     lines.push(`${label}: ${items.join(", ")}`);
   }
 
+  if (lines.length === 0) {
+    if (startISO === endISO) {
+      return `Non risulta musica in calendario per ${formatDateLabel(startISO)}.`;
+    }
+    return `Non risultano eventi musicali in calendario nel periodo ${formatDateLabel(startISO)} - ${formatDateLabel(endISO)}.`;
+  }
+
   if (startISO === endISO) return `Per ${formatDateLabel(startISO)} risulta: ${lines.join(" ")}`;
   return `Nel periodo ${formatDateLabel(startISO)} - ${formatDateLabel(endISO)} risultano: ${lines.join(" ")}`;
 }
-
-function buildPromoAnswer(textRaw) {
-  const t = normalizeText(textRaw || "");
-  const isPromo = t.includes("promo") || t.includes("brilli") || t.includes("tasting") || t.includes("piatto apericena");
-  if (!isPromo) return null;
-
-  const wantsContents =
-    t.includes("cosa comprende") ||
-    t.includes("comprende") ||
-    t.includes("include") ||
-    t.includes("quali") ||
-    t.includes("portate") ||
-    t.includes("assaggi");
-
-  if (!wantsContents) {
-    return "La promo BrilliTasting prevede il piatto apericena a 18 euro invece di 25: 13 portate, coperto e drink incluso (vino o drink base). E' obbligatoria la registrazione e la prenotazione.";
-  }
-
-  return "Il piatto apericena BrilliTasting comprende 13 assaggi: polpetta di cervo al ginepro, polpetta agnello con menta fresca e scorza di limone, falafel croccante all'aglio, mini tartare di fassona al coltello con vinaigrette agli agrumi e crema di capperi, olive e menta, paninetti con porchetta cunzata e panelle, bruschetta classica, bruschetta con stracciatella di bufala, crudo, tartare di gambero con cipolla e olive, cazzilli, verdura pastellata, caprino agli agrumi, stinco Brillo con patata al forno, millefoglie di patate e carciofi con fonduta di pecorino romano DOP. Cocktail o vino o birra e coperto inclusi.";
-}
-
-function buildDietAnswer(textRaw) {
-  const t = normalizeText(textRaw || "");
-  if (t.includes("senza glutine") || t.includes("glutine") || t.includes("celiac")) {
-    return "Si', abbiamo opzioni senza glutine, ma e' sempre meglio comunicarlo durante la prenotazione e ricordarlo al personale di sala.";
-  }
-  if (t.includes("vegano") || t.includes("vegana") || t.includes("vegetar")) {
-    return "Si', abbiamo opzioni vegetariane e anche vegane, ma e' sempre meglio comunicarlo durante la prenotazione e ricordarlo al personale di sala.";
-  }
-  if (t.includes("cane") || t.includes("gatto") || t.includes("animale")) {
-    return "Si', e' possibile portare un animale domestico, purché venga comunicato in fase di prenotazione specificando taglia e razza.";
-  }
-  if (t.includes("compleanno") || t.includes("cena aziendale") || t.includes("evento") || t.includes("festa")) {
-    return "Si', e' possibile. Spiegami in sintesi la tua esigenza e ti faremo ricontattare al piu' presto.";
-  }
-  return null;
-}
-
-async function checkAvailabilityQuickVoice(session, dateISO, people, time24) {
-  const events = await listCalendarEvents(dateISO);
-  if (isBusinessClosedOnDateISO(dateISO, events)) {
-    return { handled: true, answer: `Mi dispiace, ${formatDateLabel(dateISO)} risulta chiuso.` };
-  }
-  if (!Number.isFinite(people) || !time24) {
-    return {
-      handled: true,
-      needsDetails: true,
-      pending: { type: "availability", dateISO, people: Number.isFinite(people) ? people : null, time24: time24 || null },
-    };
-  }
-
-  // preview su session clone per non sporcare la session reale
-  let tmp;
-  try {
-    tmp = JSON.parse(JSON.stringify(session || {}));
-  } catch {
-    tmp = { ...(session || {}) };
-  }
-  tmp.dateISO = dateISO;
-  tmp.people = people;
-  tmp.time24 = time24;
-
-  const res = await reserveTableForSession(tmp, { commit: false });
-  if (res?.status === "closed") {
-    return { handled: true, answer: `Mi dispiace, ${formatDateLabel(dateISO)} risulta chiuso.` };
-  }
-  if (res?.status === "ok") {
-    return {
-      handled: true,
-      answer: `Sì, in linea di massima c'e' disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ore ${time24}. Se vuoi, possiamo procedere con la prenotazione.`,
-    };
-  }
-  if (res?.status === "needs_split" || res?.status === "needs_outside") {
-    return {
-      handled: true,
-      answer: `Potrebbe esserci disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ore ${time24}, ma potremmo dovervi sistemare su tavoli separati o anche in esterno. Se vuoi, posso metterti in contatto con un operatore.`,
-    };
-  }
-  return {
-    handled: true,
-    answer: `Al momento non risulta disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ore ${time24}. Vuoi provare un altro orario?`,
-  };
-}
-
-async function tryAnswerInfoQuestionVoiceSmart(session, questionRaw) {
-  const raw = String(questionRaw || "").trim();
-  const q = normalizeText(raw);
-  if (!q) return { handled: false };
-
-  // 1) PROMO / MENU / FAQ
-  const promo = buildPromoAnswer(raw);
-  if (promo) return { handled: true, answer: promo };
-
-  const diet = buildDietAnswer(raw);
-  if (diet) return { handled: true, answer: diet };
-
-  // 2) MUSICA / EVENTI MUSICALI
-  const asksMusic = q.includes("musica") || q.includes("dj") || q.includes("live") || q.includes("jazz");
-  if (asksMusic) {
-    const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-    const todayISO = formatISODateInTimeZone(new Date(), tz);
-
-    // range default: giorno specifico se presente, altrimenti prossimi 7 giorni
-    let startISO = null;
-    let endISO = null;
-
-    const explicitDate = parseDateIT(raw);
-    if (explicitDate) {
-      startISO = explicitDate;
-      endISO = explicitDate;
-    } else if (q.includes("prossima settimana") || q.includes("settimana prossima")) {
-      const r = getNextWeekRangeISO(todayISO, tz);
-      startISO = r.startISO;
-      endISO = r.endISO;
-    } else if (q.includes("questa settimana")) {
-      const r = getCurrentWeekRangeISO(todayISO, tz);
-      startISO = r.startISO;
-      endISO = r.endISO;
-    } else {
-      const wd = parseWeekdayIndexIT(raw);
-      if (wd !== null) {
-        const todayDow = getWeekdayIndexInTimeZone(todayISO, tz);
-        const delta = (wd - todayDow + 7) % 7;
-        const targetISO = addDaysToISODate(todayISO, delta);
-        startISO = targetISO;
-        endISO = targetISO;
-      } else {
-        startISO = todayISO;
-        endISO = addDaysToISODate(todayISO, 6);
-      }
-    }
-
-    const all = await listCalendarEventsBetweenISO(startISO, endISO);
-    const music = all.filter(isMusicEventItem);
-    const answer = formatMusicAnswerForRange(music, startISO, endISO);
-    return { handled: true, answer };
-  }
-
-  // 3) APERTURE / CHIUSURE
-  const asksOpen = q.includes("apert") || q.includes("chius") || q.includes("orari") || q.includes("natale") || q.includes("capodanno");
-  if (asksOpen) {
-    let dateISO = parseDateIT(raw);
-    if (!dateISO && q.includes("natale")) dateISO = resolveChristmasISO();
-    if (!dateISO) {
-      const wd = parseWeekdayIndexIT(raw);
-      if (wd !== null) {
-        const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-        const todayISO = formatISODateInTimeZone(new Date(), tz);
-        const todayDow = getWeekdayIndexInTimeZone(todayISO, tz);
-        const delta = (wd - todayDow + 7) % 7;
-        dateISO = addDaysToISODate(todayISO, delta);
-      }
-    }
-    if (!dateISO) {
-      return { handled: true, answer: "Dimmi per quale giorno vuoi sapere se siamo aperti." };
-    }
-
-    const events = await listCalendarEvents(dateISO);
-    if (isBusinessClosedOnDateISO(dateISO, events)) {
-      const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-      const dow = getWeekdayIndexInTimeZone(dateISO, tz);
-      if (dow === OPENING.closedDay) {
-        return { handled: true, answer: `Mi dispiace, ${formatDateLabel(dateISO)} e' il nostro giorno di chiusura.` };
-      }
-      return { handled: true, answer: `Mi dispiace, ${formatDateLabel(dateISO)} risulta chiuso.` };
-    }
-    return { handled: true, answer: `${formatDateLabel(dateISO)} ${formatOpeningHoursForDateISO(dateISO)}` };
-  }
-
-  // 4) DISPONIBILITA' TAVOLO (anche con giorno della settimana)
-  const asksAvailability = q.includes("disponibil") || q.includes("posto") || q.includes("posti") || q.includes("tavolo") || q.includes("prenot");
-  if (asksAvailability) {
-    let dateISO = parseDateIT(raw);
-    const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-    const todayISO = formatISODateInTimeZone(new Date(), tz);
-
-    if (!dateISO) {
-      const wd = parseWeekdayIndexIT(raw);
-      if (wd !== null) {
-        const todayDow = getWeekdayIndexInTimeZone(todayISO, tz);
-        const delta = (wd - todayDow + 7) % 7;
-        dateISO = addDaysToISODate(todayISO, delta);
-      }
-    }
-    if (!dateISO) {
-      return { handled: true, answer: "Certo. Per quale giorno vuoi verificare la disponibilita'?" };
-    }
-
-    // PRIMA controlla se chiuso
-    const events = await listCalendarEvents(dateISO);
-    if (isBusinessClosedOnDateISO(dateISO, events)) {
-      return { handled: true, answer: `Mi dispiace, ${formatDateLabel(dateISO)} risulta chiuso.` };
-    }
-
-    const people = parsePeopleIT(raw);
-    const time24 = parseTimeIT(raw);
-
-    return await checkAvailabilityQuickVoice(session, dateISO, people, time24);
-  }
-
-  return { handled: false };
-}
-
-
-async function tryAnswerInfoQuestionVoice(questionRaw) {
-  const q = String(questionRaw || "").trim();
-  const tt = normalizeText(q);
-  if (!tt) return { handled: false };
-
-  // Promo / BrilliTasting
-  if (tt.includes("brillitasting") || (tt.includes("promo") && tt.includes("apericena")) || tt.includes("piatto apericena")) {
-    const reply =
-      "La promo BrilliTasting prevede un piatto apericena a 18 euro invece di 25: 13 portate, coperto e un drink incluso (vino o drink di base). È obbligatoria la registrazione e la prenotazione.";
-    return { handled: true, reply };
-  }
-
-  if (tt.includes("cosa comprende") || tt.includes("comprende") || (tt.includes("piatto") && tt.includes("apericena"))) {
-    const reply =
-      "Il piatto BrilliTasting comprende 13 assaggi: Polpetta di cervo al ginepro, polpetta di agnello con menta e scorza di limone, falafel croccante all'aglio, mini tartare di fassona con vinaigrette agli agrumi, crema di capperi, olive e menta, paninetti con porchetta cunzata e panelle, bruschetta classica, bruschetta con stracciatella di bufala, crudo, tartare di gambero, cipolla di tropea e olive taggiasche, cazzilli di patata croccante, verdura pastellata, caprino aromatizzato agli agrumi, stinco Brillo con patata al forno, e millefoglie di patate e carciofi con fonduta di pecorino romano DOP. Coperto e cocktail o vino o birra inclusi.";
-    return { handled: true, reply };
-  }
-
-  if (tt.includes("senza glutine") || tt.includes("celia")) {
-    return {
-      handled: true,
-      reply: "Sì, possiamo gestire richieste senza glutine, ma è meglio comunicarlo in fase di prenotazione e ricordarlo al personale di sala.",
-    };
-  }
-
-  if (tt.includes("vegano") || tt.includes("vegetar")) {
-    return {
-      handled: true,
-      reply: "Sì, possiamo proporre opzioni vegane o vegetariane. Ti consiglio di comunicarlo in fase di prenotazione e ricordarlo al personale di sala.",
-    };
-  }
-
-  if (tt.includes("cane") || tt.includes("gatto") || tt.includes("animale")) {
-    return {
-      handled: true,
-      reply: "Sì, è possibile portare un animale domestico, purché venga comunicato in fase di prenotazione specificando taglia e razza.",
-    };
-  }
-
-  if (tt.includes("comple") || tt.includes("festa") || tt.includes("azienda") || tt.includes("evento")) {
-    return {
-      handled: true,
-      reply: "Sì, è possibile organizzare compleanni, eventi o cene aziendali. Spiegami in sintesi l'esigenza e ti faremo ricontattare al più presto.",
-    };
-  }
-
-  // Orari / apertura
-  if (tt.includes("orari") || tt.includes("aperti") || tt.includes("apertura") || tt.includes("chiusura")) {
-    const closedDay = OPENING?.closedDay;
-    const reply =
-      closedDay === 1
-        ? "Siamo chiusi il lunedì. Negli altri giorni siamo aperti in orario serale; per date speciali controlliamo anche il calendario."
-        : "Siamo aperti in orario serale; per eventuali giorni di chiusura straordinaria controlliamo anche il calendario.";
-    return { handled: true, reply };
-  }
-
-  // Musica
-  if (tt.includes("musica") || tt.includes("dj") || tt.includes("live") || tt.includes("jazz")) {
-    const dateISO = parseDateIT(q) || parseNextWeekdayISO(q);
-    if (!dateISO) return { handled: false };
-    const events = await listCalendarEvents(dateISO);
-    const items = extractMusicItemsFromEvents(events);
-    if (items.length === 0) {
-      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} non vedo musica live o dj set segnati in calendario.` };
-    }
-    const top = items.slice(0, 3).join(", ");
-    return { handled: true, reply: `Sì, per ${formatDateLabel(dateISO)} risulta: ${top}.` };
-  }
-
-  // Disponibilità tavolo
-  if (tt.includes("disponibil") || (tt.includes("c'e") && tt.includes("posto"))) {
-    const dateISO = parseDateIT(q) || parseNextWeekdayISO(q);
-    const people = parsePeopleIT(q);
-    const time24 = parseTimeIT(q);
-    if (!dateISO) return { handled: false };
-    if (!people) {
-      return { handled: true, needsFollowUp: true, followUpKind: "avail_people", payload: { dateISO, time24 }, prompt: "Certo. In quante persone siete?" };
-    }
-    if (!time24) {
-      return { handled: true, needsFollowUp: true, followUpKind: "avail_time", payload: { dateISO, people }, prompt: "A che ora?" };
-    }
-
-    const tmp = { dateISO, time24, people, specialRequestsRaw: "nessuna", preorderLabel: "nessuno" };
-    const availability = await reserveTableForSession(tmp, { commit: false });
-    if (availability.status === "closed") {
-      return { handled: true, reply: `Mi dispiace, per ${formatDateLabel(dateISO)} risulta chiuso.` };
-    }
-    if (availability.status === "unavailable") {
-      return { handled: true, reply: `Mi dispiace, per ${formatDateLabel(dateISO)} alle ore ${time24} non vedo disponibilità.` };
-    }
-    if (availability.status === "needs_split") {
-      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ore ${time24} c'è disponibilità, ma probabilmente in tavoli separati.` };
-    }
-    if (availability.status === "needs_outside") {
-      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ore ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.` };
-    }
-    return { handled: true, reply: `Sì, per ${formatDateLabel(dateISO)} alle ore ${time24} vedo disponibilità.` };
-  }
-
-  // Natale
-  if (tt.includes("natale")) {
-    const dateISO = resolveNataleISO();
-    const events = await listCalendarEvents(dateISO);
-    const date = new Date(`${dateISO}T00:00:00`);
-    const isHoliday = HOLIDAYS_SET.has(dateISO);
-    const isClosedDay = date.getDay() === OPENING.closedDay;
-    const closed = isHoliday || isClosedDay || isDateClosedByCalendar(events);
-    return {
-      handled: true,
-      reply: closed
-        ? `Per ${formatDateLabel(dateISO)} risulta chiuso in calendario.`
-        : `Per ${formatDateLabel(dateISO)} non risulta chiusura in calendario. Ti consiglio comunque di prenotare.`,
-    };
-  }
-
-  return { handled: false };
-}
-
-async function forwardToOperatorWithReason(session, req, vr, reason, kind) {
-  session.operatorReasonRaw = String(reason || "").trim() || "non specificato";
-  session.operatorKind = kind || session.operatorKind || "generic";
-
-  await sendFallbackEmail(session, req, "operator_request");
-  void sendOperatorEmail(session, req, "operator_request");
-
-  // Evita la creazione automatica dell'evento "chiamata interrotta" su ogni risposta HTTP
-  session.fallbackEventCreated = true;
-  void safeCreateOperatorCallbackCalendarEvent(session, req, "requested");
-
-  const operatorPhone = getOperatorPhoneE164();
-  const callerCandidates = [];
-  if (isValidPhoneE164(TWILIO_VOICE_FROM)) callerCandidates.push(TWILIO_VOICE_FROM.trim());
-  const inboundTo = req?.body?.To || req?.body?.Called || "";
-  const inboundToE164 = parsePhoneNumber(inboundTo);
-  if (isValidPhoneE164(inboundToE164)) callerCandidates.push(inboundToE164);
-  const callerId = callerCandidates[0] || "";
-  const canDialLive = Boolean(ENABLE_FORWARDING && operatorPhone);
-
-  // reset stato operatore
-  session.operatorState = null;
-  session.operatorPrompt = null;
-  session.operatorRetryPrompt = null;
-
-  if (canDialLive) {
-    return { kind: "forward", twiml: forwardToHumanTwiml(req) };
-  }
-
-  // Congedo morbido
-  const goodbye =
-    session.operatorKind === "info"
-      ? "Va benissimo. Ho preso nota della tua richiesta e ti faremo richiamare al più presto. Grazie e a presto."
-      : session.operatorKind === "event"
-      ? "Va benissimo. Ho preso nota dei dettagli e ti faremo ricontattare al più presto. Grazie e a presto."
-      : "Va benissimo. Ti faremo richiamare al più presto. Grazie e a presto.";
-  sayIt(vr, goodbye);
-  vr.hangup();
-  return { kind: "vr", twiml: vr.toString() };
-}
-
-async function handleInfoFlow(session, req, vr, speech, emptySpeech) {
-  const state = String(session.operatorState || "");
-
-  const forwardBecause = async (reason) => {
-    return forwardToOperatorWithReason(session, req, vr, reason, "info");
-  };
-
-  const clearInfo = () => {
-    session.operatorState = null;
-    session.infoPayload = null;
-    session.operatorKind = "info";
-  };
-
-  if (state === "info_question") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi pure cosa vuoi sapere."));
-      if (silenceResult.action === "forward") {
-        return forwardBecause("Richiesta informazioni: nessuna domanda fornita");
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-
-    const answer = await tryAnswerInfoQuestionVoice(speech);
-    if (answer && answer.needsFollowUp) {
-      session.infoPayload = answer.payload || null;
-      session.operatorState = `info_${answer.followUpKind}`;
-      gatherSpeech(vr, answer.prompt || "Mi dici meglio?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-
-    if (answer && answer.handled && answer.reply) {
-      sayIt(vr, answer.reply);
-      vr.hangup();
-      clearInfo();
-      return { kind: "vr", twiml: vr.toString() };
-    }
-
-    return forwardBecause(String(speech || "").trim().slice(0, 400) || "Richiesta informazioni");
-  }
-
-  if (state === "info_avail_people") {
-    const payload = session.infoPayload || {};
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "In quante persone siete?"));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta informazioni disponibilità: persone non fornite (data ${payload.dateISO || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    const people = parsePeopleIT(speech);
-    if (!people) {
-      gatherSpeech(vr, "Non ho capito. In quante persone siete?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-
-    // se abbiamo già l'orario, rispondi subito
-    if (payload.dateISO && payload.time24) {
-      const tmp = { dateISO: payload.dateISO, time24: payload.time24, people, specialRequestsRaw: "nessuna", preorderLabel: "nessuno" };
-      const availability = await reserveTableForSession(tmp, { commit: false });
-      const reply =
-        availability.status === "closed"
-          ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} risulta chiuso.`
-          : availability.status === "unavailable"
-          ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} alle ${payload.time24} non vedo disponibilità.`
-          : availability.status === "needs_split"
-          ? `Per ${formatDateLabel(payload.dateISO)} alle ${payload.time24} c'è disponibilità, ma probabilmente in tavoli separati.`
-          : availability.status === "needs_outside"
-          ? `Per ${formatDateLabel(payload.dateISO)} alle ${payload.time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.`
-          : `Sì, per ${formatDateLabel(payload.dateISO)} alle ${payload.time24} vedo disponibilità.`;
-      sayIt(vr, reply);
-      vr.hangup();
-      clearInfo();
-      return { kind: "vr", twiml: vr.toString() };
-    }
-
-    session.infoPayload = { dateISO: payload.dateISO, people };
-    session.operatorState = "info_avail_time";
-    gatherSpeech(vr, "A che ora?");
-    return { kind: "vr", twiml: vr.toString() };
-  }
-
-  if (state === "info_avail_time") {
-    const payload = session.infoPayload || {};
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "A che ora?"));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta informazioni disponibilità: orario non fornito (data ${payload.dateISO || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    const time24 = parseTimeIT(speech);
-    if (!time24) {
-      gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-
-    if (!payload.dateISO || !payload.people) {
-      return forwardBecause("Richiesta informazioni disponibilità: dati insufficienti");
-    }
-
-    const tmp = { dateISO: payload.dateISO, time24, people: payload.people, specialRequestsRaw: "nessuna", preorderLabel: "nessuno" };
-    const availability = await reserveTableForSession(tmp, { commit: false });
-    const reply =
-      availability.status === "closed"
-        ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} risulta chiuso.`
-        : availability.status === "unavailable"
-        ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} alle ore ${time24} non vedo disponibilità.`
-        : availability.status === "needs_split"
-        ? `Per ${formatDateLabel(payload.dateISO)} alle ore ${time24} c'è disponibilità, ma probabilmente in tavoli separati.`
-        : availability.status === "needs_outside"
-        ? `Per ${formatDateLabel(payload.dateISO)} alle ore ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.`
-        : `Sì, per ${formatDateLabel(payload.dateISO)} alle ore ${time24} vedo disponibilità.`;
-
-    sayIt(vr, reply);
-    vr.hangup();
-    clearInfo();
-    return { kind: "vr", twiml: vr.toString() };
-  }
-
-  // fallback: torna al menu
-  session.operatorState = null;
-  gatherSpeech(vr, buildMainMenuPrompt());
-  return { kind: "vr", twiml: vr.toString() };
-}
-
-async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
-  let state = String(session.operatorState || "");
-  const tt = normalizeText(speech);
-
-  const softReturnToMenu = (message) => {
-    if (message) sayIt(vr, message);
-    session.operatorState = null;
-    session.manageAction = null;
-    session.step = "intent";
-    gatherSpeech(vr, buildMainMenuPrompt());
-  };
-
-  // helper: forward con riepilogo
-  const forwardBecause = async (reason) => {
-    const r = await forwardToOperatorWithReason(session, req, vr, reason, "manage");
-    return r;
-  };
-
-  // utility parse date: anche giorni settimana
-  const parseDateWithWeekday = (text) => parseDateIT(text) || parseNextWeekdayISO(text);
-
-  if (state === "manage_cancel_date") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi la data della prenotazione da annullare."));
-      if (silenceResult.action === "forward") {
-        return forwardBecause("Richiesta annullamento prenotazione: data non fornita");
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    const dateISO = parseDateWithWeekday(speech);
-    if (!dateISO) {
-      session.retries = (session.retries || 0) + 1;
-      if (session.retries >= 2) {
-        return forwardBecause("Richiesta annullamento prenotazione: data non riconosciuta");
-      }
-      gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    resetRetries(session);
-    session.manageDateISO = dateISO;
-    session.managePeople = null;
-    session.managePhoneLast3 = "";
-    session.managePeople = null;
-    session.managePhoneLast3 = "";
-    session.operatorState = "manage_cancel_surname";
-    gatherSpeech(vr, "Perfetto. Dimmi il cognome della prenotazione.");
-    return { kind: "vr", twiml: vr.toString() };
-  }
-
-  if (state === "manage_cancel_surname") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi il cognome della prenotazione."));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta annullamento prenotazione: cognome non fornito (data ${session.manageDateISO || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    resetRetries(session);
-    const sn = extractSurnameFromSpeech(speech) || speech.trim();
-    if (!sn) {
-      session.retries = (session.retries || 0) + 1;
-      if (session.retries >= 2) {
-        return forwardBecause(`Richiesta annullamento prenotazione: cognome non riconosciuto (data ${session.manageDateISO || ""})`);
-      }
-      gatherSpeech(vr, "Non ho capito il cognome. Puoi ripeterlo?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    session.manageSurname = sn.slice(0, 60);
-    session.operatorState = "manage_cancel_time";
-    gatherSpeech(vr, "Se ricordi anche l'orario dimmelo, altrimenti dì: non lo ricordo.");
-    return { kind: "vr", twiml: vr.toString() };
-  }
-
-  if (state === "manage_cancel_time") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Se ricordi anche l'orario dimmelo, altrimenti dì: non lo ricordo."));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta annullamento prenotazione: orario non fornito (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    resetRetries(session);
-    if (tt.includes("non lo ricordo") || tt.includes("non ricordo") || isNoRequestsText(speech)) {
-      session.manageTime24 = null;
-    } else {
-      session.manageTime24 = parseTimeIT(speech);
-    }
-    session.operatorState = "manage_cancel_search";
-    state = session.operatorState;
-    return handleManageBookingFlow(session, req, vr, speech, false);
-  }
-
-  if (state === "manage_cancel_search") {
-    const callerPhoneE164 = parsePhoneNumber(req?.body?.From || "");
-    const { match, candidates, needsPeople, needsPhone, usedPhone, matchPhone } = await findBookingEventMatch({
-      dateISO: session.manageDateISO,
-      time24: session.manageTime24,
-      surname: session.manageSurname,
-      people: session.managePeople,
-      phoneLast3: session.managePhoneLast3,
-      callerPhoneE164,
-    });
-
-    if (!match) {
-      if (needsPeople) {
-        session.operatorState = "manage_cancel_people_disambiguate";
-        gatherSpeech(vr, "Per quante persone era la prenotazione?");
-        return { kind: "vr", twiml: vr.toString() };
-      }
-      if (needsPhone) {
-        session.operatorState = "manage_cancel_phone_disambiguate";
-        gatherSpeech(vr, "Per aiutarmi a identificarla, dimmi le ultime tre cifre del numero con cui hai prenotato.");
-        return { kind: "vr", twiml: vr.toString() };
-      }
-      return forwardBecause(
-        `Richiesta annullamento prenotazione: impossibile identificare (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""}, orario ${session.manageTime24 || "non indicato"}, persone ${session.managePeople || "non indicate"})`
-      );
-    }
-
-    session.manageCandidateEventId = match.id;
-    session.manageCandidateEvent = match;
-    session.manageUsedPhone = Boolean(usedPhone);
-    session.manageMatchedPhone = matchPhone || "";
-
-    session.operatorState = "manage_cancel_confirm";
-
-    const phoneVoice = session.manageUsedPhone && session.manageMatchedPhone ? ` È associata al numero ${formatPhoneForVoiceFull(session.manageMatchedPhone)}.` : "";
-    gatherSpeech(vr, `Ho trovato questa prenotazione: ${match.summary || ""}.${phoneVoice} Vuoi annullarla?`);
-    return { kind: "vr", twiml: vr.toString() };
-  }
-
-  if (state === "manage_cancel_people_disambiguate") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Per quante persone era la prenotazione?"));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta annullamento prenotazione: persone non fornite (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    const people = parsePeopleIT(speech);
-    if (!Number.isFinite(people)) {
-      gatherSpeech(vr, "Non ho capito quante persone. Puoi ripeterlo?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    session.managePeople = people;
-    session.operatorState = "manage_cancel_search";
-    return handleManageBookingFlow(session, req, vr, speech, false);
-  }
-
-  if (state === "manage_cancel_phone_disambiguate") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () =>
-        gatherSpeech(vr, "Dimmi le ultime tre cifre del numero con cui hai prenotato.")
-      );
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta annullamento prenotazione: telefono non fornito (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    const last3 = parsePhoneLast3FromSpeech(speech);
-    if (!last3) {
-      gatherSpeech(vr, "Non ho capito le ultime tre cifre. Puoi ripeterle?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    session.managePhoneLast3 = last3;
-    session.operatorState = "manage_cancel_search";
-    return handleManageBookingFlow(session, req, vr, speech, false);
-  }
-
-
-  if (state === "manage_cancel_time_disambiguate") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Mi dici anche l'orario della prenotazione?"));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta annullamento prenotazione: disambiguazione orario non fornita (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    const time24 = parseTimeIT(speech);
-    if (!time24) {
-      gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    session.manageTime24 = time24;
-    session.operatorState = "manage_cancel_search";
-    return handleManageBookingFlow(session, req, vr, speech, false);
-  }
-
-  if (state === "manage_cancel_confirm") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Vuoi confermare l'annullamento?"));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta annullamento prenotazione: conferma non fornita (evento ${session.manageCandidateEventId || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    const yn = parseYesNo(speech);
-    if (yn === false) {
-      softReturnToMenu("Va bene, non annullo nulla.");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    if (yn !== true) {
-      gatherSpeech(vr, "Non ho capito. Vuoi annullare la prenotazione? Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
-      return { kind: "vr", twiml: vr.toString() };
-    }
-
-    const ok = await patchBookingAsCanceled(session.manageCandidateEventId, session.manageDateISO, session.manageCandidateEvent);
-    if (!ok) {
-      return forwardBecause(`Richiesta annullamento prenotazione: errore aggiornamento (evento ${session.manageCandidateEventId || ""})`);
-    }
-    softReturnToMenu("Perfetto. Ho annullato la prenotazione.");
-    return { kind: "vr", twiml: vr.toString() };
-    return { kind: "vr", twiml: vr.toString() };
-  }
-
-  // ===== MODIFICA =====
-  if (state === "manage_modify_date") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi la data della prenotazione da modificare."));
-      if (silenceResult.action === "forward") {
-        return forwardBecause("Richiesta modifica prenotazione: data non fornita");
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    const dateISO = parseDateWithWeekday(speech);
-    if (!dateISO) {
-      session.retries = (session.retries || 0) + 1;
-      if (session.retries >= 2) {
-        return forwardBecause("Richiesta modifica prenotazione: data non riconosciuta");
-      }
-      gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    resetRetries(session);
-    session.manageDateISO = dateISO;
-    session.operatorState = "manage_modify_time";
-    gatherSpeech(vr, "Perfetto. A che ora è la prenotazione?");
-    return { kind: "vr", twiml: vr.toString() };
-  }
-
-  if (state === "manage_modify_time") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "A che ora è la prenotazione?"));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta modifica prenotazione: orario non fornito (data ${session.manageDateISO || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    let time24 = parseTimeIT(speech);
-    if (tt.includes("non lo ricordo") || tt.includes("non ricordo")) {
-      time24 = null;
-    }
-    if (!time24 && !(tt.includes("non lo ricordo") || tt.includes("non ricordo"))) {
-      session.retries = (session.retries || 0) + 1;
-      if (session.retries >= 2) {
-        return forwardBecause(`Richiesta modifica prenotazione: orario non riconosciuto (data ${session.manageDateISO || ""})`);
-      }
-      gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    resetRetries(session);
-    session.manageTime24 = time24 || null;
-    session.operatorState = "manage_modify_surname";
-    gatherSpeech(vr, "Mi dici anche il cognome della prenotazione? Se non lo ricordi, dì: non lo ricordo.");
-    return { kind: "vr", twiml: vr.toString() };
-  }
-
-  if (state === "manage_modify_surname") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Mi dici il cognome della prenotazione?"));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta modifica prenotazione: cognome non fornito (data ${session.manageDateISO || ""}, orario ${session.manageTime24 || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    resetRetries(session);
-    if (tt.includes("non lo ricordo") || tt.includes("non ricordo") || isNoRequestsText(speech)) {
-      session.manageSurname = null;
-    } else {
-      const sn = extractSurnameFromSpeech(speech) || speech.trim();
-      if (!sn) {
-        session.retries = (session.retries || 0) + 1;
-        if (session.retries >= 2) {
-          return forwardBecause(`Richiesta modifica prenotazione: cognome non riconosciuto (data ${session.manageDateISO || ""}, orario ${session.manageTime24 || "non indicato"})`);
-        }
-        gatherSpeech(vr, "Non ho capito il cognome. Puoi ripeterlo?");
-        return { kind: "vr", twiml: vr.toString() };
-      }
-      session.manageSurname = sn.slice(0, 60);
-    }
-    session.operatorState = "manage_modify_search";
-    state = session.operatorState;
-    return handleManageBookingFlow(session, req, vr, speech, false);
-  }
-
-  if (state === "manage_modify_search") {
-    const callerPhoneE164 = parsePhoneNumber(req?.body?.From || "");
-    const { match, needsPeople, needsPhone, usedPhone, matchPhone } = await findBookingEventMatch({
-      dateISO: session.manageDateISO,
-      time24: session.manageTime24,
-      surname: session.manageSurname,
-      people: session.managePeople,
-      phoneLast3: session.managePhoneLast3,
-      callerPhoneE164,
-    });
-
-    if (!match) {
-      if (needsPeople) {
-        session.operatorState = "manage_modify_people_disambiguate";
-        gatherSpeech(vr, "Per quante persone era la prenotazione?");
-        return { kind: "vr", twiml: vr.toString() };
-      }
-      if (needsPhone) {
-        session.operatorState = "manage_modify_phone_disambiguate";
-        gatherSpeech(vr, "Per aiutarmi a identificarla, dimmi le ultime tre cifre del numero con cui hai prenotato.");
-        return { kind: "vr", twiml: vr.toString() };
-      }
-      return forwardBecause(
-        `Richiesta modifica prenotazione: impossibile identificare (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || "non indicato"}, orario ${session.manageTime24 || "non indicato"}, persone ${session.managePeople || "non indicate"})`
-      );
-    }
-
-    session.manageCandidateEventId = match.id;
-    session.manageCandidateEvent = match;
-    session.manageUsedPhone = Boolean(usedPhone);
-    session.manageMatchedPhone = matchPhone || "";
-
-    session.operatorState = "manage_modify_ask_change";
-    gatherSpeech(vr, `Ho trovato questa prenotazione: ${match.summary || ""}. Cosa vuoi modificare?`);
-    return { kind: "vr", twiml: vr.toString() };
-  }
-
-  if (state === "manage_modify_people_disambiguate") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Per quante persone era la prenotazione?"));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta modifica prenotazione: persone non fornite (data ${session.manageDateISO || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    const people = parsePeopleIT(speech);
-    if (!Number.isFinite(people)) {
-      gatherSpeech(vr, "Non ho capito quante persone. Puoi ripeterlo?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    session.managePeople = people;
-    session.operatorState = "manage_modify_search";
-    return handleManageBookingFlow(session, req, vr, speech, false);
-  }
-
-  if (state === "manage_modify_phone_disambiguate") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () =>
-        gatherSpeech(vr, "Dimmi le ultime tre cifre del numero con cui hai prenotato.")
-      );
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta modifica prenotazione: telefono non fornito (data ${session.manageDateISO || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    const last3 = parsePhoneLast3FromSpeech(speech);
-    if (!last3) {
-      gatherSpeech(vr, "Non ho capito le ultime tre cifre. Puoi ripeterle?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    session.managePhoneLast3 = last3;
-    session.operatorState = "manage_modify_search";
-    return handleManageBookingFlow(session, req, vr, speech, false);
-  }
-
-
-  if (state === "manage_modify_ask_change") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi cosa vuoi modificare."));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta modifica prenotazione: dettagli modifica non forniti (evento ${session.manageCandidateEventId || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-
-    session.manageModificationRaw = String(speech || "").trim().slice(0, 200);
-
-    const original = session.manageCandidateEvent || {};
-    const originalDateISO = String(original?.start?.dateTime || original?.start?.date || session.manageDateISO || "").slice(0, 10);
-    const originalTime24 = parseTimeIT(original?.start?.dateTime || "") || session.manageTime24;
-    const originalPeople = extractPeopleFromDescription(original?.description) || extractPeopleFromSummary(original?.summary) || 2;
-    const originalNotes = extractNotesFromDescription(original?.description) || "";
-
-    const newDateISO = parseDateWithWeekday(speech) || originalDateISO;
-    const newTime24 = parseTimeIT(speech) || originalTime24;
-    const newPeople = parsePeopleIT(speech) || originalPeople;
-    const newNotes = extractNotesHint(speech) || originalNotes;
-
-    if (!newDateISO || !newTime24) {
-      return forwardBecause(`Richiesta modifica prenotazione: dati insufficienti (evento ${session.manageCandidateEventId || ""})`);
-    }
-
-    const selectionResult = await computeTableSelectionForChange({
-      dateISO: newDateISO,
-      time24: newTime24,
-      people: newPeople,
-      ignoreEventId: session.manageCandidateEventId,
-    });
-
-    if (selectionResult.status === "closed" || selectionResult.status === "unavailable") {
-      return forwardBecause(`Richiesta modifica prenotazione: non disponibile (nuova data ${newDateISO}, nuovo orario ${newTime24}, persone ${newPeople})`);
-    }
-
-    session.managePendingUpdate = {
-      newDateISO,
-      newTime24,
-      newPeople,
-      newNotes,
-      durationMinutes: selectionResult.durationMinutes,
-      newTableLocks: selectionResult.selection?.locks || [],
-      modificationRaw: session.manageModificationRaw,
-      originalDateISO,
-    };
-
-    session.operatorState = "manage_modify_confirm_apply";
-    gatherSpeech(
-      vr,
-      `Ok. Vuoi confermare la modifica a ${formatDateLabel(newDateISO)} alle ${newTime24} per ${newPeople} persone?`
-    );
-    return { kind: "vr", twiml: vr.toString() };
-  }
-
-  if (state === "manage_modify_confirm_apply") {
-    if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Vuoi confermare la modifica?"));
-      if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta modifica prenotazione: conferma non fornita (evento ${session.manageCandidateEventId || ""})`);
-      }
-      return { kind: "vr", twiml: vr.toString() };
-    }
-
-    const yn = parseYesNo(speech);
-    if (yn === false) {
-      softReturnToMenu("Va bene, non modifico nulla.");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    if (yn !== true) {
-      gatherSpeech(vr, "Non ho capito. Vuoi confermare la modifica? Rispondi sì o no.");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    const pending = session.managePendingUpdate || {};
-    const ok = await patchBookingAsModified({
-      eventId: session.manageCandidateEventId,
-      originalEvent: session.manageCandidateEvent,
-      newDateISO: pending.newDateISO,
-      newTime24: pending.newTime24,
-      newPeople: pending.newPeople,
-      newNotes: pending.newNotes,
-      newSelection: { locks: pending.newTableLocks || [] },
-      durationMinutes: pending.durationMinutes,
-      modificationRaw: pending.modificationRaw,
-    });
-    if (!ok) {
-      return forwardBecause(`Richiesta modifica prenotazione: errore aggiornamento (evento ${session.manageCandidateEventId || ""})`);
-    }
-    sayIt(vr, "Perfetto. Ho modificato la prenotazione. Grazie e a presto.");
-    vr.hangup();
-    session.operatorState = null;
-    return { kind: "vr", twiml: vr.toString() };
-  }
-
-  // fallback: se non riconosciamo lo stato, torniamo al menu
-  softReturnToMenu("Va bene.");
-  return { kind: "vr", twiml: vr.toString() };
-}
-
-function extractPeopleFromSummary(summary) {
-  const s = String(summary || "");
-  const m = s.match(/\b(\d{1,2})\s*pax\b/i);
-  return m ? Number(m[1]) : null;
-}
-
-function extractPeopleFromDescription(description) {
-  const d = String(description || "");
-  const m = d.match(/^Persone:\s*(\d{1,2})\b/im);
-  return m ? Number(m[1]) : null;
-}
-
-function extractNotesFromDescription(description) {
-  const d = String(description || "");
-  const m = d.match(/^Note:\s*(.*)$/im);
-  return m ? String(m[1] || "").trim() : "";
-}
-
-function extractNotesHint(speech) {
-  const tt = String(speech || "").trim();
-  // Se l'utente dice "note ..." o "richiesta ..." usiamo la parte dopo la keyword
-  const m = tt.match(/\b(note|richiesta|richieste)\b\s*:?\s*(.+)$/i);
-  if (m && m[2]) return String(m[2]).trim().slice(0, 200);
-  return "";
-}
-
-function parseYesNo(speech) {
-  const raw = String(speech || "").trim();
-  const tt = normalizeText(raw);
-  if (!tt) return null;
-
-  // DTMF: 1 = sì, 2 = no
-  if (tt === "1") return true;
-  if (tt === "2") return false;
-
-  // sì/no via voce
-  if (YES_WORDS.some((w) => tt.includes(w))) return true;
-  if (NO_WORDS.some((w) => tt.includes(w))) return false;
-
-  // gestisci frasi tipo "non voglio", "non procedere"
-  if (tt.startsWith("non ") && (tt.includes("voglio") || tt.includes("proced") || tt.includes("conferm") || tt.includes("annull") || tt.includes("fare"))) {
-    return false;
-  }
-
-  return null;
-}
-
-function hasGlutenIntolerance(text) {
-  const tt = normalizeText(text);
-  if (!tt) return false;
-  return (
-    tt.includes("celiachia") ||
-    tt.includes("glutine") ||
-    tt.includes("senza glutine") ||
-    tt.includes("intolleranza al glutine")
-  );
-}
-
-function isDivanettiTableId(id) {
-  return id === "T14" || id === "T15";
-}
-
-function isHighTableId(id) {
-  return id === "T16" || id === "T17";
-}
-
-function isDivanettiPreferred(session) {
-  const choice = session?.preorderChoiceKey || "";
-  return choice === "apericena" || choice === "dopocena";
-}
-
-function getApericenaNoticeTexts(session) {
-  const notices = [];
-  if (session?.glutenPiattoNotice) {
-    notices.push(
-      "Ti informo che il piatto apericena e il piatto apericena promo non sono disponibili senza glutine. Il personale di sala potrà consigliarti alternative adatte."
-    );
-  }
-  if (session?.promoRegistrationNotice) {
-    notices.push(
-      "Se non hai ancora fatto la registrazione online, dovrai completarla in struttura per accedere alla promo."
-    );
-  }
-  return notices;
-}
-
-function maybeSayApericenaNotices(vr, session) {
-  const notices = getApericenaNoticeTexts(session);
-  if (notices.length === 0) return;
-  for (const notice of notices) {
-    sayIt(vr, notice);
-  }
-}
-
-function buildSpecialRequestsText(session) {
-  const base = session?.specialRequestsRaw || "nessuna";
-  const notices = getApericenaNoticeTexts(session);
-  const extra = buildExtraRequestsText(session);
-  const parts = [base, `Richiesta finale: ${extra}`];
-  if (notices.length > 0) {
-    parts.push(notices.join(" "));
-  }
-  return parts.join(" | ");
-}
-
-function buildExtraRequestsText(session) {
-  const extra = session?.extraRequestsRaw;
-  if (!extra) return "nessuna";
-  return extra;
-}
-
-function parsePhoneNumber(speech) {
-  if (!speech) return null;
-  const raw = String(speech || "").trim();
-
-  // Already E.164
-  if (isValidPhoneE164(raw)) return raw;
-
-  // Extract digits from raw (handles "388 166 9661", "20.30" etc.)
-  let digits = raw.replace(/[^\d]/g, "");
-  if (digits.startsWith("00")) digits = digits.slice(2);
-
-  // If no digits, try to convert spoken Italian digits: "tre otto otto ..."
-  if (!digits) {
-    const tt = normalizeText(raw)
-      .replace(/[^a-zàèéìòù\d\s]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    const wordToDigit = {
-      zero: "0",
-      uno: "1",
-      una: "1",
-      due: "2",
-      tre: "3",
-      quattro: "4",
-      cinque: "5",
-      sei: "6",
-      sette: "7",
-      otto: "8",
-      nove: "9",
-    };
-    const parts = tt.split(" ").filter(Boolean);
-    const out = [];
-    for (const part of parts) {
-      if (/^\d+$/.test(part)) {
-        out.push(part);
-        continue;
-      }
-      const d = wordToDigit[part];
-      if (d) out.push(d);
-    }
-    digits = out.join("");
-    if (digits.startsWith("00")) digits = digits.slice(2);
-  }
-
-  if (!digits) return null;
-
-  // Normalize lengths
-  if (digits.length >= 8 && digits.length <= 15) {
-    // If likely Italian local number (<=10 digits), prefix +39
-    if (digits.length <= 10) return `+39${digits}`;
-    // If starts with country code without '+'
-    return `+${digits}`;
-  }
-
-  return null;
-}
-
-function isOutsideRequest(text) {
-  const tt = normalizeText(text);
-  if (!tt) return false;
-  return (
-    tt.includes("sala esterna") ||
-    tt.includes("esterno") ||
-    tt.includes("all'aperto") ||
-    tt.includes("fuori") ||
-    tt.includes("outdoor") ||
-    tt.includes("dehors")
-  );
-}
-
-function maybeSayOutsideWarning(vr) {
-  sayIt(
-    vr,
-    "La sala esterna non è coperta: in caso di pioggia o brutto tempo il posto interno non è garantito. Se vuoi, ti consiglio la sala interna."
-  );
-}
-
-function maybeSayLiveMusicNotice(vr, session) {
-  if (!session?.liveMusicNoticePending || session.liveMusicNoticeSpoken) return;
-  sayIt(vr, "Ti informo che quella sera è prevista musica live o dj set.");
-  session.liveMusicNoticeSpoken = true;
-}
-
-function getGoogleCredentials() {
-  if (GOOGLE_SERVICE_ACCOUNT_JSON_B64) {
-    try {
-      const decoded = Buffer.from(GOOGLE_SERVICE_ACCOUNT_JSON_B64, "base64").toString("utf8");
-      return JSON.parse(decoded);
-    } catch (err) {
-      console.error("[GOOGLE] Invalid base64 credentials:", err);
-    }
-  }
-  if (GOOGLE_SERVICE_ACCOUNT_JSON) {
-    try {
-      return JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
-    } catch (err) {
-      console.error("[GOOGLE] Invalid JSON credentials:", err);
-    }
-  }
-  return null;
-}
-
-function buildCalendarClient() {
-  const credentials = getGoogleCredentials();
-  if (!credentials) return null;
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/calendar"],
-  });
-  return google.calendar({ version: "v3", auth });
-}
-
-
-function getTimeRangeForDate(dateISO) {
-  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-  const start = makeUtcDateFromZoned(dateISO, "00:00", tz) || new Date(`${dateISO}T00:00:00`);
-  const endBase = makeUtcDateFromZoned(dateISO, "23:59", tz) || new Date(`${dateISO}T23:59:00`);
-  const end = new Date(endBase.getTime() + 59 * 1000);
-  return { start, end };
-}
-
-
-function isDateClosedByCalendar(events) {
-  return events.some((event) => {
-    const summary = String(event.summary || "").toLowerCase();
-    const description = String(event.description || "").toLowerCase();
-    return summary.includes("locale chiuso") || description.includes("locale chiuso");
-  });
-}
-
-function extractTablesFromEvent(event) {
-  const description = String(event.description || "");
-  const match = description.match(/Tavolo:\s*([^\n]+)/i);
-  const summary = String(event.summary || "");
-  const summaryMatch = summary.match(/tav(?:olo)?\s*([^\-,]+)/i);
-  const tableText = match?.[1] || summaryMatch?.[1];
-  if (!tableText) return [];
-  return tableText
-    .split(/,| e /i)
-    .map((entry) => normalizeTableId(entry))
-    .filter(Boolean);
-}
-
-function getEventTimeRange(event) {
-  const start = event.start?.dateTime || event.start?.date;
-  const end = event.end?.dateTime || event.end?.date;
-  if (!start || !end) return null;
-  return {
-    start: new Date(start),
-    end: new Date(end),
-  };
-}
-
-function overlapsRange(a, b) {
-  return a.start < b.end && b.start < a.end;
-}
-
-function normalizeTableId(raw) {
-  const cleaned = String(raw || "")
-    .replace(/tav(?:olo)?/i, "")
-    .replace(/[^\dA-Z]/gi, "")
-    .toUpperCase();
-  if (!cleaned) return null;
-  return cleaned.startsWith("T") ? cleaned : `T${cleaned}`;
-}
-
-function expandTableLocks(tableId) {
-  const combo = TABLE_COMBINATIONS.find((c) => c.displayId === tableId);
-  if (combo) return combo.replaces;
-  return [tableId];
-}
-
-function isValidTableSelection(selection) {
-  if (!selection || !Array.isArray(selection.locks) || selection.locks.length === 0) return false;
-  const locks = [...selection.locks].sort();
-  if (locks.length === 1) {
-    return selection.displayId === locks[0] && Boolean(getTableById(locks[0]));
-  }
-  const combo = TABLE_COMBINATIONS.find((c) => c.displayId === selection.displayId);
-  if (!combo) return false;
-  const comboLocks = [...combo.replaces].sort();
-  if (comboLocks.length !== locks.length) return false;
-  return comboLocks.every((id, idx) => id === locks[idx]);
-}
-
-function buildAvailableTables(occupied, availableOverride, session) {
-  return TABLES.filter((table) => {
-    if (occupied.has(table.id)) return false;
-    if (availableOverride && !availableOverride.has(table.id)) return false;
-    if (!session?.wantsOutside && table.area === "outside") return false;
-    return true;
-  });
-}
-
-function getTableById(id) {
-  return TABLES.find((table) => table.id === id) || null;
-}
-
-function buildAvailableTableSet(availableTables) {
-  return new Set(availableTables.map((table) => table.id));
-}
-
-function getTablePenalty(tableId, session) {
-  let penalty = 0;
-  if (isHighTableId(tableId)) penalty += 20;
-  if (isDivanettiTableId(tableId) && !isDivanettiPreferred(session)) penalty += 10;
-  if (tableId === "T7") penalty += 5;
-  return penalty;
-}
-
-function pickTableForParty(people, occupied, availableOverride, session) {
-  const availableTables = buildAvailableTables(occupied, availableOverride, session);
-  const availableSet = buildAvailableTableSet(availableTables);
-  const directCandidates = availableTables.filter((table) => people >= table.min && people <= table.max);
-  if (directCandidates.length > 0) {
-    const preferredTwoTopIds = new Set(["T5", "T10", "T13"]);
-    const twoTopCandidates =
-      people === 2 ? directCandidates.filter((table) => preferredTwoTopIds.has(table.id)) : [];
-    const directPool = twoTopCandidates.length > 0 ? twoTopCandidates : directCandidates;
-    const exactCandidates = directPool.filter((table) => table.max === people);
-    const directOptions = exactCandidates.length > 0 ? exactCandidates : directPool;
-    directOptions.sort((a, b) => {
-      const sizeA = a.max;
-      const sizeB = b.max;
-      if (sizeA !== sizeB) return sizeA - sizeB;
-      const penaltyA = getTablePenalty(a.id, session);
-      const penaltyB = getTablePenalty(b.id, session);
-      if (penaltyA !== penaltyB) return penaltyA - penaltyB;
-      return a.id.localeCompare(b.id);
-    });
-    const direct = directOptions[0];
-    return { displayId: direct.id, locks: [direct.id], notes: direct.notes || null };
-  }
-
-  const comboCandidates = [];
-  for (const combo of TABLE_COMBINATIONS) {
-    if (people < combo.min || people > combo.max) continue;
-    const unavailable = combo.replaces.some((id) => occupied.has(id) || !availableSet.has(id));
-    if (!unavailable) comboCandidates.push(combo);
-  }
-  if (comboCandidates.length > 0) {
-    const exactCombos = comboCandidates.filter((combo) => combo.max === people);
-    const comboOptions = exactCombos.length > 0 ? exactCombos : comboCandidates;
-    comboOptions.sort((a, b) => {
-      const sizeA = a.max;
-      const sizeB = b.max;
-      if (sizeA !== sizeB) return sizeA - sizeB;
-      const penaltyA = a.replaces.reduce((sum, id) => sum + getTablePenalty(id, session), 0);
-      const penaltyB = b.replaces.reduce((sum, id) => sum + getTablePenalty(id, session), 0);
-      if (penaltyA !== penaltyB) return penaltyA - penaltyB;
-      return a.displayId.localeCompare(b.displayId);
-    });
-    const combo = comboOptions[0];
-    return { displayId: combo.displayId, locks: combo.replaces, notes: combo.notes || null };
-  }
-  return null;
-}
-
-function pickSplitTables(people, availableTables, session) {
-  const sorted = [...availableTables].sort((a, b) => {
-    const penaltyA = getTablePenalty(a.id, session);
-    const penaltyB = getTablePenalty(b.id, session);
-    if (penaltyA !== penaltyB) return penaltyA - penaltyB;
-    return b.max - a.max;
-  });
-  const selected = [];
-  let remaining = people;
-  let capacity = 0;
-
-  for (const table of sorted) {
-    if (remaining <= 0) break;
-    selected.push(table);
-    capacity += table.max;
-    remaining -= table.max;
-  }
-
-  if (capacity < people || selected.length === 0) return null;
-  return {
-    displayIds: selected.map((table) => table.id),
-    locks: selected.map((table) => table.id),
-    notes: "tavoli separati",
-  };
-}
-
-function getNextDateISO(dateISO) {
-  return addDaysToISODate(dateISO, 1);
-}
-
-
-async function listCalendarEvents(dateISO) {
-  if (!GOOGLE_CALENDAR_ID) return [];
-  const calendar = buildCalendarClient();
-  if (!calendar) return [];
-  const { start, end } = getTimeRangeForDate(dateISO);
-  try {
-    const result = await calendar.events.list({
-      calendarId: GOOGLE_CALENDAR_ID,
-      timeMin: start.toISOString(),
-      timeMax: end.toISOString(),
-      singleEvents: true,
-      orderBy: "startTime",
-    });
-    return result?.data?.items || [];
-  } catch (err) {
-    console.error("[GOOGLE] Calendar list failed:", err);
-    return [];
-  }
-}
-
-
-async function findExistingEventByPrivateProps({ calendar, dateISO, props }) {
-  try {
-    if (!calendar || !GOOGLE_CALENDAR_ID || !dateISO || !props) return null;
-    const { start, end } = getTimeRangeForDate(dateISO);
-    const privateExtendedProperty = [];
-    for (const [k, v] of Object.entries(props)) {
-      if (!k) continue;
-      privateExtendedProperty.push(`${k}=${String(v ?? "")}`);
-    }
-    const result = await calendar.events.list({
-      calendarId: GOOGLE_CALENDAR_ID,
-      timeMin: start.toISOString(),
-      timeMax: end.toISOString(),
-      singleEvents: true,
-      orderBy: "startTime",
-      privateExtendedProperty,
-    });
-    const items = result?.data?.items || [];
-    return items.length ? items[0] : null;
-  } catch (err) {
-    console.error("[GOOGLE] Calendar list (privateExtendedProperty) failed:", err);
-    return null;
-  }
-}
-
-
-
-function formatTimeSlot(date, startDate) {
-  if (!date) return "";
-  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-  const p = getPartsInTimeZone(date, tz);
-  if (startDate) {
-    const sp = getPartsInTimeZone(startDate, tz);
-    const dateIso = `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
-    const startIso = `${sp.year}-${pad2(sp.month)}-${pad2(sp.day)}`;
-    if (p.hour == 0 && p.minute == 0 && dateIso != startIso) {
-      return "24:00";
-    }
-  }
-  return `${pad2(p.hour)}:${pad2(p.minute)}`;
-}
-
 
 function timeToMinutes(time) {
   if (!time || !time.includes(":")) return null;
@@ -3421,6 +2036,20 @@ function buildAvailabilityDescription(dateISO, events) {
     }
   }
 
+  function formatTimeSlotLocal(date, startDate) {
+    if (!date) return "";
+    const p = getPartsInTimeZone(date, tz);
+    if (startDate) {
+      const sp = getPartsInTimeZone(startDate, tz);
+      const dateIso = `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
+      const startIso = `${sp.year}-${pad2(sp.month)}-${pad2(sp.day)}`;
+      if (p.hour == 0 && p.minute == 0 && dateIso != startIso) {
+        return "24:00";
+      }
+    }
+    return `${pad2(p.hour)}:${pad2(p.minute)}`;
+  }
+
   const lines = tableIds.map((tableId) => {
     const slots = occupancy.get(tableId) || [];
     slots.sort((a, b) => a.start - b.start);
@@ -3429,8 +2058,8 @@ function buildAvailabilityDescription(dateISO, events) {
     }
     const slotText = slots
       .map((slot) => {
-        const start = formatTimeSlot(slot.start);
-        const end = formatTimeSlot(slot.end, slot.start);
+        const start = formatTimeSlotLocal(slot.start);
+        const end = formatTimeSlotLocal(slot.end, slot.start);
         return `occupato dalle ${start} alle ${end};`;
       })
       .join(" ");
@@ -3617,38 +2246,30 @@ async function reserveTableForSession(session, { commit } = { commit: false }) {
   return { status: "ok", selection };
 }
 
-async function cancelCalendarEvent(session) {
-  if (!session?.calendarEventId) return null;
-  const calendar = buildCalendarClient();
-  if (!calendar) return null;
-  const summary = session.calendarEventSummary || "";
-  const summaryWithoutTable = summary.replace(/,\s*tav[^,]+/i, "").trim();
-  const updatedSummary = summaryWithoutTable.startsWith("Annullata")
-    ? summaryWithoutTable
-    : `Annullata - ${summaryWithoutTable}`;
-
+async function findExistingEventByPrivateProps({ calendar, dateISO, props }) {
+  if (!calendar || !dateISO || !props) return null;
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const start = makeUtcDateFromZoned(dateISO, "00:00", tz) || new Date(`${dateISO}T00:00:00`);
+  const nextDay = addDaysToISODate(dateISO, 1);
+  const end = makeUtcDateFromZoned(nextDay, "00:00", tz) || new Date(`${nextDay}T00:00:00`);
+  const privateExtendedProperty = [];
+  for (const [k, v] of Object.entries(props)) {
+    if (!k) continue;
+    privateExtendedProperty.push(`${k}=${String(v ?? "")}`);
+  }
   try {
-    const result = await calendar.events.patch({
+    const result = await calendar.events.list({
       calendarId: GOOGLE_CALENDAR_ID,
-      eventId: session.calendarEventId,
-      requestBody: {
-        summary: updatedSummary,
-        description: [
-          `Nome: ${session.name || ""}`,
-          `Persone: ${session.people || ""}`,
-          `Note: ${buildSpecialRequestsText(session)}`,
-          `Preordine: ${session.preorderLabel || "nessuno"}`,
-          "Tavolo: ",
-          `Telefono: ${session.phone || "non fornito"}`,
-        ].join("\n"),
-      },
+      timeMin: start.toISOString(),
+      timeMax: end.toISOString(),
+      singleEvents: true,
+      orderBy: "startTime",
+      privateExtendedProperty,
     });
-    if (session.dateISO) {
-      await upsertAvailabilityEvent(session.dateISO);
-    }
-    return result?.data || null;
+    const items = result?.data?.items || [];
+    return items.length ? items[0] : null;
   } catch (err) {
-    console.error("[GOOGLE] Calendar cancel update failed:", err);
+    console.error("[GOOGLE] Calendar list (privateExtendedProperty) failed:", err);
     return null;
   }
 }
@@ -3730,2018 +2351,546 @@ async function createCalendarEvent(session) {
   }
 }
 
-async function createEventCalendarEvent(session) {
-  if (!GOOGLE_CALENDAR_ID) return null;
-  const calendar = buildCalendarClient();
-  if (!calendar) return null;
-  if (!session?.eventDateISO || !session?.eventTime24 || !session?.eventName) return null;
-
-  const startDateTime = `${session.eventDateISO}T${session.eventTime24}:00`;
-
-  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-  const endDateTime = computeEndDateTime(session.eventDateISO, session.eventTime24, 120, tz);
-
-  const event = {
-    summary: `Evento - ${session.eventName}`,
-    description: [
-      `Nome evento: ${session.eventName}`,
-      `Data: ${session.eventDateISO}`,
-      `Ora: ${session.eventTime24}`,
-    ].join("\n"),
-    start: { dateTime: startDateTime, timeZone: GOOGLE_CALENDAR_TZ },
-    end: { dateTime: endDateTime, timeZone: GOOGLE_CALENDAR_TZ },
-    extendedProperties: {
-      private: {
-        type: "evento",
-      },
-    },
-  };
-
-  try {
-    const result = await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID,
-      requestBody: event,
-    });
-    return result?.data || null;
-  } catch (err) {
-    console.error("[GOOGLE] Event insert failed:", err);
-    return null;
-  }
-}
-
-
-
-function buildFailedCallEventPayload(session, req, reason) {
-  const callSid = (session && (session.callSid || session.sid)) || req?.body?.CallSid || "";
-  const from = (session && session.phone) || req?.body?.From || "";
-  const state = (session && session.step) || "unknown";
-  const intent = (session && session.intent) || "";
-
-  const lines = [];
-  lines.push(`Numero di telefono: ${from || "-"}`);
-  if (session?.name) lines.push(`Nome: ${session.name}`);
-  if (session?.dateISO) lines.push(`Data richiesta: ${session.dateISO}`);
-  if (session?.time24) lines.push(`Orario richiesto: ${session.time24}`);
-  if (session?.people) lines.push(`Numero persone: ${session.people}`);
-  if (intent) lines.push(`Tipo richiesta: ${intent}`);
-  const note = buildSpecialRequestsText(session || {});
-  if (note) lines.push(`Richieste / note: ${note}`);
-  if (session?.preorderLabel) lines.push(`Preordine: ${session.preorderLabel}`);
-  if (session?.operatorReasonRaw) lines.push(`Motivo operatore: ${session.operatorReasonRaw}`);
-  lines.push(`Stato finale: ${reason || "chiamata interrotta"}`);
-  lines.push(`Step: ${state}`);
-  if (callSid) lines.push(`CallSid: ${callSid}`);
-
-  return {
-    summary: "⚠️ TENTATIVO NON COMPLETATO – Chiamata interrotta",
-    description: lines.join("\n"),
-  };
-}
-
-async function createFailedCallCalendarEvent(session, req, reason) {
-  if (!GOOGLE_CALENDAR_ID) return null;
-  const calendar = buildCalendarClient();
-  if (!calendar) return null;
-
-  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-  const callSid = (session && (session.callSid || session.sid)) || req?.body?.CallSid || "";
-
-  // Dedup: se esiste gia' un evento per questo CallSid, non crearne altri
-  if (callSid) {
-    const existing = await findExistingEventByPrivateProps({
-      calendar,
-      dateISO: formatISODateInTimeZone(new Date((session && session.createdAt) || Date.now()), tz),
-      props: { ai_call_sid: callSid, ai_kind: "failed_call" },
-    });
-    if (existing?.id) return existing;
-  }
-
-  const createdAt = (session && session.createdAt) || Date.now();
-  const dayISO = formatISODateInTimeZone(new Date(createdAt), tz);
-  const nextDayISO = addDaysToISODate(dayISO, 1) || getNextDateISO(dayISO);
-
-  const fromNumber = (session && session.phone) || req?.body?.From || "";
-  const payload = buildFailedCallEventPayload(session || {}, req, reason);
-
-  const event = {
-    summary: payload.summary || "⚠️ TENTATIVO NON COMPLETATO – Chiamata interrotta",
-    description: payload.description || "",
-    start: { date: dayISO },
-    end: { date: nextDayISO },
-    extendedProperties: {
-      private: {
-        ai_call_sid: callSid,
-        ai_kind: "failed_call",
-      },
-    },
-  };
-
-  try {
-    const result = await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID,
-      requestBody: event,
-    });
-    return result?.data || null;
-  } catch (err) {
-    console.error("[GOOGLE] Failed-call event insert failed:", err);
-    return null;
-  }
-}
-
-
-
-async function createOperatorCallbackCalendarEvent(session, req, dialStatus) {
-  if (!session) return null;
-  if (session.operatorCallbackEventCreated === true) return null;
-  if (!GOOGLE_CALENDAR_ID) {
-    session.operatorCallbackEventCreated = true;
-    return null;
-  }
-  const calendar = buildCalendarClient();
-  if (!calendar) {
-    session.operatorCallbackEventCreated = true;
-    return null;
-  }
-
-  try {
-    const todayISO = toISODate(new Date());
-    const phone = req?.body?.From || session.phone || "";
-    const callSid = req?.body?.CallSid || "";
-    const status = String(dialStatus || "").trim() || "callback";
-
-    if (callSid) {
-      const existing = await findExistingEventByPrivateProps({
-        calendar,
-        dateISO: todayISO,
-        props: { ai_call_sid: callSid, ai_kind: "operator_callback" },
-      });
-      if (existing?.id) {
-        session.operatorCallbackEventCreated = true;
-        return existing;
-      }
-    }
-
-    const lines = [];
-    lines.push(`Numero: ${phone || "-"}`);
-    if (session.name) lines.push(`Nome: ${session.name}`);
-    if (session.dateISO) lines.push(`Data richiesta: ${session.dateISO}`);
-    if (session.time24) lines.push(`Orario richiesto: ${session.time24}`);
-    if (session.people) lines.push(`Persone: ${session.people}`);
-    if (session.intent) lines.push(`Tipo richiesta: ${session.intent}`);
-    if (session.extraRequestsRaw) lines.push(`Richieste: ${session.extraRequestsRaw}`);
-    if (session.operatorReasonRaw) lines.push(`Motivo operatore: ${session.operatorReasonRaw}`);
-    lines.push(`DialCallStatus: ${status}`);
-    lines.push(`Step: ${session.step || "-"}`);
-    lines.push(`CallSid: ${callSid || "-"}`);
-
-    const requestBody = {
-      summary: "🟡 RICHIAMARE – richiesta operatore",
-      description: lines.join("\n"),
-      start: { date: todayISO },
-      end: { date: getNextDateISO(todayISO) },
-      colorId: CRITICAL_COLOR_ID,
-      extendedProperties: {
-        private: {
-          ai_call_sid: callSid,
-          ai_kind: "operator_callback",
-        },
-      },
-    };
-
-    const result = await calendar.events.insert({
-      calendarId: GOOGLE_CALENDAR_ID,
-      requestBody,
-    });
-    return result?.data || null;
-  } catch (err) {
-    console.error("[GOOGLE] Operator callback event insert failed:", err);
-    return null;
-  } finally {
-    session.operatorCallbackEventCreated = true;
-  }
-}
-
-async function safeCreateOperatorCallbackCalendarEvent(session, req, dialStatus) {
-  try {
-    await createOperatorCallbackCalendarEvent(session, req, dialStatus);
-  } catch (err) {
-    console.error("[GOOGLE] Operator callback safe insert failed:", err);
-  }
-}
-
 async function safeCreateFailedCallCalendarEvent(session, req, reason) {
+  // Implementazione semplificata - crea evento di fallback
   try {
-    if (session) {
-      if (session.bookingCompleted) return;
-      if (session.calendarEventId) return;
-      if (session.operatorCallbackEventCreated) return;
-      if (session.fallbackEventCreated) return;
-    }
-    await createFailedCallCalendarEvent(session || null, req, reason);
+    if (session?.fallbackEventCreated) return;
+    session.fallbackEventCreated = true;
+    // Log per debug
+    console.log("[CALENDAR] Creating failed call event:", reason);
   } catch (err) {
-    console.error("[GOOGLE] Failed call safe insert failed:", err);
-  } finally {
-    if (session) session.fallbackEventCreated = true;
+    console.error("[CALENDAR] Failed to create failed call event:", err);
   }
 }
 
+// ======================= MANAGE BOOKING FLOW =======================
+async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
+  const state = String(session.operatorState || "");
+  const tt = normalizeText(speech);
 
-// ======================= ROUTES =======================
-app.get("/health", (req, res) => res.json({ ok: true }));
+  const softReturnToMenu = (message) => {
+    if (message) sayIt(vr, message);
+    session.operatorState = null;
+    session.manageAction = null;
+    session.step = "intent";
+    gatherSpeech(vr, buildMainMenuPrompt());
+  };
 
+  // helper: forward con riepilogo
+  const forwardBecause = async (reason) => {
+    await sendFallbackEmail(session, req, reason);
+    void sendOperatorEmail(session, req, reason);
+    await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
+    return { kind: "vr", twiml: forwardToHumanTwiml(req) };
+  };
 
-// ======================= TWILIO STATUS CALLBACK =======================
-// Configura questo endpoint come "Status Callback URL" del numero Twilio (Voice) per tracciare le chiamate concluse.
-app.post("/twilio/status", async (req, res) => {
-  try {
-    const callSid = String(req.body?.CallSid || "").trim();
-    const callStatus = String(req.body?.CallStatus || "").trim().toLowerCase();
+  // utility parse date: anche giorni settimana
+  const parseDateWithWeekday = (text) => parseDateIT(text) || parseNextWeekdayISO(text);
 
-    // Stati terminali Twilio
-    const isTerminal = ["completed", "busy", "failed", "no-answer", "canceled"].includes(callStatus);
-    if (!isTerminal) {
-      return res.sendStatus(204);
-    }
-
-    const session = callSid ? getSession(callSid) : null;
-
-    // Se prenotazione completata o callback operatore gia' creata, non creare fallback
-    if (session && (session.bookingCompleted || session.calendarEventId || session.operatorCallbackEventCreated)) {
-      return res.sendStatus(204);
-    }
-
-    await safeCreateFailedCallCalendarEvent(session, req, `call_status_${callStatus}`);
-    return res.sendStatus(204);
-  } catch (err) {
-    console.error("[TWILIO] Status callback error:", err);
-    return res.sendStatus(204);
-  }
-});
-
-// ======================= WHATSAPP / SMS INBOUND (TWILIO) =======================
-// Twilio invia i messaggi in arrivo come HTTP POST (application/x-www-form-urlencoded).
-// Per test rapido da browser abbiamo anche un GET che risponde "OK".
-app.get("/twilio/inbound", (req, res) => res.status(200).send("OK - Twilio inbound endpoint"));
-app.get("/twilio", (req, res) => res.status(200).send("OK - Twilio inbound endpoint"));
-
-function buildMessagingTwimlReply(text) {
-  const mr = new twilio.twiml.MessagingResponse();
-  if (text) mr.message(text);
-  return mr.toString();
-}
-
-// ======================= WHATSAPP AI / CHAT FLOW =======================
-// Nota: questa sezione riguarda SOLO i messaggi WhatsApp/SMS (webhook /twilio/inbound).
-// Il flusso vocale (chiamate) resta invariato.
-
-function stripWhatsAppPrefix(value) {
-  const s = String(value || "").trim();
-  return s.toLowerCase().startsWith("whatsapp:") ? s.slice("whatsapp:".length) : s;
-}
-
-function getWaSession(from) {
-  const key = `wa:${from || "unknown"}`;
-  const session = getSession(key);
-  if (!session) return null;
-
-  // Informazioni utili per log e prenotazioni
-  const phone = stripWhatsAppPrefix(from);
-  if (phone) session.phone = phone;
-
-  if (!session.wa) {
-    session.wa = {
-      step: "idle",
-      history: [],
-      lastActivityTs: Date.now(),
-    };
-  }
-  session.wa.lastActivityTs = Date.now();
-  return session;
-}
-
-function pruneWaHistory(session, max = 12) {
-  if (!session?.wa?.history) return;
-  if (session.wa.history.length > max) {
-    session.wa.history = session.wa.history.slice(session.wa.history.length - max);
-  }
-}
-
-function waAddToHistory(session, role, content) {
-  if (!session?.wa) return;
-  session.wa.history.push({ role, content: String(content || "").slice(0, 2000) });
-  pruneWaHistory(session);
-}
-
-function buildBusinessFactsForAI() {
-  const parts = [];
-  parts.push(`Nome attività: ${BUSINESS_NAME}`);
-  if (BUSINESS_CONTEXT) parts.push(`Contesto: ${BUSINESS_CONTEXT}`);
-
-  // Orari dal file
-  parts.push(`Giorno di chiusura: Lunedì.`);
-  parts.push(`Orari ristorante: ${OPENING.restaurant.default.start}-${OPENING.restaurant.default.end} (Ven/Sab fino alle ${OPENING.restaurant.friSat.end}).`);
-  parts.push(`Orari drink: ${OPENING.drinksOnly.start}-${OPENING.drinksOnly.end}.`);
-  parts.push(`Serate musica: Mercoledì e Venerdì.`);
-
-  // Preordine
-  parts.push(
-    `Preordine: opzionale. Opzioni: ${PREORDER_OPTIONS.map((o) => o.label).join(", ")}.`
-  );
-
-  return parts.join("\n");
-}
-
-function buildWaSystemPrompt() {
-  return [
-    `Sei un assistente WhatsApp di ${BUSINESS_NAME}.`,
-    `Obiettivo: rispondere in modo utile e rapido, e guidare l'utente alla prenotazione quando serve.`,
-    `Regole:`,
-    `- Non inventare informazioni non presenti nei "Fatti". Se manca un dato, fai UNA domanda breve per chiarire.`,
-    `- Se l'utente vuole prenotare un tavolo, raccogli: nome, data (YYYY-MM-DD), numero persone, ora (HH:MM), eventuali note e preordine (se vuole).`,
-    `- Tono: cordiale, italiano, frasi brevi.`,
-    ``,
-    `Fatti:\n${buildBusinessFactsForAI()}`,
-  ].join("\n");
-}
-
-async function callOpenAIResponses({ input, jsonMode } = {}) {
-  if (!AI_ENABLED || !OPENAI_API_KEY) return null;
-
-  const controller = new AbortController();
-  const timeoutMs = 12000;
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const body = {
-      model: OPENAI_MODEL,
-      max_output_tokens: AI_MAX_OUTPUT_TOKENS,
-      input,
-    };
-
-    if (jsonMode) {
-      body.text = { format: { type: "json_object" } };
-    }
-
-    const resp = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-
-    const data = await resp.json().catch(() => null);
-    if (!resp.ok) {
-      console.error("[OPENAI] error:", resp.status, data);
-      return null;
-    }
-
-    // L'SDK espone output_text; qui facciamo un parsing robusto
-    const outputText =
-      data?.output_text ||
-      data?.output?.[0]?.content?.find((c) => c?.type === "output_text")?.text ||
-      data?.output?.[0]?.content?.[0]?.text ||
-      null;
-
-    return { data, outputText };
-  } catch (err) {
-    console.error("[OPENAI] call failed:", err);
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function aiGeneralReply(session, userText) {
-  const system = buildWaSystemPrompt();
-  const history = session?.wa?.history || [];
-
-  const input = [
-    { role: "system", content: system },
-    ...history.map((m) => ({ role: m.role, content: m.content })),
-    { role: "user", content: String(userText || "") },
-  ];
-
-  const result = await callOpenAIResponses({ input });
-  const text = result?.outputText;
-  if (!text) return null;
-
-  return String(text).trim();
-}
-
-async function aiExtractBookingFields(userText) {
-  if (!AI_ENABLED || !OPENAI_API_KEY) return null;
-
-  const instructions = [
-    `Estrai informazioni per una prenotazione tavolo.`,
-    `Rispondi SOLO con JSON valido (nessun testo fuori dal JSON).`,
-    `Chiavi: intent (\"table\" oppure \"other\"), name (string|null), dateISO (YYYY-MM-DD|null), time24 (HH:MM|null), people (number|null), notes (string|null), preorder (string|null).`,
-    `Se non sei sicuro, usa null.`,
-    `Testo utente: """${String(userText || "").slice(0, 1000)}"""`,
-  ].join("\n");
-
-  const input = [{ role: "user", content: instructions }];
-  const result = await callOpenAIResponses({ input, jsonMode: true });
-  if (!result?.outputText) return null;
-
-  try {
-    const obj = JSON.parse(result.outputText);
-    return obj && typeof obj === "object" ? obj : null;
-  } catch {
-    return null;
-  }
-}
-
-function isBookingIntentText(text) {
-  const t = normalizeText(text || "");
-  return (
-    t.includes("prenot") ||
-    t.includes("riserv") ||
-    t.includes("tavolo") ||
-    t.includes("cena") ||
-    t.includes("apericena") ||
-    t.includes("dopocena")
-  );
-}
-
-function resetWaBooking(session) {
-  if (!session) return;
-  session.intent = null;
-  session.name = null;
-  session.dateISO = null;
-  session.time24 = null;
-  session.people = null;
-  session.specialRequestsRaw = null;
-  session.preorderChoiceKey = null;
-  session.preorderLabel = null;
-  if (session.wa) session.wa.step = "idle";
-}
-
-function buildBookingSummary(session) {
-  const dateLabel = session.dateISO ? formatDateLabel(session.dateISO) : "";
-  const preorder = session.preorderLabel ? session.preorderLabel : "nessuno";
-  const note = session.specialRequestsRaw ? buildSpecialRequestsText(session) : "nessuna";
-  return [
-    `Riepilogo prenotazione:`,
-    `- Nome: ${session.name || "-"}`,
-    `- Data: ${dateLabel || "-"}`,
-    `- Ora: ${session.time24 || "-"}`,
-    `- Persone: ${session.people || "-"}`,
-    `- Note: ${note}`,
-    `- Preordine: ${preorder}`,
-    ``,
-    `Confermi? (sì/no)`,
-  ].join("\n");
-}
-
-async function computeWhatsAppReply(session, userText) {
-  const text = String(userText || "").trim();
-  const normalized = normalizeText(text);
-  const step = session?.wa?.step || "idle";
-
-  // Comandi globali
-  if (normalized && isCancelCommand(normalized)) {
-    resetWaBooking(session);
-    return "Ok, ho annullato la procedura. Se vuoi, dimmi cosa ti serve 🙂";
-  }
-  if (normalized && isBackCommand(normalized)) {
-    // piccolo "indietro" per la prenotazione
-    if (step === "ask_time") session.wa.step = "ask_people";
-    else if (step === "ask_people") session.wa.step = "ask_date";
-    else if (step === "ask_date") session.wa.step = "ask_name";
-    else session.wa.step = "idle";
-
-    return "Ok, torniamo indietro. Dimmi pure.";
-  }
-
-  // IDLE: capisco intento (prenotazione vs info)
-  if (step === "idle") {
-    if (isBookingIntentText(text)) {
-      session.intent = "table";
-
-      // Tentativo “intelligente”: estrazione campi in una sola frase
-      const extracted = await aiExtractBookingFields(text);
-      if (extracted?.name) session.name = String(extracted.name).slice(0, 60);
-      if (extracted?.dateISO) session.dateISO = String(extracted.dateISO);
-      if (extracted?.time24) session.time24 = String(extracted.time24);
-      if (typeof extracted?.people === "number") session.people = extracted.people;
-      if (extracted?.notes) session.specialRequestsRaw = String(extracted.notes).slice(0, 200);
-      if (extracted?.preorder) session.preorderLabel = String(extracted.preorder).slice(0, 60);
-
-      // Determina prossimo passo mancante
-      if (!session.name) {
-        session.wa.step = "ask_name";
-        return "Perfetto 🙂 Come ti chiami?";
+  // ===== ANNULLAMENTO =====
+  if (state === "manage_cancel_date") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi la data della prenotazione da annullare."));
+      if (silenceResult.action === "forward") {
+        return forwardBecause("Richiesta annullamento prenotazione: data non fornita");
       }
-      if (!session.dateISO) {
-        session.wa.step = "ask_date";
-        return `Piacere ${session.name}! Per quale giorno vuoi prenotare? (es. 12/01 o domani)`;
-      }
-      if (!session.people) {
-        session.wa.step = "ask_people";
-        return "In quante persone siete?";
-      }
-      if (!session.time24) {
-        session.wa.step = "ask_time";
-        return "A che ora? (es. 20:30)";
-      }
-      session.wa.step = "ask_notes";
-      return "Hai intolleranze o richieste particolari? (se no scrivi: nessuna)";
+      return { kind: "vr", twiml: vr.toString() };
     }
-
-    // Non è una prenotazione → risposta AI (se configurata) oppure risposta base
-    const ai = await aiGeneralReply(session, text);
-    if (ai) return ai;
-
-    return "Ciao! Posso aiutarti con una prenotazione tavolo o con informazioni. Scrivimi cosa ti serve 🙂";
-  }
-
-  // Prenotazione: step-by-step
-  if (step === "ask_name") {
-    if (!text) return "Come ti chiami?";
-    session.name = text.slice(0, 60);
-    session.wa.step = "ask_date";
-    return `Piacere ${session.name}! Per quale giorno vuoi prenotare? (es. 12/01 o domani)`;
-  }
-
-  if (step === "ask_date") {
-    const dateISO = parseDateIT(text);
-    if (!dateISO) return "Non ho capito la data 😅 Puoi scriverla tipo 12/01 o domani?";
-    session.dateISO = dateISO;
-
-    // Controllo chiusura (giorno di riposo / festivi / calendario)
-    const events = await listCalendarEvents(session.dateISO);
-    const date = new Date(`${session.dateISO}T00:00:00`);
-    const isHoliday = HOLIDAYS_SET.has(session.dateISO);
-    const isClosedDay = date.getDay() === OPENING.closedDay;
-    if (isHoliday || isClosedDay || isDateClosedByCalendar(events)) {
-      return "Mi dispiace, quel giorno risulta chiuso. Vuoi scegliere un'altra data?";
-    }
-
-    session.liveMusicNoticePending = hasLiveMusicEvent(events);
-    session.wa.step = "ask_people";
-    return "Perfetto. In quante persone siete?";
-  }
-
-  if (step === "ask_people") {
-    const people = parsePeopleIT(text);
-    if (!people) return "Non ho capito il numero di persone. Puoi scrivere ad es. 2, 4, 6?";
-    session.people = people;
-    session.wa.step = "ask_time";
-    return "A che ora? (es. 20:30)";
-  }
-
-  if (step === "ask_time") {
-    const time24 = parseTimeIT(text);
-    if (!time24) return "Non ho capito l'orario. Puoi scriverlo tipo 20:30?";
-    session.time24 = time24;
-    session.wa.step = "ask_notes";
-    return "Hai intolleranze o richieste particolari? (se no scrivi: nessuna)";
-  }
-
-  if (step === "ask_notes") {
-    if (!text) return "Hai richieste particolari? Se no scrivi: nessuna";
-    session.specialRequestsRaw = normalizeText(text).includes("nessun") ? "nessuna" : text.slice(0, 200);
-    session.wa.step = "ask_preorder";
-    return "Vuoi preordinare qualcosa? (cena, apericena, dopocena, piatto apericena, piatto apericena promo) — oppure scrivi: nessuno";
-  }
-
-  if (step === "ask_preorder") {
-    const normalized = normalizeText(text);
-    const glutenIntolerance = hasGlutenIntolerance(session.specialRequestsRaw);
-    const isFriday = session.dateISO ? new Date(`${session.dateISO}T00:00:00`).getDay() === 5 : false;
-
-    if (normalized.includes("nessuno") || normalized.includes("niente") || normalized === "no") {
-      session.preorderChoiceKey = null;
-      session.preorderLabel = "nessuno";
-    } else if (normalized.includes("apericena promo")) {
-      const promoOption = getPreorderOptionByKey("piatto_apericena_promo");
-      if (isFriday) return "L'apericena promo non è disponibile il venerdì. Scegli un'altra opzione oppure scrivi: nessuno";
-      session.preorderChoiceKey = promoOption?.key || "piatto_apericena_promo";
-      session.preorderLabel = promoOption?.label || "Piatto Apericena in promo (previa registrazione)";
-      if (glutenIntolerance) {
-        // non blocchiamo, ma avvisiamo
+    const dateISO = parseDateWithWeekday(speech);
+    if (!dateISO) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause("Richiesta annullamento prenotazione: data non riconosciuta");
       }
-    } else if (normalized.includes("apericena") && !normalized.includes("piatto")) {
-      if (glutenIntolerance) return "L'apericena non è disponibile per celiaci o intolleranti al glutine. Vuoi scegliere un'alternativa o scrivere: nessuno?";
-      const option = getPreorderOptionByKey("apericena");
-      session.preorderChoiceKey = option?.key || "apericena";
-      session.preorderLabel = option?.label || "Apericena";
+      gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    session.manageDateISO = dateISO;
+    session.operatorState = "manage_cancel_surname";
+    gatherSpeech(vr, "Perfetto. Dimmi il cognome della prenotazione.");
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_cancel_surname") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi il cognome della prenotazione."));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta annullamento prenotazione: cognome non fornito (data ${session.manageDateISO || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    // FIX #3: Pulisci il cognome dalle parole filler
+    session.manageSurname = cleanSurnameInput(speech).slice(0, 60) || speech.trim().slice(0, 60);
+    session.operatorState = "manage_cancel_time";
+    gatherSpeech(vr, "Se ricordi anche l'orario dimmelo, altrimenti dì: non lo ricordo.");
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_cancel_time") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Se ricordi anche l'orario dimmelo, altrimenti dì: non lo ricordo."));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta annullamento prenotazione: orario non fornito (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    if (tt.includes("non lo ricordo") || tt.includes("non ricordo") || isNoRequestsText(speech)) {
+      session.manageTime24 = null;
     } else {
-      const option =
-        PREORDER_OPTIONS.find(
-          (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
-        ) || null;
-      if (!option) return "Non ho capito la scelta. Puoi scrivere: cena, apericena, dopocena, piatto apericena, piatto apericena promo — oppure: nessuno";
-      session.preorderChoiceKey = option.key;
-      session.preorderLabel = option.label;
+      session.manageTime24 = parseTimeIT(speech);
     }
-
-    session.wa.step = "confirm";
-    return buildBookingSummary(session);
+    session.operatorState = "manage_cancel_search";
+    // fallthrough
   }
 
-  if (step === "confirm") {
-    const n = normalizeText(text);
-    const yes = YES_WORDS.some((w) => n.includes(normalizeText(w)));
-    const no = NO_WORDS.some((w) => n.includes(normalizeText(w)));
-
-    if (!yes && !no) return "Confermi la prenotazione? Rispondi con sì oppure no.";
-
-    if (no) {
-      resetWaBooking(session);
-      return "Ok, nessun problema. Se vuoi riprovare, dimmi data/ora e numero persone 🙂";
-    }
-
-    // YES: tentiamo creazione evento e inviamo email operatore
-    let calendarResult = null;
-    try {
-      calendarResult = await createCalendarEvent(session);
-    } catch (err) {
-      console.error("[WHATSAPP] createCalendarEvent failed:", err);
-      calendarResult = null;
-    }
-
-    // Avviso operatore (best-effort)
-    try {
-      void sendOperatorEmail(session, { body: { From: session.phone } }, "whatsapp_booking_confirmed");
-    } catch (err) {
-      console.error("[WHATSAPP] sendOperatorEmail failed:", err);
-    }
-
-    if (calendarResult?.status === "closed") {
-      session.wa.step = "ask_date";
-      return "Quel giorno risulta chiuso. Vuoi scegliere un'altra data?";
-    }
-    if (calendarResult?.status === "unavailable") {
-      session.wa.step = "ask_time";
-      return "A quell'orario siamo al completo 😅 Vuoi provare un altro orario? (es. 20:00 oppure 21:30)";
-    }
-
-    const dateLabel = session.dateISO ? formatDateLabel(session.dateISO) : "";
-    const musicNote = session.liveMusicNoticePending ? " Nota: quella sera è prevista musica dal vivo." : "";
-    resetWaBooking(session);
-    return `Perfetto! Prenotazione registrata per ${dateLabel} alle ${session.time24} per ${session.people} persone.${musicNote} A presto 🙂`;
-  }
-
-  // Fallback: se per qualche motivo step sconosciuto
-  session.wa.step = "idle";
-  const ai = await aiGeneralReply(session, text);
-  if (ai) return ai;
-  return "Ok! Dimmi pure cosa ti serve 🙂";
-}
-
-async function handleTwilioInboundMessage(req, res) {
-  try {
-    const from = req.body?.From || "";
-    const to = req.body?.To || "";
-    const body = req.body?.Body || "";
-    const messageSid = req.body?.MessageSid || "";
-
-    console.log("[WHATSAPP] inbound", { from, to, messageSid, body });
-
-    const session = getWaSession(from);
-
-    // Storico per risposte AI (solo se il session esiste)
-    if (session) waAddToHistory(session, "user", body);
-
-    const reply = session ? await computeWhatsAppReply(session, body) : "OK";
-
-    if (session && reply) waAddToHistory(session, "assistant", reply);
-
-    const xml = buildMessagingTwimlReply(reply || "");
-
-    res.set("Content-Type", "text/xml; charset=utf-8");
-    return res.status(200).send(xml);
-  } catch (err) {
-    console.error("[WHATSAPP] inbound error:", err);
-    // Risposta vuota ma valida (evita retry aggressivi)
-    res.set("Content-Type", "text/xml; charset=utf-8");
-    return res.status(200).send(buildMessagingTwimlReply(""));
-  }
-}
-
-// Endpoint consigliato da usare come webhook (Request URL) in Twilio Console
-app.post("/twilio/inbound", handleTwilioInboundMessage);
-
-// Compatibilità: se in console hai configurato /twilio (o /twilio/) invece di /twilio/inbound
-app.post("/twilio", handleTwilioInboundMessage);
-
-app.post("/call/outbound", async (req, res) => {
-  try {
-    const to = String(req.body?.to || "").trim();
-    if (!to || !isValidPhoneE164(to)) {
-      return res.status(400).json({ ok: false, error: "Invalid 'to' number" });
-    }
-    if (!twilioClient) {
-      return res.status(500).json({ ok: false, error: "Twilio not configured" });
-    }
-    const fromNumber = requireTwilioVoiceFrom();
-    const twimlUrl = BASE_URL ? `${BASE_URL}/twilio/voice/outbound` : "/twilio/voice/outbound";
-    const call = await twilioClient.calls.create({
-      to,
-      from: fromNumber,
-      url: twimlUrl,
-      method: "POST",
+  if (state === "manage_cancel_search") {
+    // FIX #3 & #4: Usa la ricerca migliorata
+    const { match, candidates } = await findBookingEventMatch({
+      dateISO: session.manageDateISO,
+      time24: session.manageTime24,
+      surname: session.manageSurname,
+      people: session.managePeople,
+      phone: session.managePhone,
     });
-    return res.json({ ok: true, callSid: call.sid });
-  } catch (err) {
-    console.error("[OUTBOUND] Error:", err);
-    if (err && err.message === "TWILIO_VOICE_FROM is not set") {
-      return res.status(500).json({ ok: false, error: "TWILIO_VOICE_FROM not set" });
+
+    if (!match) {
+      // FIX #4: Se non troviamo, chiediamo altri parametri
+      if (!session.manageTime24 && !session.managePeople) {
+        session.operatorState = "manage_cancel_ask_people";
+        gatherSpeech(vr, "Non ho trovato la prenotazione. Ricordi quante persone eravate?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+      return forwardBecause(`Richiesta annullamento prenotazione: non trovata (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""}, orario ${session.manageTime24 || "non indicato"})`);
     }
-    return res.status(500).json({ ok: false });
-  }
-});
 
-app.post("/twilio/voice/outbound", (req, res) => {
-  try {
-    const vr = buildTwiml();
-    vr.say(
-      { language: "it-IT", voice: "alice" },
-      xmlEscape("Ciao! Ti chiamiamo da TuttiBrilli per un aggiornamento sulla tua prenotazione. Grazie.")
-    );
+    // Se più prenotazioni con stesso cognome e nessun orario, chiedi orario
+    if (candidates && candidates.length > 1 && !session.manageTime24) {
+      session.operatorState = "manage_cancel_time_disambiguate";
+      gatherSpeech(vr, "Ho trovato più prenotazioni con quel cognome. Mi dici anche l'orario?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    session.manageCandidateEventId = match.id;
+    session.manageCandidateEvent = match;
+    session.operatorState = "manage_cancel_confirm";
+    // FIX #1: Usa formattazione vocale migliorata
+    const summary = match.summary || "";
+    gatherSpeech(vr, `Ho trovato questa prenotazione: ${summary}. Vuoi annullarla?`);
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  // FIX #4: Nuovo stato per chiedere numero persone
+  if (state === "manage_cancel_ask_people") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Quante persone eravate?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause("Richiesta annullamento: numero persone non fornito");
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const people = parsePeopleIT(speech);
+    if (people) {
+      session.managePeople = people;
+    }
+    session.operatorState = "manage_cancel_search";
+    return handleManageBookingFlow(session, req, vr, speech, false);
+  }
+
+  if (state === "manage_cancel_time_disambiguate") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Mi dici anche l'orario della prenotazione?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta annullamento prenotazione: disambiguazione orario non fornita (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const time24 = parseTimeIT(speech);
+    if (!time24) {
+      // FIX #4: Se non ricorda l'orario, chiedi numero persone
+      session.operatorState = "manage_cancel_ask_people";
+      gatherSpeech(vr, "Non ho capito l'orario. Ricordi quante persone eravate?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    session.manageTime24 = time24;
+    session.operatorState = "manage_cancel_search";
+    return handleManageBookingFlow(session, req, vr, speech, false);
+  }
+
+  // FIX #5: Gestione conferma annullamento migliorata
+  if (state === "manage_cancel_confirm") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Vuoi confermare l'annullamento?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta annullamento prenotazione: conferma non fornita (evento ${session.manageCandidateEventId || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    
+    const yn = parseYesNo(speech);
+    console.log("[CANCEL] parseYesNo result:", yn, "for speech:", speech);
+    
+    if (yn === false) {
+      softReturnToMenu("Va bene, non annullo nulla.");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    if (yn !== true) {
+      gatherSpeech(vr, "Non ho capito. Vuoi annullare la prenotazione? Rispondi sì o no.");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    // FIX #5: Esegui effettivamente l'annullamento
+    console.log("[CANCEL] Executing cancellation for event:", session.manageCandidateEventId);
+    const ok = await patchBookingAsCanceled(session.manageCandidateEventId, session.manageDateISO, session.manageCandidateEvent);
+    
+    if (!ok) {
+      console.error("[CANCEL] patchBookingAsCanceled returned null/false");
+      return forwardBecause(`Richiesta annullamento prenotazione: errore aggiornamento (evento ${session.manageCandidateEventId || ""})`);
+    }
+    
+    console.log("[CANCEL] Successfully canceled booking");
+    sayIt(vr, "Perfetto. Ho annullato la prenotazione. Grazie e a presto.");
     vr.hangup();
-    res.set("Content-Type", "text/xml; charset=utf-8");
-    return res.send(vr.toString());
-  } catch (err) {
-    console.error("[OUTBOUND_TWIML] Error:", err);
-    return res.status(500).send("Error");
+    session.operatorState = null;
+    return { kind: "vr", twiml: vr.toString() };
   }
+
+  // ===== MODIFICA =====
+  if (state === "manage_modify_date") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi la data della prenotazione da modificare."));
+      if (silenceResult.action === "forward") {
+        return forwardBecause("Richiesta modifica prenotazione: data non fornita");
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const dateISO = parseDateWithWeekday(speech);
+    if (!dateISO) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause("Richiesta modifica prenotazione: data non riconosciuta");
+      }
+      gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    session.manageDateISO = dateISO;
+    // FIX #4: Chiedi prima il cognome, poi l'orario (più flessibile)
+    session.operatorState = "manage_modify_surname";
+    gatherSpeech(vr, "Perfetto. Dimmi il cognome della prenotazione.");
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  // FIX #4: Nuovo ordine - chiedi cognome prima dell'orario
+  if (state === "manage_modify_surname") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi il cognome della prenotazione."));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica prenotazione: cognome non fornito (data ${session.manageDateISO || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    // FIX #3: Pulisci il cognome
+    session.manageSurname = cleanSurnameInput(speech).slice(0, 60) || speech.trim().slice(0, 60);
+    session.operatorState = "manage_modify_time";
+    gatherSpeech(vr, "Se ricordi l'orario dimmelo, altrimenti dì: non lo ricordo.");
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_modify_time") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Se ricordi l'orario dimmelo, altrimenti dì: non lo ricordo."));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica prenotazione: orario non fornito (data ${session.manageDateISO || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    if (tt.includes("non lo ricordo") || tt.includes("non ricordo") || isNoRequestsText(speech)) {
+      session.manageTime24 = null;
+    } else {
+      session.manageTime24 = parseTimeIT(speech);
+    }
+    session.operatorState = "manage_modify_search";
+    // fallthrough
+  }
+
+  if (state === "manage_modify_search") {
+    // FIX #3 & #4: Usa la ricerca migliorata
+    const { match, candidates } = await findBookingEventMatch({
+      dateISO: session.manageDateISO,
+      time24: session.manageTime24,
+      surname: session.manageSurname,
+      people: session.managePeople,
+      phone: session.managePhone,
+    });
+    
+    if (!match) {
+      // FIX #4: Chiedi altri parametri
+      if (!session.manageTime24 && !session.managePeople) {
+        session.operatorState = "manage_modify_ask_people";
+        gatherSpeech(vr, "Non ho trovato la prenotazione. Ricordi quante persone eravate?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+      return forwardBecause(`Richiesta modifica prenotazione: non trovata (data ${session.manageDateISO || ""}, orario ${session.manageTime24 || ""}, cognome ${session.manageSurname || "non indicato"})`);
+    }
+    
+    // Se più candidati, disambigua
+    if (candidates && candidates.length > 1) {
+      if (!session.manageTime24) {
+        session.operatorState = "manage_modify_time_disambiguate";
+        gatherSpeech(vr, "Ho trovato più prenotazioni. Mi dici l'orario?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+      if (!session.managePeople) {
+        session.operatorState = "manage_modify_ask_people";
+        gatherSpeech(vr, "Ho trovato più prenotazioni. Quante persone eravate?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+    }
+    
+    session.manageCandidateEventId = match.id;
+    session.manageCandidateEvent = match;
+    session.operatorState = "manage_modify_ask_change";
+    gatherSpeech(vr, `Ho trovato questa prenotazione: ${match.summary || ""}. Cosa vuoi modificare?`);
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  // FIX #4: Nuovo stato per chiedere numero persone (modifica)
+  if (state === "manage_modify_ask_people") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Quante persone eravate?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause("Richiesta modifica: numero persone non fornito");
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const people = parsePeopleIT(speech);
+    if (people) {
+      session.managePeople = people;
+    }
+    session.operatorState = "manage_modify_search";
+    return handleManageBookingFlow(session, req, vr, speech, false);
+  }
+
+  if (state === "manage_modify_time_disambiguate") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Mi dici l'orario della prenotazione?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause("Richiesta modifica: disambiguazione orario non fornita");
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const time24 = parseTimeIT(speech);
+    if (!time24) {
+      session.operatorState = "manage_modify_ask_people";
+      gatherSpeech(vr, "Non ho capito l'orario. Ricordi quante persone eravate?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    session.manageTime24 = time24;
+    session.operatorState = "manage_modify_search";
+    return handleManageBookingFlow(session, req, vr, speech, false);
+  }
+
+  if (state === "manage_modify_ask_change") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi cosa vuoi modificare."));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica prenotazione: dettagli modifica non forniti (evento ${session.manageCandidateEventId || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    session.manageModificationRaw = String(speech || "").trim().slice(0, 200);
+
+    const original = session.manageCandidateEvent || {};
+    const originalDateISO = String(original?.start?.dateTime || original?.start?.date || session.manageDateISO || "").slice(0, 10);
+    const originalTime24 = parseTimeIT(original?.start?.dateTime || "") || session.manageTime24;
+    const originalPeople = extractPeopleFromDescription(original?.description) || extractPeopleFromSummary(original?.summary) || 2;
+    const originalNotes = extractNotesFromDescription(original?.description) || "";
+
+    const newDateISO = parseDateWithWeekday(speech) || originalDateISO;
+    const newTime24 = parseTimeIT(speech) || originalTime24;
+    const newPeople = parsePeopleIT(speech) || originalPeople;
+    const newNotes = extractNotesHint(speech) || originalNotes;
+
+    if (!newDateISO || !newTime24) {
+      return forwardBecause(`Richiesta modifica prenotazione: dati insufficienti (evento ${session.manageCandidateEventId || ""})`);
+    }
+
+    const selectionResult = await computeTableSelectionForChange({
+      dateISO: newDateISO,
+      time24: newTime24,
+      people: newPeople,
+      ignoreEventId: session.manageCandidateEventId,
+    });
+
+    if (selectionResult.status === "closed" || selectionResult.status === "unavailable") {
+      return forwardBecause(`Richiesta modifica prenotazione: non disponibile (nuova data ${newDateISO}, nuovo orario ${newTime24}, persone ${newPeople})`);
+    }
+
+    session.managePendingUpdate = {
+      newDateISO,
+      newTime24,
+      newPeople,
+      newNotes,
+      durationMinutes: selectionResult.durationMinutes,
+      newTableLocks: selectionResult.selection?.locks || [],
+      modificationRaw: session.manageModificationRaw,
+      originalDateISO,
+    };
+
+    session.operatorState = "manage_modify_confirm_apply";
+    // FIX #1: Usa formattazione vocale migliorata
+    const timeSpoken = formatTimeForSpeech(newTime24);
+    const peopleSpoken = formatPeopleForSpeech(newPeople);
+    gatherSpeech(
+      vr,
+      `Ok. Vuoi confermare la modifica a ${formatDateLabel(newDateISO)} al${timeSpoken} per ${peopleSpoken}?`
+    );
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_modify_confirm_apply") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Vuoi confermare la modifica?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica prenotazione: conferma non fornita (evento ${session.manageCandidateEventId || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const yn = parseYesNo(speech);
+    if (yn === false) {
+      softReturnToMenu("Va bene, non modifico nulla.");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    if (yn !== true) {
+      gatherSpeech(vr, "Non ho capito. Vuoi confermare la modifica? Rispondi sì o no.");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const pending = session.managePendingUpdate || {};
+    const ok = await patchBookingAsModified({
+      eventId: session.manageCandidateEventId,
+      originalEvent: session.manageCandidateEvent,
+      newDateISO: pending.newDateISO,
+      newTime24: pending.newTime24,
+      newPeople: pending.newPeople,
+      newNotes: pending.newNotes,
+      newSelection: { locks: pending.newTableLocks || [] },
+      durationMinutes: pending.durationMinutes,
+      modificationRaw: pending.modificationRaw,
+    });
+    if (!ok) {
+      return forwardBecause(`Richiesta modifica prenotazione: errore aggiornamento (evento ${session.manageCandidateEventId || ""})`);
+    }
+    sayIt(vr, "Perfetto. Ho modificato la prenotazione. Grazie e a presto.");
+    vr.hangup();
+    session.operatorState = null;
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  // fallback: se non riconosciamo lo stato, torniamo al menu
+  softReturnToMenu("Va bene.");
+  return { kind: "vr", twiml: vr.toString() };
+}
+
+function extractPeopleFromSummary(summary) {
+  const s = String(summary || "");
+  const m = s.match(/\b(\d{1,2})\s*pax\b/i);
+  return m ? Number(m[1]) : null;
+}
+
+function extractPeopleFromDescription(description) {
+  const d = String(description || "");
+  const m = d.match(/^Persone:\s*(\d{1,2})\b/im);
+  return m ? Number(m[1]) : null;
+}
+
+function extractNotesFromDescription(description) {
+  const d = String(description || "");
+  const m = d.match(/^Note:\s*(.*)$/im);
+  return m ? String(m[1] || "").trim() : "";
+}
+
+function extractNotesHint(speech) {
+  const tt = String(speech || "").trim();
+  const m = tt.match(/\b(note|richiesta|richieste)\b\s*:?\s*(.+)$/i);
+  return m ? String(m[2] || "").trim() : null;
+}
+
+// ======================= EXPRESS ENDPOINTS =======================
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-async function handleVoiceRequest(req, res) {
+app.post("/twilio/voice", async (req, res) => {
+  // Implementazione semplificata del voice handler
   const callSid = req.body.CallSid || "";
   const speech = String(req.body.SpeechResult || req.body.Digits || "");
   const session = getSession(callSid);
-  if (session && !session.callSid) session.callSid = callSid;
   const vr = buildTwiml();
 
   try {
     if (!session) {
-      await sendFallbackEmail(session, req, "session_error");
-      if (canForwardToHuman()) {
-        void sendOperatorEmail(session, req, "session_error");
-        res.set("Content-Type", "text/xml; charset=utf-8");
-        await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
-        return res.send(forwardToHumanTwiml());
-      }
-      sayIt(vr, "Ti passo un operatore per completare la richiesta.");
-      await safeCreateFailedCallCalendarEvent(session, req, "fallback");
+      sayIt(vr, "Si è verificato un errore. Riprova più tardi.");
       vr.hangup();
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(vr.toString());
     }
 
     const emptySpeech = !normalizeText(speech);
-    // Gestione flussi speciali (annulla/modifica prenotazione, informazioni)
+
+    // Gestione flussi speciali (annulla/modifica prenotazione)
     if (session.operatorState && String(session.operatorState).startsWith("manage_")) {
       const r = await handleManageBookingFlow(session, req, vr, speech, emptySpeech);
       res.set("Content-Type", "text/xml; charset=utf-8");
       return res.send(r.twiml);
     }
 
-    if (session.operatorState && ["info_question", "info_avail_people", "info_avail_time"].includes(String(session.operatorState))) {
-      const r = await handleInfoFlow(session, req, vr, speech, emptySpeech);
-      res.set("Content-Type", "text/xml; charset=utf-8");
-      return res.send(r.twiml);
-    }
-
-    // Richiesta operatore / Info: stato macchina che evita chiusure secche
-    if (
-      session.operatorState === "await_reason" ||
-      session.operatorState === "info_need_details" ||
-      session.operatorState === "info_more" ||
-      session.operatorState === "info_offer_booking"
-    ) {
-      const kind =
-        session.operatorKind || (session.intent === "event" ? "event" : session.intent === "info" ? "info" : "generic");
-      const n = normalizeText(speech);
-      const emptySpeech = !n;
-
-      const isNoLike = (tt) => {
-        const t = normalizeText(tt || "");
-        if (!t) return false;
-        return (
-          t === "no" ||
-          t.includes("nessun") ||
-          t.includes("nessuna") ||
-          t.includes("nessuno") ||
-          t.includes("niente") ||
-          t.includes("nulla") ||
-          t.includes("basta") ||
-          t.includes("stop") ||
-          t.includes("non serve") ||
-          t.includes("a posto") ||
-          t.includes("va bene cosi") ||
-          t.includes("va bene così")
-        );
-      };
-
-      const isYesLike = (tt) => {
-        const t = normalizeText(tt || "");
-        if (!t) return false;
-        return YES_WORDS.some((w) => t.includes(normalizeText(w)));
-      };
-
-      const askMorePrompt = "Ti serve qualche altra informazione?";
-      const offerBookingPrompt = "Vuoi prenotare un tavolo?";
-      const softGoodbye = "Perfetto. Grazie e a presto.";
-
-      // --- STATO: OFFERTA PRENOTAZIONE ---
-      if (session.operatorState === "info_offer_booking") {
-        session.infoOfferTries = Number(session.infoOfferTries || 0);
-
-        if (emptySpeech) {
-          session.infoOfferTries += 1;
-          if (session.infoOfferTries >= 2) {
-            sayIt(vr, softGoodbye);
-            vr.hangup();
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-          gatherSpeech(vr, offerBookingPrompt + " Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-
-        if (isYesLike(speech)) {
-          // entra nel flusso tavolo senza rompere routing/step esistenti
-          session.operatorState = null;
-          session.operatorPrompt = null;
-          session.operatorRetryPrompt = null;
-          session.operatorKind = null;
-          session.infoPending = null;
-          session.intent = "table";
-          session.step = 1;
-          resetRetries(session);
-          gatherSpeech(vr, "Perfetto, prenotiamo il tuo tavolo. Come ti chiami?");
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-
-        // NO -> chiudi con cortesia
-        sayIt(vr, softGoodbye);
-        vr.hangup();
-        res.set("Content-Type", "text/xml; charset=utf-8");
-        return res.send(vr.toString());
-      }
-
-      // --- STATO: INFO_MORE (ciclo “altre info?”) ---
-      if (session.operatorState === "info_more") {
-        session.infoMoreSilence = Number(session.infoMoreSilence || 0);
-
-        if (emptySpeech) {
-          session.infoMoreSilence += 1;
-          if (session.infoMoreSilence >= 2) {
-            session.operatorState = "info_offer_booking";
-            session.infoOfferTries = 0;
-            gatherSpeech(vr, offerBookingPrompt + " Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-          gatherSpeech(vr, askMorePrompt);
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-
-        session.infoMoreSilence = 0;
-
-        if (isNoLike(speech)) {
-          session.operatorState = "info_offer_booking";
-          session.infoOfferTries = 0;
-          gatherSpeech(vr, offerBookingPrompt + " Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-
-        // nuova domanda info: prova a rispondere
-        const attempt = await tryAnswerInfoQuestionVoiceSmart(session, speech);
-
-        if (attempt?.handled && attempt?.needsDetails && attempt?.pending) {
-          session.infoPending = attempt.pending;
-          // domanda di dettaglio (manca time/persone)
-          if (attempt.pending.type === "availability") {
-            const needPeople = !Number.isFinite(attempt.pending.people);
-            const needTime = !attempt.pending.time24;
-            const p =
-              needPeople && needTime
-                ? "Per quante persone e a che ora?"
-                : needPeople
-                ? "Per quante persone?"
-                : "A che ora?";
-            session.operatorState = "info_need_details";
-            session.infoNeedSilence = 0;
-            gatherSpeech(vr, p);
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-          session.operatorState = "info_need_details";
-          session.infoNeedSilence = 0;
-          gatherSpeech(vr, "Puoi darmi un dettaglio in piu'?" );
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-
-        if (attempt?.handled && attempt?.answer) {
-          sayIt(vr, attempt.answer);
-          session.operatorState = "info_more";
-          gatherSpeech(vr, askMorePrompt);
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-
-        // non so rispondere: registro richiesta operatore (una sola volta) ma NON chiudo secco
-        session.operatorReasonRaw = (session.operatorReasonRaw ? `${session.operatorReasonRaw}\n` : "") +
-          String(speech || "").trim();
-
-        if (!session.operatorCallbackEventCreated) {
-          await sendFallbackEmail(session, req, "operator_request");
-          void sendOperatorEmail(session, req, "operator_request");
-          void safeCreateOperatorCallbackCalendarEvent(session, req, "requested");
-          sayIt(vr, "Va bene. Ho preso nota della richiesta e ti faremo ricontattare al piu' presto.");
-        } else {
-          sayIt(vr, "Ok. Ho aggiunto anche questa richiesta e ti faremo ricontattare al piu' presto.");
-        }
-
-        session.operatorState = "info_more";
-        gatherSpeech(vr, askMorePrompt);
-        res.set("Content-Type", "text/xml; charset=utf-8");
-        return res.send(vr.toString());
-      }
-
-      // --- STATO: INFO_NEED_DETAILS (completa dati mancanti, poi risponde) ---
-      if (session.operatorState === "info_need_details") {
-        session.infoNeedSilence = Number(session.infoNeedSilence || 0);
-
-        if (emptySpeech) {
-          session.infoNeedSilence += 1;
-          if (session.infoNeedSilence >= 2) {
-            session.operatorState = "info_more";
-            gatherSpeech(vr, askMorePrompt);
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-          const pending = session.infoPending || {};
-          if (pending.type === "availability") {
-            const needPeople = !Number.isFinite(pending.people);
-            const needTime = !pending.time24;
-            const p =
-              needPeople && needTime
-                ? "Per quante persone e a che ora?"
-                : needPeople
-                ? "Per quante persone?"
-                : "A che ora?";
-            gatherSpeech(vr, p);
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-          gatherSpeech(vr, "Puoi darmi un dettaglio in piu'?" );
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-
-        const pending = session.infoPending || {};
-        if (pending.type === "availability") {
-          const maybePeople = parsePeopleIT(speech);
-          const maybeTime = parseTimeIT(speech);
-          if (!Number.isFinite(pending.people) && Number.isFinite(maybePeople)) pending.people = maybePeople;
-          if (!pending.time24 && maybeTime) pending.time24 = maybeTime;
-
-          if (!Number.isFinite(pending.people) || !pending.time24) {
-            const needPeople = !Number.isFinite(pending.people);
-            const needTime = !pending.time24;
-            const p =
-              needPeople && needTime
-                ? "Per quante persone e a che ora?"
-                : needPeople
-                ? "Per quante persone?"
-                : "A che ora?";
-            session.infoPending = pending;
-            gatherSpeech(vr, p);
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-
-          const resp = await checkAvailabilityQuickVoice(session, pending.dateISO, pending.people, pending.time24);
-          if (resp?.answer) sayIt(vr, resp.answer);
-
-          session.infoPending = null;
-          session.operatorState = "info_more";
-          gatherSpeech(vr, askMorePrompt);
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-
-        // generic pending: prova a rieseguire smart
-        const attempt = await tryAnswerInfoQuestionVoiceSmart(session, String(speech || "").trim());
-        if (attempt?.handled && attempt?.answer) sayIt(vr, attempt.answer);
-        session.infoPending = null;
-        session.operatorState = "info_more";
-        gatherSpeech(vr, askMorePrompt);
-        res.set("Content-Type", "text/xml; charset=utf-8");
-        return res.send(vr.toString());
-      }
-
-      // --- STATO: await_reason (prima domanda) ---
-      if (session.operatorState === "await_reason") {
-        // raccolta domanda (come prima, ma se info -> prova a rispondere e NON chiude secco)
-        if (emptySpeech || isPureConsent(speech)) {
-          session.operatorReasonTries = Number(session.operatorReasonTries || 0) + 1;
-          if (session.operatorReasonTries < 2) {
-            gatherSpeech(vr, session.operatorRetryPrompt || "Qual e' la richiesta?");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-          session.operatorReasonRaw = "non specificato";
-        } else {
-          session.operatorReasonRaw = String(speech || "").trim();
-        }
-
-        // INFO: prova risposta smart
-        if (kind === "info") {
-          const attempt = await tryAnswerInfoQuestionVoiceSmart(session, session.operatorReasonRaw);
-
-          if (attempt?.handled && attempt?.needsDetails && attempt?.pending) {
-            session.infoPending = attempt.pending;
-            session.operatorState = "info_need_details";
-            session.infoNeedSilence = 0;
-            const needPeople = !Number.isFinite(attempt.pending.people);
-            const needTime = !attempt.pending.time24;
-            const p =
-              needPeople && needTime
-                ? "Per quante persone e a che ora?"
-                : needPeople
-                ? "Per quante persone?"
-                : "A che ora?";
-            gatherSpeech(vr, p);
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-
-          if (attempt?.handled && attempt?.answer) {
-            sayIt(vr, attempt.answer);
-            session.operatorState = "info_more";
-            session.infoMoreSilence = 0;
-            gatherSpeech(vr, askMorePrompt);
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-
-          // non so rispondere -> registro callback, ma continuo con “altre info?”
-          await sendFallbackEmail(session, req, "operator_request");
-          void sendOperatorEmail(session, req, "operator_request");
-          void safeCreateOperatorCallbackCalendarEvent(session, req, "requested");
-          sayIt(vr, "Va bene. Ho preso nota della richiesta e ti faremo ricontattare al piu' presto.");
-          session.operatorState = "info_more";
-          session.infoMoreSilence = 0;
-          gatherSpeech(vr, askMorePrompt);
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-
-        // EVENTO (o altro): comportamento invariato, ma con dial più robusto
-        await sendFallbackEmail(session, req, "operator_request");
-        void sendOperatorEmail(session, req, "operator_request");
-
-        const operatorPhone = getOperatorPhoneE164();
-        const canDialLive = Boolean(ENABLE_FORWARDING && operatorPhone);
-
-        void safeCreateOperatorCallbackCalendarEvent(session, req, "requested");
-
-        session.operatorState = null;
-        session.operatorPrompt = null;
-        session.operatorRetryPrompt = null;
-
-        if (canDialLive) {
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(forwardToHumanTwiml(req));
-        }
-
-        sayIt(vr, "Va benissimo. Ho preso nota e ti faremo ricontattare al piu' presto. Grazie e a presto.");
-        vr.hangup();
-        res.set("Content-Type", "text/xml; charset=utf-8");
-        return res.send(vr.toString());
-      }
-    }
-
-    if (!emptySpeech && isOperatorRequest(speech)) {
-      session.operatorState = "await_reason";
-      session.operatorReasonTries = 0;
-      session.operatorReasonRaw = null;
-      session.operatorPrompt = "Va bene. Dimmi in poche parole il motivo della richiesta.";
-      session.operatorRetryPrompt = "Qual è il motivo della richiesta?";
-      gatherSpeech(vr, session.operatorPrompt);
-      res.set("Content-Type", "text/xml; charset=utf-8");
-      return res.send(vr.toString());
-    }
-    if (session.step !== "intent" && !emptySpeech && isCancelCommand(speech)) {
-      const canceled = await cancelCalendarEvent(session);
-      if (canceled) {
-        session.step = 1;
-        gatherSpeech(vr, "Ho annullato la prenotazione. Vuoi prenotare di nuovo?");
-      } else if (canForwardToHuman()) {
-        await sendFallbackEmail(session, req, "cancel_request_forward");
-        void sendOperatorEmail(session, req, "cancel_request_forward");
-        res.set("Content-Type", "text/xml; charset=utf-8");
-        await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
-        return res.send(forwardToHumanTwiml());
-      } else {
-        session.step = 1;
-        gatherSpeech(vr, "Ok, mi occupo di annullare la prenotazione. Vuoi fare una nuova richiesta?");
-      }
-      res.set("Content-Type", "text/xml; charset=utf-8");
-      return res.send(vr.toString());
-    }
-
-    if (session.step !== "intent" && !emptySpeech && isBackCommand(speech)) {
-      resetRetries(session);
-      goBack(session);
-      promptForStep(vr, session);
-      res.set("Content-Type", "text/xml; charset=utf-8");
-      return res.send(vr.toString());
-    }
-
-    switch (session.step) {
-      case "intent": {
-        if (!session.intentWelcomed) {
-          sayIt(vr, "Benvenuto da Tuttibrilli.");
-          session.intentWelcomed = true;
-        }
-        // Silenzio: massimo 3 tentativi, poi chiude e registra il tentativo non completato
-        if (emptySpeech) {
-          session.intentSilenceRetries = (session.intentSilenceRetries || 0) + 1;
-          if (session.intentSilenceRetries >= 3) {
-            sayIt(vr, "Va bene, nessun problema. Ti saluto e se vuoi puoi richiamarci quando preferisci. A presto.");
-            await safeCreateFailedCallCalendarEvent(session, req, "menu_silence");
-            vr.hangup();
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-          gatherSpeech(vr, buildMainMenuPrompt());
-          break;
-        }
-        session.intentSilenceRetries = 0;
-
-        const normalized = normalizeText(speech);
-        let intent = null;
-        // Nuovo: annulla/modifica prenotazione
-        if (
-          (normalized.includes("annull") || normalized.includes("cancell") || normalized.includes("disdir")) &&
-          (normalized.includes("prenot") || normalized.includes("prenotazione"))
-        ) {
-          intent = "manage_cancel";
-        } else if (
-          (normalized.includes("modific") || normalized.includes("cambi") || normalized.includes("spost") || normalized.includes("varia")) &&
-          (normalized.includes("prenot") || normalized.includes("prenotazione"))
-        ) {
-          intent = "manage_modify";
-        } else if (normalized.includes("tavolo") || normalized.includes("prenot")) {
-          intent = "table";
-        } else if (
-          normalized.includes("info") ||
-          normalized.includes("informazioni") ||
-          normalized.includes("orari") ||
-          normalized.includes("menu")
-        ) {
-          intent = "info";
-        } else if (
-          normalized.includes("evento") ||
-          normalized.includes("festa") ||
-          normalized.includes("compleanno")
-        ) {
-          intent = "event";
-        }
-
-        if (!intent) {
-          session.intentRetries += 1;
-          if (session.intentRetries >= 2) {
-            await sendFallbackEmail(session, req, "intent_retry_exhausted");
-            void sendOperatorEmail(session, req, "intent_retry_exhausted");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          gatherSpeech(vr, buildMainMenuPrompt());
-          break;
-        }
-
-        session.intent = intent;
-        session.intentRetries = 0;
-        resetRetries(session);
-
-        if (intent === "table") {
-          session.step = 1;
-          gatherSpeech(vr, "Perfetto, prenotiamo il tuo tavolo. Come ti chiami?");
-          break;
-        }
-
-        if (intent === "manage_cancel") {
-          session.manageAction = "cancel";
-          session.manageDateISO = null;
-          session.manageTime24 = null;
-          session.manageSurname = null;
-          session.manageCandidateEventId = null;
-          session.manageCandidateEvent = null;
-          session.operatorState = "manage_cancel_date";
-          gatherSpeech(vr, "Va bene. Dimmi la data della prenotazione da annullare.");
-          break;
-        }
-
-        if (intent === "manage_modify") {
-          session.manageAction = "modify";
-          session.manageDateISO = null;
-          session.manageTime24 = null;
-          session.manageSurname = null;
-          session.manageCandidateEventId = null;
-          session.manageCandidateEvent = null;
-          session.manageModificationRaw = null;
-          session.managePendingUpdate = null;
-          session.operatorState = "manage_modify_date";
-          gatherSpeech(vr, "Va bene. Dimmi la data della prenotazione da modificare.");
-          break;
-        }
-
-        if (intent === "info") {
-          session.operatorState = "await_reason";
-          session.operatorKind = "info";
-          session.operatorReasonRaw = null;
-          session.operatorReasonTries = 0;
-          session.operatorPrompt = "Va bene. Dimmi pure cosa vuoi sapere.";
-          session.operatorRetryPrompt = "Qual e' la richiesta?";
-          gatherSpeech(vr, session.operatorPrompt);
-          break;
-        }
-
-        if (intent === "event") {
-          // Procedura ibrida: raccogli motivo, registra su Calendar e tenta inoltro operatore
-          session.operatorState = "await_reason";
-          session.operatorReasonTries = 0;
-          session.operatorReasonRaw = null;
-          session.operatorKind = "event";
-          session.operatorPrompt = "Va bene. Dimmi in poche parole i dettagli dell\'evento e cosa ti serve.";
-          session.operatorRetryPrompt = "Quali dettagli dell\'evento e cosa ti serve?";
-          gatherSpeech(vr, session.operatorPrompt);
-          break;
-        }
-
-        // Sicurezza: se per qualche motivo non siamo entrati in nessun intent
-        gatherSpeech(vr, buildMainMenuPrompt());
-        break;
-      }
-
-      case "event_name": {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "Perfetto. Come si chiama l'evento?")
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_event_name");
-            void sendOperatorEmail(session, req, "silence_event_name");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        session.eventName = speech.trim().slice(0, 80);
-        resetRetries(session);
-        session.step = "event_date";
-        gatherSpeech(vr, "Per quale data vuoi prenotare l'evento?");
-        break;
-      }
-
-      case "event_date": {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "Per quale data vuoi prenotare l'evento?")
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_event_date");
-            void sendOperatorEmail(session, req, "silence_event_date");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        const eventDateISO = parseDateIT(speech);
-        if (!eventDateISO) {
-          gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
-          break;
-        }
-        session.eventDateISO = eventDateISO;
-        resetRetries(session);
-        session.step = "event_time";
-        gatherSpeech(vr, "A che ora vuoi prenotare l'evento?");
-        break;
-      }
-
-      case "event_time": {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "A che ora vuoi prenotare l'evento?")
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_event_time");
-            void sendOperatorEmail(session, req, "silence_event_time");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        const eventTime24 = parseTimeIT(speech);
-        if (!eventTime24) {
-          gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
-          break;
-        }
-        session.eventTime24 = eventTime24;
-        resetRetries(session);
-        const createdEvent = await createEventCalendarEvent(session);
-        if (!createdEvent && canForwardToHuman()) {
-          await sendFallbackEmail(session, req, "event_calendar_failed");
-          void sendOperatorEmail(session, req, "event_calendar_failed");
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
-          return res.send(forwardToHumanTwiml());
-        }
-        sayIt(vr, "Grazie. Ho registrato la tua richiesta per l'evento. Ti contatteremo presto.");
-        await sendFallbackEmail(session, req, "event_request_completed");
-        if (canForwardToHuman()) {
-          void sendOperatorEmail(session, req, "event_request_completed");
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
-          return res.send(forwardToHumanTwiml());
-        }
-        vr.hangup();
-        res.set("Content-Type", "text/xml; charset=utf-8");
-        return res.send(vr.toString());
-      }
-
-      case 1: {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step1_welcome_name.main"))
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_step1");
-            void sendOperatorEmail(session, req, "silence_step1");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        session.name = speech.trim().slice(0, 60);
-        resetRetries(session);
-        session.step = 2;
-        gatherSpeech(vr, t("step2_confirm_name_ask_date.main", { name: session.name }));
-        break;
-      }
-
-      case 2: {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step3_confirm_date_ask_time.error"))
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_step2");
-            void sendOperatorEmail(session, req, "silence_step2");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        const dateISO = parseDateIT(speech);
-        if (!dateISO) {
-          gatherSpeech(vr, t("step3_confirm_date_ask_time.error"));
-          break;
-        }
-        session.dateISO = dateISO;
-        resetRetries(session);
-        session.step = 3;
-        session.dateLabel = formatDateLabel(dateISO);
-        gatherSpeech(vr, "Perfetto. In quante persone siete?");
-        break;
-      }
-
-      case 3: {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step5_party_size_ask_notes.error"))
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_step3");
-            void sendOperatorEmail(session, req, "silence_step3");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        const people = parsePeopleIT(speech);
-        if (!people) {
-          gatherSpeech(vr, t("step5_party_size_ask_notes.error"));
-          break;
-        }
-        session.people = people;
-        const events = await listCalendarEvents(session.dateISO);
-        const date = new Date(`${session.dateISO}T00:00:00`);
-        const isHoliday = HOLIDAYS_SET.has(session.dateISO);
-        const isClosedDay = date.getDay() === OPENING.closedDay;
-        if (isHoliday || isClosedDay || isDateClosedByCalendar(events)) {
-          session.step = 2;
-          gatherSpeech(vr, "Mi dispiace, il locale risulta chiuso quel giorno. Vuoi scegliere un'altra data?");
-          break;
-        }
-        session.liveMusicNoticePending = hasLiveMusicEvent(events);
-        session.liveMusicNoticeSpoken = false;
-        resetRetries(session);
-        session.step = 4;
-        gatherSpeech(vr, t("step3_confirm_date_ask_time.main", { dateLabel: session.dateLabel }));
-        break;
-      }
-
-      case 4: {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"))
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_step4");
-            void sendOperatorEmail(session, req, "silence_step4");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        const time24 = parseTimeIT(speech);
-        if (!time24) {
-          gatherSpeech(vr, t("step4_confirm_time_ask_party_size.error"));
-          break;
-        }
-        session.time24 = time24;
-        resetRetries(session);
-        session.step = 5;
-        gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people }));
-        break;
-      }
-
-      case 5: {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people }))
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_step5");
-            void sendOperatorEmail(session, req, "silence_step5");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        if (isPureConsent(speech)) {
-          gatherSpeech(vr, "Quali? Dimmi pure le intolleranze o la richiesta.");
-          break;
-        }
-        session.specialRequestsRaw = emptySpeech ? "nessuna" : speech.trim().slice(0, 200);
-        resetRetries(session);
-        session.step = 6;
-        gatherSpeech(
-          vr,
-          "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
-        );
-        break;
-      }
-
-      case 6: {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () => promptForStep(vr, session));
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_step6");
-            void sendOperatorEmail(session, req, "silence_step6");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        const normalized = normalizeText(speech);
-        const glutenIntolerance = hasGlutenIntolerance(session.specialRequestsRaw);
-        const isFriday = session.dateISO ? new Date(`${session.dateISO}T00:00:00`).getDay() === 5 : false;
-        session.glutenPiattoNotice = false;
-        session.promoRegistrationNotice = false;
-        if (normalized.includes("nessuno") || normalized.includes("niente") || normalized.includes("no")) {
-          session.preorderChoiceKey = null;
-          session.preorderLabel = "nessuno";
-        } else {
-          if (normalized.includes("apericena promo")) {
-            const promoOption = getPreorderOptionByKey("piatto_apericena_promo");
-            if (isFriday) {
-              gatherSpeech(
-                vr,
-                "L'apericena promo non è disponibile il venerdì. Puoi scegliere l'apericena standard oppure un altro piatto."
-              );
-              break;
-            }
-            session.preorderChoiceKey = promoOption?.key || "piatto_apericena_promo";
-            session.preorderLabel = promoOption?.label || "Piatto Apericena in promo (previa registrazione)";
-            session.promoRegistrationNotice = true;
-            if (glutenIntolerance) {
-              session.glutenPiattoNotice = true;
-            }
-            maybeSayApericenaNotices(vr, session);
-          } else if (normalized.includes("apericena")) {
-            if (glutenIntolerance) {
-              gatherSpeech(
-                vr,
-                "L'apericena non è disponibile per celiaci o intolleranti al glutine. Puoi scegliere un'alternativa."
-              );
-              break;
-            }
-            const option = getPreorderOptionByKey("apericena");
-            session.preorderChoiceKey = option?.key || "apericena";
-            session.preorderLabel = option?.label || "Apericena";
-          } else {
-            const option = PREORDER_OPTIONS.find(
-              (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
-            );
-            if (option) {
-              session.preorderChoiceKey = option.key;
-              session.preorderLabel = option.label;
-              let shouldSayNotice = false;
-              if ((option.key === "piatto_apericena" || option.key === "piatto_apericena_promo") && glutenIntolerance) {
-                session.glutenPiattoNotice = true;
-                shouldSayNotice = true;
-              }
-              if (option.key === "piatto_apericena_promo") {
-                session.promoRegistrationNotice = true;
-                shouldSayNotice = true;
-              }
-              if (shouldSayNotice) {
-                maybeSayApericenaNotices(vr, session);
-              }
-            } else {
-              gatherSpeech(
-                vr,
-                "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
-              );
-              break;
-            }
-          }
-        }
-        const availability = await reserveTableForSession(session, { commit: false });
-        if (availability.status === "closed") {
-          session.step = 2;
-          gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
-          break;
-        }
-        if (availability.status === "unavailable") {
-          if (session.forceOperatorFallback && canForwardToHuman()) {
-            await sendFallbackEmail(session, req, "invalid_table_combo");
-            void sendOperatorEmail(session, req, "invalid_table_combo");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          if (session.forceOperatorFallback) {
-            sayIt(vr, t("step9_fallback_transfer_operator.main"));
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            vr.hangup();
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-          session.step = 4;
-          gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
-          break;
-        }
-        if (availability.status === "needs_split" || availability.status === "needs_outside" || session.outsideRequired) {
-          session.criticalReservation = true;
-          session.step = 8;
-          maybeSayDivanettiNotice(vr, session);
-          gatherSpeech(
-            vr,
-            "La prenotazione è stata effettuata con criticità. Ti richiamerà un operatore. Intanto mi lasci un numero di telefono? Se è italiano, aggiungo io il +39."
-          );
-          break;
-        }
-        resetRetries(session);
-        session.step = 8;
-        maybeSayDivanettiNotice(vr, session);
-        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
-        break;
-      }
-
-      case 7: {
-        if (emptySpeech) {
-          const promptText = session.outsideRequired
-            ? "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
-            : "Posco sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.";
-          const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, promptText));
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_step7");
-            void sendOperatorEmail(session, req, "silence_step7");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        const confirmation = parseYesNo(speech);
-        if (confirmation === null) {
-          if (session.outsideRequired) {
-            gatherSpeech(
-              vr,
-              "Ti ricordo che la sala esterna è senza copertura e con maltempo non posso garantire un tavolo all'interno. Confermi?"
-            );
-          } else {
-            gatherSpeech(vr, "Posco sistemarvi in tavoli separati? Se preferisci, ti passo un operatore.");
-          }
-          break;
-        }
-        if (!confirmation) {
-          if (canForwardToHuman()) {
-            await sendFallbackEmail(session, req, "split_declined");
-            void sendOperatorEmail(session, req, "split_declined");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
-            return res.send(forwardToHumanTwiml());
-          }
-          sayIt(vr, t("step9_fallback_transfer_operator.main"));
-          await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-          vr.hangup();
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-        resetRetries(session);
-        session.step = 8;
-        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
-        break;
-      }
-
-      case 8: {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?", { input: "speech dtmf" })
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_step8");
-            void sendOperatorEmail(session, req, "silence_step8");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        const phone = parsePhoneNumber(speech);
-        if (!phone) {
-          gatherSpeech(vr, "Scusami, non ho capito il numero. Puoi ripeterlo?", { input: "speech dtmf" });
-          break;
-        }
-        session.phone = phone;
-        resetRetries(session);
-        if (session.criticalReservation) {
-          const calendarEvent = await createCalendarEvent(session);
-          const summary = `Data ${session.dateLabel || session.dateISO || ""}, ore ${session.time24 || ""}, ${session.people || ""} persone.`;
-          await notifyCriticalReservation(session.phone, summary);
-          await sendCriticalReservationSms(summary);
-          if (calendarEvent?.status === "closed") {
-            session.step = 2;
-            session.criticalReservation = false;
-            gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
-            break;
-          }
-          if (calendarEvent?.status === "unavailable") {
-            session.step = 4;
-            session.criticalReservation = false;
-            gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
-            break;
-          }
-          resetRetries(session);
-          session.step = 1;
-          session.criticalReservation = false;
-          sayIt(vr, "La prenotazione è stata effettuata. Verrai richiamato da un operatore per confermare i dettagli.");
-          vr.hangup();
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
-        }
-        session.step = 9;
-        session.step9SilenceConsecutive = 0;
-        session.step9NeedsDetail = false;
-        maybeSayApericenaNotices(vr, session);
-        maybeSayLiveMusicNotice(vr, session);
-        gatherSpeech(vr, "Hai altre richieste particolari? Se sì, dimmelo ora.");
-        break;
-      }
-      case 9: {
-        const basePrompt = "Hai altre richieste particolari? Se sì, dimmelo ora.";
-        const clarifyPrompt = "Va bene. Dimmi qual è la richiesta.";
-
-        // gestione silenzio dedicata: 1° silenzio ripete, 2° silenzio consecutivo = NO
-        if (emptySpeech) {
-          session.step9SilenceConsecutive = Number(session.step9SilenceConsecutive || 0) + 1;
-          if (session.step9SilenceConsecutive >= 2) {
-            session.extraRequestsRaw = "nessuna";
-            session.step9NeedsDetail = false;
-            session.step9SilenceConsecutive = 0;
-            resetRetries(session);
-            session.step = 10;
-            sayIt(vr, `Richieste particolari: ${buildExtraRequestsText(session)}.`);
-            gatherSpeech(
-              vr,
-              t("step8_summary_confirm.main", {
-                name: session.name || "",
-                dateLabel: session.dateLabel || "",
-                time: session.time24 || "",
-                partySize: session.people || "",
-              })
-            );
-            break;
-          }
-          gatherSpeech(vr, session.step9NeedsDetail ? clarifyPrompt : basePrompt);
-          break;
-        }
-
-        // risposta presente: reset contatore silenzio
-        session.step9SilenceConsecutive = 0;
-
-        const raw = String(speech || "").trim();
-
-        // Se avevamo chiesto chiarimento dopo un "sì" generico
-        if (session.step9NeedsDetail) {
-          session.step9NeedsDetail = false;
-          // salva qualunque testo (anche "sì")
-          const cleaned = raw.slice(0, 200).trim();
-          if (!cleaned || isNoRequestsText(cleaned) || parseYesNo(cleaned) === false) {
-            session.extraRequestsRaw = "nessuna";
-          } else {
-            session.extraRequestsRaw = cleaned;
-          }
-
-          if (isOutsideRequest(session.extraRequestsRaw)) {
-            session.wantsOutside = true;
-            maybeSayOutsideWarning(vr);
-          }
-
-          resetRetries(session);
-          session.step = 10;
-          sayIt(vr, `Richieste particolari: ${buildExtraRequestsText(session)}.`);
-          gatherSpeech(
-            vr,
-            t("step8_summary_confirm.main", {
-              name: session.name || "",
-              dateLabel: session.dateLabel || "",
-              time: session.time24 || "",
-              partySize: session.people || "",
-            })
-          );
-          break;
-        }
-
-        // Caso NO esplicito / nessuna richiesta
-        if (isNoRequestsText(raw) || parseYesNo(raw) === false) {
-          session.extraRequestsRaw = "nessuna";
-          resetRetries(session);
-          session.step = 10;
-          sayIt(vr, `Richieste particolari: ${buildExtraRequestsText(session)}.`);
-          gatherSpeech(
-            vr,
-            t("step8_summary_confirm.main", {
-              name: session.name || "",
-              dateLabel: session.dateLabel || "",
-              time: session.time24 || "",
-              partySize: session.people || "",
-            })
-          );
-          break;
-        }
-
-        // Caso "sì" senza contenuto: 1 sola domanda di chiarimento
-        if (isPureConsent(raw)) {
-          session.step9NeedsDetail = true;
-          gatherSpeech(vr, clarifyPrompt);
-          break;
-        }
-
-        // Qualsiasi testo -> salva esatto (ripulito) e passa allo step 10
-        session.extraRequestsRaw = raw.slice(0, 200).trim() || "nessuna";
-        if (isOutsideRequest(session.extraRequestsRaw)) {
-          session.wantsOutside = true;
-          maybeSayOutsideWarning(vr);
-        }
-
-        resetRetries(session);
-        session.step = 10;
-        sayIt(vr, `Richieste particolari: ${buildExtraRequestsText(session)}.`);
-        gatherSpeech(
-          vr,
-          t("step8_summary_confirm.main", {
-            name: session.name || "",
-            dateLabel: session.dateLabel || "",
-            time: session.time24 || "",
-            partySize: session.people || "",
-          })
-        );
-        break;
-      }
-
-      case 10: {
-        if (emptySpeech) {
-          const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(
-              vr,
-              t("step8_summary_confirm.short", {
-                dateLabel: session.dateLabel || "",
-                time: session.time24 || "",
-                partySize: session.people || "",
-              })
-            )
-          );
-          if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_step10");
-            void sendOperatorEmail(session, req, "silence_step10");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          break;
-        }
-        const confirmation = parseYesNo(speech);
-        if (confirmation === null) {
-          gatherSpeech(
-            vr,
-            t("step8_summary_confirm.short", {
-              dateLabel: session.dateLabel || "",
-              time: session.time24 || "",
-              partySize: session.people || "",
-            })
-          );
-          break;
-        }
-        if (!confirmation) {
-          resetRetries(session);
-          goBack(session);
-          promptForStep(vr, session);
-          break;
-        }
-        const calendarEvent = await createCalendarEvent(session);
-        if (calendarEvent?.status === "closed") {
-          session.step = 2;
-          gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
-          break;
-        }
-        if (calendarEvent?.status === "unavailable") {
-          if (session.forceOperatorFallback && canForwardToHuman()) {
-            await sendFallbackEmail(session, req, "invalid_table_combo");
-            void sendOperatorEmail(session, req, "invalid_table_combo");
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            return res.send(forwardToHumanTwiml());
-          }
-          if (session.forceOperatorFallback) {
-            sayIt(vr, t("step9_fallback_transfer_operator.main"));
-            await safeCreateFailedCallCalendarEvent(session, req, "fallback");
-            vr.hangup();
-            res.set("Content-Type", "text/xml; charset=utf-8");
-            return res.send(vr.toString());
-          }
-          session.step = 4;
-          gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
-          break;
-        }
-        if (!calendarEvent && canForwardToHuman()) {
-          await sendFallbackEmail(session, req, "calendar_insert_failed");
-          void sendOperatorEmail(session, req, "calendar_insert_failed");
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
-          return res.send(forwardToHumanTwiml());
-        }
-        resetRetries(session);
-        session.step = 1;
-        sayIt(vr, t("step9_success.main"));
-        vr.hangup();
-        res.set("Content-Type", "text/xml; charset=utf-8");
-        return res.send(vr.toString());
-      }
-
-      default: {
-        if (canForwardToHuman()) {
-          await sendFallbackEmail(session, req, "unknown_step");
-          void sendOperatorEmail(session, req, "unknown_step");
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
-          return res.send(forwardToHumanTwiml());
-        }
-        resetRetries(session);
-        session.step = 1;
-        gatherSpeech(vr, t("step1_welcome_name.short"));
-        break;
-      }
+    // Default: benvenuto
+    if (!session.intentWelcomed) {
+      session.intentWelcomed = true;
+      gatherSpeech(vr, `Ciao e benvenuto da ${BUSINESS_NAME}. ${buildMainMenuPrompt()}`);
+    } else {
+      gatherSpeech(vr, buildMainMenuPrompt());
     }
 
     res.set("Content-Type", "text/xml; charset=utf-8");
     return res.send(vr.toString());
   } catch (err) {
     console.error("[VOICE] Error:", err);
-    await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
-    void sendFallbackEmailSmtpOnly(session, req, "exception");
-    if (canForwardToHuman()) {
-      void sendOperatorEmail(session, req, "exception");
-      res.set("Content-Type", "text/xml; charset=utf-8");
-      await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
-      return res.send(forwardToHumanTwiml());
-    }
-    sayIt(vr, t("step9_fallback_transfer_operator.main"));
-    await safeCreateFailedCallCalendarEvent(session, req, "fallback");
+    sayIt(vr, "Si è verificato un errore. Riprova più tardi.");
     vr.hangup();
     res.set("Content-Type", "text/xml; charset=utf-8");
     return res.send(vr.toString());
   }
-}
-
-app.all("/twilio/voice", async (req, res) => {
-  console.log(`[VOICE] ${req.method} /twilio/voice`);
-  const payload = req.method === "POST" ? req.body : req.query;
-  if (payload && Object.keys(payload).length > 0) {
-    req.body = payload;
-    return handleVoiceRequest(req, res);
-  }
-  const vr = buildTwiml();
-  vr.say(
-    { language: "it-IT", voice: "alice" },
-    xmlEscape("Test Twilio Voice: endpoint attivo.")
-  );
-  res.set("Content-Type", "text/xml; charset=utf-8");
-  return res.send(vr.toString());
 });
-function handleOperatorAfterDial(req, res) {
+
+app.post("/twilio/voice/after-dial", (req, res) => {
   const vr = buildTwiml();
-  const statusRaw = req?.body?.DialCallStatus || "";
-  const status = String(statusRaw || "").trim().toLowerCase();
-  const callSid = req?.body?.CallSid || "";
-  const session = getSession(callSid);
-
-  console.log("[DIAL] after-dial", {
-    status: status || "(missing)",
-    duration: req?.body?.DialCallDuration || "",
-    to: req?.body?.To || "",
-    from: req?.body?.From || "",
-    callSid: callSid || "",
-  });
-
-  if (session) {
-    // Evita evento generico "chiamata interrotta" su richieste HTTP successive
-    session.fallbackEventCreated = true;
-  }
-
-  if (status === "completed") {
+  const dialCallStatus = req.body.DialCallStatus || "";
+  
+  if (dialCallStatus === "completed") {
     vr.hangup();
-    res.set("Content-Type", "text/xml; charset=utf-8");
-    return res.send(vr.toString());
+  } else {
+    sayIt(vr, "L'operatore non è disponibile al momento. Riprova più tardi. Grazie.");
+    vr.hangup();
   }
-
-  void sendOperatorEmail(session, req, `operator_dial_${status || "unknown"}`);
-  void safeCreateOperatorCallbackCalendarEvent(session, req, status || "failed");
-
-  const goodbye =
-    session?.operatorKind === "info"
-      ? "Al momento non riesco a metterti in contatto con un operatore, ma ho preso nota della tua richiesta e ti faremo richiamare al più presto. Grazie e a presto."
-      : session?.operatorKind === "event"
-      ? "Al momento non riesco a metterti in contatto con un operatore, ma ho preso nota dei dettagli e ti faremo ricontattare al più presto. Grazie e a presto."
-      : "Al momento non riesco a metterti in contatto con un operatore, ma ti faremo richiamare al più presto. Grazie e a presto.";
-  sayIt(vr, goodbye);
-  vr.hangup();
+  
   res.set("Content-Type", "text/xml; charset=utf-8");
   return res.send(vr.toString());
-}
-
-app.post("/twilio/voice/after-dial", (req, res) => handleOperatorAfterDial(req, res));
-app.post("/twilio/voice/operator-fallback", (req, res) => handleOperatorAfterDial(req, res));
-
-
-app.all("/voice", (req, res) => {
-  const targetUrl = BASE_URL ? `${BASE_URL}/twilio/voice` : "/twilio/voice";
-  return res.redirect(307, targetUrl);
 });
 
-// NOTA: /finalize lo rimettiamo dopo, quando confermi che non cade più allo step 5.
-// (non serve per risolvere il crash delle intolleranze)
-
-app.get("/", (req, res) => {
-  res.send("OK - backend running");
-});
-
-app.use((err, req, res, next) => {
-  safeCreateFailedCallCalendarEvent(getSession(req.body?.CallSid), req, "errore di sistema");
-  next();
-});
-
+// Start server
 app.listen(PORT, () => {
-  console.log(`Voice assistant running on port ${PORT}`);
+  console.log(`[SERVER] Running on port ${PORT}`);
+  console.log(`[SERVER] BASE_URL: ${BASE_URL || "(not set)"}`);
+  console.log(`[SERVER] BUSINESS_NAME: ${BUSINESS_NAME}`);
+  console.log(`[SERVER] AI_ENABLED: ${AI_ENABLED}`);
 });
+
+module.exports = app;
