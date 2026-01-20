@@ -2126,7 +2126,7 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       session.manageTime24 = parseTimeIT(speech);
     }
     session.operatorState = "manage_cancel_search";
-    // fallthrough
+    return handleManageBookingFlow(session, req, vr, speech, false);
   }
 
   if (state === "manage_cancel_search") {
@@ -2264,7 +2264,7 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       session.manageSurname = speech.trim().slice(0, 60);
     }
     session.operatorState = "manage_modify_search";
-    // fallthrough
+    return handleManageBookingFlow(session, req, vr, speech, false);
   }
 
   if (state === "manage_modify_search") {
