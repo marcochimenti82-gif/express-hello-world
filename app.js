@@ -68,7 +68,7 @@ const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
 const YES_WORDS = ["si", "sì", "certo", "confermo", "ok", "va bene", "perfetto", "esatto"];
-const NO_WORDS = ["no", "non", "annulla", "cancella", "negativo"];
+const NO_WORDS = ["no", "negativo", "annulla", "cancella", "stop", "basta", "non voglio", "non confermo", "non va bene", "non procedere", "non fare"];
 const CANCEL_WORDS = ["annulla", "annullare", "cancella", "cancellare", "disdici", "disdire"];
 
 // ======================= OPENING HOURS =======================
@@ -381,11 +381,12 @@ function sanitizeForTTS(text) {
   s = s.replace(/\bnr\b/gi, "numero");
   s = s.replace(/\bn[.°]?\b/gi, "numero");
 
+  // simboli comuni
+  s = s.replace(/€/g, " euro ");
+  s = s.replace(/\+/g, " più ");
+
   // orari: 20:30 -> 20 e 30 (TTS più naturale)
   s = s.replace(/(\b\d{1,2})[:.](\d{2}\b)/g, "$1 e $2");
-
-  // evita pronunce strane di "+"
-  s = s.replace(/\+/g, " più ");
 
   // pulizia spazi
   s = s.replace(/\s+/g, " ").trim();
@@ -399,7 +400,8 @@ function sayIt(response, text) {
 
 function gatherSpeech(response, promptText, opts = {}) {
   const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice` : "/twilio/voice";
-  const gather = response.gather({
+
+  const gatherOpts = {
     input: opts.input || "speech",
     language: "it-IT",
     speechTimeout: opts.speechTimeout || "auto",
@@ -408,15 +410,28 @@ function gatherSpeech(response, promptText, opts = {}) {
     speechModel: "phone_call",
     action: actionUrl,
     method: "POST",
-  });
+    // migliora UX: l'utente può interrompere la voce e parlare subito
+    bargeIn: opts.bargeIn === undefined ? true : Boolean(opts.bargeIn),
+  };
+
+  // opzionale: abilita DTMF (es. conferme sì/no)
+  if (Number.isFinite(Number(opts.numDigits))) gatherOpts.numDigits = Number(opts.numDigits);
+  if (typeof opts.finishOnKey === "string") gatherOpts.finishOnKey = opts.finishOnKey;
+
+  const gather = response.gather(gatherOpts);
+
   gather.say({ language: "it-IT" }, xmlEscape(sanitizeForTTS(promptText)));
+
   if (opts.hints && Array.isArray(opts.hints) && opts.hints.length) {
     gather.speechHints(opts.hints);
   }
+
   response.append(gather);
+
   // se l'utente non risponde, ritorna comunque allo stesso webhook per gestire il "silenzio"
   response.redirect({ method: "POST" }, actionUrl);
 }
+
 
 
 function isValidPhoneE164(s) {
@@ -1976,18 +1991,18 @@ async function checkAvailabilityQuickVoice(session, dateISO, people, time24) {
   if (res?.status === "ok") {
     return {
       handled: true,
-      answer: `Sì, in linea di massima c'e' disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ${time24}. Se vuoi, possiamo procedere con la prenotazione.`,
+      answer: `Sì, in linea di massima c'e' disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ore ${time24}. Se vuoi, possiamo procedere con la prenotazione.`,
     };
   }
   if (res?.status === "needs_split" || res?.status === "needs_outside") {
     return {
       handled: true,
-      answer: `Potrebbe esserci disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ${time24}, ma potremmo dovervi sistemare su tavoli separati o anche in esterno. Se vuoi, posso metterti in contatto con un operatore.`,
+      answer: `Potrebbe esserci disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ore ${time24}, ma potremmo dovervi sistemare su tavoli separati o anche in esterno. Se vuoi, posso metterti in contatto con un operatore.`,
     };
   }
   return {
     handled: true,
-    answer: `Al momento non risulta disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ${time24}. Vuoi provare un altro orario?`,
+    answer: `Al momento non risulta disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ore ${time24}. Vuoi provare un altro orario?`,
   };
 }
 
@@ -2199,15 +2214,15 @@ async function tryAnswerInfoQuestionVoice(questionRaw) {
       return { handled: true, reply: `Mi dispiace, per ${formatDateLabel(dateISO)} risulta chiuso.` };
     }
     if (availability.status === "unavailable") {
-      return { handled: true, reply: `Mi dispiace, per ${formatDateLabel(dateISO)} alle ${time24} non vedo disponibilità.` };
+      return { handled: true, reply: `Mi dispiace, per ${formatDateLabel(dateISO)} alle ore ${time24} non vedo disponibilità.` };
     }
     if (availability.status === "needs_split") {
-      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ${time24} c'è disponibilità, ma probabilmente in tavoli separati.` };
+      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ore ${time24} c'è disponibilità, ma probabilmente in tavoli separati.` };
     }
     if (availability.status === "needs_outside") {
-      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.` };
+      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ore ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.` };
     }
-    return { handled: true, reply: `Sì, per ${formatDateLabel(dateISO)} alle ${time24} vedo disponibilità.` };
+    return { handled: true, reply: `Sì, per ${formatDateLabel(dateISO)} alle ore ${time24} vedo disponibilità.` };
   }
 
   // Natale
@@ -2376,12 +2391,12 @@ async function handleInfoFlow(session, req, vr, speech, emptySpeech) {
       availability.status === "closed"
         ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} risulta chiuso.`
         : availability.status === "unavailable"
-        ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} alle ${time24} non vedo disponibilità.`
+        ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} alle ore ${time24} non vedo disponibilità.`
         : availability.status === "needs_split"
-        ? `Per ${formatDateLabel(payload.dateISO)} alle ${time24} c'è disponibilità, ma probabilmente in tavoli separati.`
+        ? `Per ${formatDateLabel(payload.dateISO)} alle ore ${time24} c'è disponibilità, ma probabilmente in tavoli separati.`
         : availability.status === "needs_outside"
-        ? `Per ${formatDateLabel(payload.dateISO)} alle ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.`
-        : `Sì, per ${formatDateLabel(payload.dateISO)} alle ${time24} vedo disponibilità.`;
+        ? `Per ${formatDateLabel(payload.dateISO)} alle ore ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.`
+        : `Sì, per ${formatDateLabel(payload.dateISO)} alle ore ${time24} vedo disponibilità.`;
 
     sayIt(vr, reply);
     vr.hangup();
@@ -2597,7 +2612,7 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       return { kind: "vr", twiml: vr.toString() };
     }
     if (yn !== true) {
-      gatherSpeech(vr, "Non ho capito. Vuoi annullare la prenotazione? Rispondi sì o no.");
+      gatherSpeech(vr, "Non ho capito. Vuoi annullare la prenotazione? Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
       return { kind: "vr", twiml: vr.toString() };
     }
 
@@ -2605,9 +2620,8 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     if (!ok) {
       return forwardBecause(`Richiesta annullamento prenotazione: errore aggiornamento (evento ${session.manageCandidateEventId || ""})`);
     }
-    sayIt(vr, "Perfetto. Ho annullato la prenotazione. Grazie e a presto.");
-    vr.hangup();
-    session.operatorState = null;
+    softReturnToMenu("Perfetto. Ho annullato la prenotazione.");
+    return { kind: "vr", twiml: vr.toString() };
     return { kind: "vr", twiml: vr.toString() };
   }
 
@@ -2894,10 +2908,23 @@ function extractNotesHint(speech) {
 }
 
 function parseYesNo(speech) {
-  const tt = normalizeText(speech);
+  const raw = String(speech || "").trim();
+  const tt = normalizeText(raw);
   if (!tt) return null;
+
+  // DTMF: 1 = sì, 2 = no
+  if (tt === "1") return true;
+  if (tt === "2") return false;
+
+  // sì/no via voce
   if (YES_WORDS.some((w) => tt.includes(w))) return true;
   if (NO_WORDS.some((w) => tt.includes(w))) return false;
+
+  // gestisci frasi tipo "non voglio", "non procedere"
+  if (tt.startsWith("non ") && (tt.includes("voglio") || tt.includes("proced") || tt.includes("conferm") || tt.includes("annull") || tt.includes("fare"))) {
+    return false;
+  }
+
   return null;
 }
 
@@ -4535,7 +4562,7 @@ async function handleVoiceRequest(req, res) {
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(vr.toString());
           }
-          gatherSpeech(vr, offerBookingPrompt);
+          gatherSpeech(vr, offerBookingPrompt + " Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(vr.toString());
         }
@@ -4571,7 +4598,7 @@ async function handleVoiceRequest(req, res) {
           if (session.infoMoreSilence >= 2) {
             session.operatorState = "info_offer_booking";
             session.infoOfferTries = 0;
-            gatherSpeech(vr, offerBookingPrompt);
+            gatherSpeech(vr, offerBookingPrompt + " Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(vr.toString());
           }
@@ -4585,7 +4612,7 @@ async function handleVoiceRequest(req, res) {
         if (isNoLike(speech)) {
           session.operatorState = "info_offer_booking";
           session.infoOfferTries = 0;
-          gatherSpeech(vr, offerBookingPrompt);
+          gatherSpeech(vr, offerBookingPrompt + " Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(vr.toString());
         }
