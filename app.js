@@ -68,7 +68,7 @@ const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) : null;
 
 const YES_WORDS = ["si", "sì", "certo", "confermo", "ok", "va bene", "perfetto", "esatto"];
-const NO_WORDS = ["no", "non", "annulla", "cancella", "negativo"];
+const NO_WORDS = ["no", "negativo", "annulla", "cancella", "stop", "basta", "non voglio", "non confermo", "non va bene", "non procedere", "non fare"];
 const CANCEL_WORDS = ["annulla", "annullare", "cancella", "cancellare", "disdici", "disdire"];
 
 // ======================= OPENING HOURS =======================
@@ -371,13 +371,37 @@ function buildTwiml() {
   return new twilio.twiml.VoiceResponse();
 }
 
-function sayIt(response, text) {
-  response.say({ language: "it-IT" }, xmlEscape(text));
+
+function sanitizeForTTS(text) {
+  let s = String(text || "");
+
+  // abbreviazioni comuni
+  s = s.replace(/\btav\b/gi, "tavolo");
+  s = s.replace(/\bpax\b/gi, "persone");
+  s = s.replace(/\bnr\b/gi, "numero");
+  s = s.replace(/\bn[.°]?\b/gi, "numero");
+
+  // simboli comuni
+  s = s.replace(/€/g, " euro ");
+  s = s.replace(/\+/g, " più ");
+
+  // orari: 20:30 -> 20 e 30 (TTS più naturale)
+  s = s.replace(/(\b\d{1,2})[:.](\d{2}\b)/g, "$1 e $2");
+
+  // pulizia spazi
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
 }
+
+function sayIt(response, text) {
+  response.say({ language: "it-IT" }, xmlEscape(sanitizeForTTS(text)));
+}
+
 
 function gatherSpeech(response, promptText, opts = {}) {
   const actionUrl = BASE_URL ? `${BASE_URL}/twilio/voice` : "/twilio/voice";
-  const gather = response.gather({
+
+  const gatherOpts = {
     input: opts.input || "speech",
     language: "it-IT",
     speechTimeout: opts.speechTimeout || "auto",
@@ -386,10 +410,29 @@ function gatherSpeech(response, promptText, opts = {}) {
     speechModel: "phone_call",
     action: actionUrl,
     method: "POST",
-  });
-  gather.say({ language: "it-IT" }, xmlEscape(promptText));
+    // migliora UX: l'utente può interrompere la voce e parlare subito
+    bargeIn: opts.bargeIn === undefined ? true : Boolean(opts.bargeIn),
+  };
+
+  // opzionale: abilita DTMF (es. conferme sì/no)
+  if (Number.isFinite(Number(opts.numDigits))) gatherOpts.numDigits = Number(opts.numDigits);
+  if (typeof opts.finishOnKey === "string") gatherOpts.finishOnKey = opts.finishOnKey;
+
+  const gather = response.gather(gatherOpts);
+
+  gather.say({ language: "it-IT" }, xmlEscape(sanitizeForTTS(promptText)));
+
+  if (opts.hints && Array.isArray(opts.hints) && opts.hints.length) {
+    gather.speechHints(opts.hints);
+  }
+
+  response.append(gather);
+
+  // se l'utente non risponde, ritorna comunque allo stesso webhook per gestire il "silenzio"
   response.redirect({ method: "POST" }, actionUrl);
 }
+
+
 
 function isValidPhoneE164(s) {
   return /^\+\d{8,15}$/.test(String(s || "").trim());
@@ -755,11 +798,14 @@ function handleSilence(session, vr, promptFn) {
 
 function normalizeText(s) {
   return String(s || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
     .trim()
     .toLowerCase()
-    .replace(/[.,!?]/g, "")
+    .replace(/[.,!?;:]/g, "")
     .replace(/\s+/g, " ");
 }
+
 
 function isPureConsent(speech) {
   const tt = normalizeText(speech);
@@ -1000,11 +1046,8 @@ function promptForStep(vr, session) {
 
 // ====== parsing basilari (per arrivare al punto: FIX crash step 5) ======
 function parseTimeIT(speech) {
-  const raw = String(speech || "").trim();
-  const tt = normalizeText(raw);
-
-  // HH:MM (anche con punto) o "HH MM"
-  const hm = tt.match(/(\d{1,2})\s*[:\.]\s*(\d{2})/);
+  const tt = normalizeText(speech);
+  const hm = tt.match(/(\d{1,2})[:\s](\d{2})/);
   if (hm) {
     const hh = Number(hm[1]);
     const mm = Number(hm[2]);
@@ -1012,23 +1055,13 @@ function parseTimeIT(speech) {
       return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
     }
   }
-
-  // "alle 21" / "ore 21" / "ora 21"
-  const ctxH = tt.match(/\b(?:alle|ore|ora|all)\s*(\d{1,2})\b/);
-  if (ctxH) {
-    const hh = Number(ctxH[1]);
+  const onlyH = tt.match(/\b(\d{1,2})\b/);
+  if (onlyH) {
+    const hh = Number(onlyH[1]);
     if (hh >= 0 && hh <= 23) return `${String(hh).padStart(2, "0")}:00`;
   }
-
-  // solo numero (input composto solo da cifre)
-  if (/^\d{1,2}$/.test(raw)) {
-    const hh = Number(raw);
-    if (hh >= 0 && hh <= 23) return `${String(hh).padStart(2, "0")}:00`;
-  }
-
   return null;
 }
-
 
 function parseDateIT(speech) {
   const tt = normalizeText(speech).replace(/[,\.]/g, " ").replace(/\s+/g, " ").trim();
@@ -1263,34 +1296,328 @@ function extractDateISOFromEvent(ev) {
   return String(dt).slice(0, 10);
 }
 
-async function findBookingEventMatch({ dateISO, time24, surname }) {
-  const base = await findBookingCandidatesByDate(dateISO);
-  const bySurname = filterCandidatesBySurname(base, surname);
-  const candidates = bySurname;
-  const byTime = filterCandidatesByTime(bySurname, time24);
-  const match = (byTime && byTime.length ? byTime[0] : candidates[0]) || null;
-  return { match, candidates };
+
+function extractSurnameFromSpeech(raw) {
+  const t = normalizeText(raw);
+  if (!t) return "";
+  // rimuovi riempitivi/filler che spesso l'ASR mette prima del cognome
+  const fillers = [
+    "si",
+    "ok",
+    "eh",
+    "allora",
+    "diciamo",
+    "insomma",
+    "credo",
+    "penso",
+    "forse",
+    "mi sembra",
+    "sembra",
+    "dovrebbe",
+    "dovrebbe essere",
+    "dovrebbe esser",
+    "mi pare",
+    "pare",
+    "praticamente",
+    "cioe",
+    "cioè",
+    "tipo",
+    "beh",
+  ];
+
+  let s = ` ${t} `;
+  for (const f of fillers) {
+    const ff = normalizeText(f);
+    if (!ff) continue;
+    // rimuovi solo se appare come parola intera
+    s = s.replace(new RegExp(`\\b${ff}\\b`, "g"), " ");
+  }
+  s = s.replace(/\s+/g, " ").trim();
+
+  // se rimane solo consenso/stopwords, considera vuoto
+  if (!s || YES_WORDS.includes(s) || NO_WORDS.includes(s)) return "";
+
+  // tieni gli ultimi 1-3 token (gestisce cognomi composti: "de luca", "di marco")
+  const tokens = s.split(" ").filter(Boolean);
+  if (!tokens.length) return "";
+
+  const connectors = new Set(["de", "di", "del", "della", "dello", "dei", "da", "la", "lo"]);
+  let keep = 1;
+  // se l'ultimo token è corto e connettivo, aumenta
+  for (let i = tokens.length - 2; i >= 0 && keep < 3; i--) {
+    if (connectors.has(tokens[i])) keep += 1;
+    else break;
+  }
+
+  const picked = tokens.slice(-keep).join(" ").trim();
+  return picked;
 }
 
+function levenshteinDistance(a, b) {
+  const s = String(a || "");
+  const t = String(b || "");
+  const n = s.length;
+  const m = t.length;
+  if (!n) return m;
+  if (!m) return n;
+
+  const dp = new Array(m + 1);
+  for (let j = 0; j <= m; j++) dp[j] = j;
+
+  for (let i = 1; i <= n; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= m; j++) {
+      const tmp = dp[j];
+      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
+      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + cost);
+      prev = tmp;
+    }
+  }
+  return dp[m];
+}
+
+function similarityRatio(a, b) {
+  const s = normalizeText(a);
+  const t = normalizeText(b);
+  if (!s || !t) return 0;
+  if (s === t) return 1;
+  if (s.includes(t) || t.includes(s)) return 0.92;
+  const d = levenshteinDistance(s, t);
+  const denom = Math.max(s.length, t.length) || 1;
+  return 1 - d / denom;
+}
+
+function extractPeopleFromSummary(summary) {
+  const s = String(summary || "");
+  const m = s.match(/,\s*(\d+)\s*pax/i);
+  if (m) return Number(m[1]);
+  return null;
+}
+
+function extractPeopleFromDescription(desc) {
+  const s = String(desc || "");
+  const m = s.match(/Persone:\s*(\d+)/i);
+  if (m) return Number(m[1]);
+  return null;
+}
+
+function extractPhoneFromDescription(desc) {
+  const s = String(desc || "");
+  const m = s.match(/Telefono:\s*([^\n]+)/i);
+  if (!m) return "";
+  return String(m[1] || "").trim();
+}
+
+function extractNameFromSummary(summary) {
+  // formato tipico: "Ore 20:30, tav T12, Mario Rossi, 4 pax"
+  const s = String(summary || "");
+  const parts = s.split(",");
+  if (parts.length < 3) return "";
+  // parte 0: Ore..., parte 1: tav..., parte 2: nome
+  return String(parts[2] || "").trim();
+}
+
+function extractSurnameFromEvent(ev) {
+  const desc = String(ev?.description || "");
+  const nameLine = desc.match(/Nome:\s*([^\n]+)/i);
+  const fullName = nameLine ? String(nameLine[1] || "").trim() : extractNameFromSummary(ev?.summary || "");
+  if (!fullName) return "";
+  const tokens = normalizeText(fullPhoneCleanup(fullName)).split(" ").filter(Boolean);
+  if (!tokens.length) return "";
+  // cognome = ultimi 1-2 token (gestione composti)
+  const connectors = new Set(["de", "di", "del", "della", "dello", "dei", "da", "la", "lo"]);
+  let keep = 1;
+  if (tokens.length >= 2 && connectors.has(tokens[tokens.length - 2])) keep = 2;
+  return tokens.slice(-keep).join(" ");
+}
+
+function fullPhoneCleanup(s) {
+  return String(s || "").replace(/[0-9+]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function extractTime24FromEvent(ev) {
+  // preferisci summary "Ore 20:30", fallback su start.dateTime
+  const sum = String(ev?.summary || "");
+  const m = sum.match(/Ore\s*(\d{1,2}:\d{2})/i);
+  if (m) return m[1];
+  const dt = ev?.start?.dateTime;
+  if (dt) return parseTimeIT(dt) || null;
+  return null;
+}
+
+function extractPhoneE164FromEvent(ev) {
+  const raw = extractPhoneFromDescription(ev?.description || "");
+  const parsed = parsePhoneNumber(raw);
+  return isValidPhoneE164(parsed) ? parsed : "";
+}
+
+function parsePhoneLast3FromSpeech(raw) {
+  const t = normalizeText(raw);
+  if (!t) return "";
+
+  // mapping parole->digit
+  const map = {
+    zero: "0",
+    uno: "1",
+    una: "1",
+    due: "2",
+    tre: "3",
+    quattro: "4",
+    cinque: "5",
+    sei: "6",
+    sette: "7",
+    otto: "8",
+    nove: "9",
+  };
+
+  let s = t;
+  for (const [w, d] of Object.entries(map)) {
+    s = s.replace(new RegExp(`\\b${w}\\b`, "g"), d);
+  }
+
+  // prendi solo cifre
+  const digits = s.replace(/\D/g, "");
+  if (digits.length >= 3) return digits.slice(-3);
+  return "";
+}
+
+function formatPhoneForVoiceFull(phoneE164) {
+  let p = String(phoneE164 || "").trim();
+  if (!p) return "";
+  // rimuovi +39 o 39 iniziale
+  p = p.replace(/^\+?39/, "");
+  // lascia solo cifre
+  const digits = p.replace(/\D/g, "");
+  if (!digits) return "";
+  return digits.split("").join(" ");
+}
+
+async function findBookingEventMatch({ dateISO, time24, surname, people, phoneLast3, callerPhoneE164 }) {
+  const candidates = await findBookingCandidatesByDate(dateISO);
+
+  const targetSurname = normalizeText(surname || "");
+  const targetTime = time24 ? String(time24) : "";
+  const targetPeople = Number.isFinite(Number(people)) ? Number(people) : null;
+  const targetLast3 = String(phoneLast3 || "").replace(/\D/g, "").slice(-3) || "";
+  const caller = isValidPhoneE164(callerPhoneE164) ? callerPhoneE164 : "";
+
+  const scored = (candidates || []).map((ev) => {
+    const evSurname = extractSurnameFromEvent(ev);
+    const evTime = extractTime24FromEvent(ev);
+    const evPeople = extractPeopleFromDescription(ev?.description) || extractPeopleFromSummary(ev?.summary);
+    const evPhone = extractPhoneE164FromEvent(ev);
+
+    let score = 0;
+
+    // cognome: fuzzy
+    if (targetSurname) {
+      score += similarityRatio(targetSurname, evSurname) * 0.55;
+    } else {
+      // se non ho cognome, piccolo bonus per non penalizzare troppo
+      score += 0.05;
+    }
+
+    // orario
+    if (targetTime && evTime) {
+      if (targetTime === evTime) score += 0.22;
+      else {
+        // tolleranza 15 min
+        const [h1, m1] = targetTime.split(":").map(Number);
+        const [h2, m2] = evTime.split(":").map(Number);
+        if (Number.isFinite(h1) && Number.isFinite(m1) && Number.isFinite(h2) && Number.isFinite(m2)) {
+          const diff = Math.abs((h1 * 60 + m1) - (h2 * 60 + m2));
+          if (diff <= 15) score += 0.12;
+        }
+      }
+    }
+
+    // persone
+    if (targetPeople && Number.isFinite(evPeople)) {
+      if (Number(evPeople) === targetPeople) score += 0.15;
+      else if (Math.abs(Number(evPeople) - targetPeople) === 1) score += 0.08;
+    }
+
+    // telefono (disambiguazione)
+    let phoneMatched = false;
+    if (targetLast3 && evPhone) {
+      const evDigits = evPhone.replace(/\D/g, "").replace(/^39/, "");
+      if (evDigits.endsWith(targetLast3)) {
+        score += 0.25;
+        phoneMatched = true;
+      }
+    } else if (caller && evPhone && evPhone === caller) {
+      score += 0.18; // aiuto "silenzioso" senza chiederlo
+    }
+
+    return {
+      ev,
+      score,
+      evSurname,
+      evTime,
+      evPeople: Number.isFinite(evPeople) ? Number(evPeople) : null,
+      evPhone,
+      phoneMatched,
+    };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const best = scored[0] || null;
+  const second = scored[1] || null;
+
+  // se non ho candidati
+  if (!best) return { match: null, candidates: [], needsPeople: false, needsPhone: false };
+
+  // soglie
+  const bestScore = best.score || 0;
+  const secondScore = second ? second.score || 0 : 0;
+  const gap = bestScore - secondScore;
+
+  const isConfident = bestScore >= 0.60 && (gap >= 0.14 || scored.length === 1);
+
+  if (isConfident) {
+    return {
+      match: best.ev,
+      candidates: scored.map((x) => x.ev),
+      needsPeople: false,
+      needsPhone: false,
+      usedPhone: Boolean(targetLast3 && best.phoneMatched),
+      matchPhone: best.evPhone || "",
+    };
+  }
+
+  // ambiguo: chiedi persone, poi ultime 3 cifre (solo se serve)
+  const needsPeople = !targetPeople;
+  const needsPhone = !needsPeople && !targetLast3;
+
+  return {
+    match: null,
+    candidates: scored.map((x) => x.ev).slice(0, 5),
+    needsPeople,
+    needsPhone,
+  };
+}
+
+
 async function patchBookingAsCanceled(eventId, dateISO, originalEvent) {
-  if (!GOOGLE_CALENDAR_ID || !eventId || !dateISO) return null;
+  if (!GOOGLE_CALENDAR_ID || !eventId) return null;
   const calendar = buildCalendarClient();
   if (!calendar) return null;
 
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const oldDateISO = String(originalEvent?.start?.dateTime || originalEvent?.start?.date || dateISO || "").slice(0, 10) || dateISO;
+  const useDateISO = oldDateISO || dateISO;
+  if (!useDateISO) return null;
+
   const originalSummary = String(originalEvent?.summary || "");
   const stripped = stripOreETavolo(originalSummary);
-  const newSummary = stripped ? `Annullato - ${stripped}` : "Annullato - Prenotazione";
+  const cleaned = stripped.replace(/^annullat[oa]\s*-\s*/i, "").trim();
+  const newSummary = `Annullato - ${cleaned || "prenotazione"}`;
 
-  const oldDesc = String(originalEvent?.description || "").trim();
-  const newDesc = [
-    "ANNULLAMENTO PRENOTAZIONE",
-    `Data annullamento: ${formatISODateInTimeZone(new Date(), GOOGLE_CALENDAR_TZ || "Europe/Rome")}`,
-    "",
-    "DESCRIZIONE PRECEDENTE:",
-    oldDesc || "-",
-    "",
-    "Tavolo: ",
-  ].join("\n");
+  const newDesc = String(originalEvent?.description || "")
+    .replace(/Tavolo:\s*[^\n]*/i, "Tavolo: ")
+    .trim();
 
   try {
     const result = await calendar.events.patch({
@@ -1299,17 +1626,19 @@ async function patchBookingAsCanceled(eventId, dateISO, originalEvent) {
       requestBody: {
         summary: newSummary,
         description: newDesc,
-        start: { date: dateISO },
-        end: { date: getNextDateISO(dateISO) },
+        start: { date: useDateISO },
+        end: { date: getNextDateISO(useDateISO) },
       },
     });
-    await upsertAvailabilityEvent(dateISO);
+    // rigenera tavoli disponibili
+    await upsertAvailabilityEvent(useDateISO);
     return result?.data || null;
   } catch (err) {
-    console.error("[GOOGLE] Cancel booking patch failed:", err);
+    console.error("[GOOGLE] patchBookingAsCanceled failed:", err);
     return null;
   }
 }
+
 
 async function computeTableSelectionForChange({ dateISO, time24, people, ignoreEventId }) {
   const events = await listCalendarEvents(dateISO);
@@ -1476,21 +1805,38 @@ function resolveChristmasISO() {
 }
 
 function isMusicEventItem(event) {
-  const s = String(event?.summary || "").toLowerCase();
+  const summary = String(event?.summary || "").trim();
+  if (!summary) return false;
+
+  const s = summary.toLowerCase();
   const d = String(event?.description || "").toLowerCase();
-  const blob = `${s} ${d}`;
-  return (
+
+  // escludi eventi di sistema / servizio
+  if (s.includes("tavoli disponibili")) return false;
+  if (s.includes("locale chiuso") || d.includes("locale chiuso")) return false;
+  if (s.startsWith("richiamare") || s.includes("richiamare -")) return false;
+  if (s.startsWith("annullat")) return false;
+  if (event?.extendedProperties?.private?.ai_kind === "booking") return false;
+
+  const hasKw = (blob) =>
+    blob.includes("musica") ||
+    blob.includes("live") ||
     blob.includes("dj") ||
     blob.includes("dj set") ||
-    blob.includes("live") ||
-    blob.includes("live music") ||
-    blob.includes("musica") ||
     blob.includes("jazz") ||
     blob.includes("concerto") ||
     blob.includes("band") ||
-    blob.includes("quartet")
-  );
+    blob.includes("quartet");
+
+  const isAllDay = Boolean(event?.start?.date && !event?.start?.dateTime);
+
+  // ALL-DAY: includi solo se keyword in titolo o descrizione
+  if (isAllDay) return hasKw(s) || hasKw(d);
+
+  // con orario: keyword in titolo o descrizione
+  return hasKw(`${s} ${d}`);
 }
+
 
 function getEventStartDateISO(event) {
   const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
@@ -1645,18 +1991,18 @@ async function checkAvailabilityQuickVoice(session, dateISO, people, time24) {
   if (res?.status === "ok") {
     return {
       handled: true,
-      answer: `Sì, in linea di massima c'e' disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ${time24}. Se vuoi, possiamo procedere con la prenotazione.`,
+      answer: `Sì, in linea di massima c'e' disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ore ${time24}. Se vuoi, possiamo procedere con la prenotazione.`,
     };
   }
   if (res?.status === "needs_split" || res?.status === "needs_outside") {
     return {
       handled: true,
-      answer: `Potrebbe esserci disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ${time24}, ma potremmo dovervi sistemare su tavoli separati o anche in esterno. Se vuoi, posso metterti in contatto con un operatore.`,
+      answer: `Potrebbe esserci disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ore ${time24}, ma potremmo dovervi sistemare su tavoli separati o anche in esterno. Se vuoi, posso metterti in contatto con un operatore.`,
     };
   }
   return {
     handled: true,
-    answer: `Al momento non risulta disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ${time24}. Vuoi provare un altro orario?`,
+    answer: `Al momento non risulta disponibilita' per ${people} persone ${formatDateLabel(dateISO)} alle ore ${time24}. Vuoi provare un altro orario?`,
   };
 }
 
@@ -1868,15 +2214,15 @@ async function tryAnswerInfoQuestionVoice(questionRaw) {
       return { handled: true, reply: `Mi dispiace, per ${formatDateLabel(dateISO)} risulta chiuso.` };
     }
     if (availability.status === "unavailable") {
-      return { handled: true, reply: `Mi dispiace, per ${formatDateLabel(dateISO)} alle ${time24} non vedo disponibilità.` };
+      return { handled: true, reply: `Mi dispiace, per ${formatDateLabel(dateISO)} alle ore ${time24} non vedo disponibilità.` };
     }
     if (availability.status === "needs_split") {
-      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ${time24} c'è disponibilità, ma probabilmente in tavoli separati.` };
+      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ore ${time24} c'è disponibilità, ma probabilmente in tavoli separati.` };
     }
     if (availability.status === "needs_outside") {
-      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.` };
+      return { handled: true, reply: `Per ${formatDateLabel(dateISO)} alle ore ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.` };
     }
-    return { handled: true, reply: `Sì, per ${formatDateLabel(dateISO)} alle ${time24} vedo disponibilità.` };
+    return { handled: true, reply: `Sì, per ${formatDateLabel(dateISO)} alle ore ${time24} vedo disponibilità.` };
   }
 
   // Natale
@@ -2045,12 +2391,12 @@ async function handleInfoFlow(session, req, vr, speech, emptySpeech) {
       availability.status === "closed"
         ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} risulta chiuso.`
         : availability.status === "unavailable"
-        ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} alle ${time24} non vedo disponibilità.`
+        ? `Mi dispiace, per ${formatDateLabel(payload.dateISO)} alle ore ${time24} non vedo disponibilità.`
         : availability.status === "needs_split"
-        ? `Per ${formatDateLabel(payload.dateISO)} alle ${time24} c'è disponibilità, ma probabilmente in tavoli separati.`
+        ? `Per ${formatDateLabel(payload.dateISO)} alle ore ${time24} c'è disponibilità, ma probabilmente in tavoli separati.`
         : availability.status === "needs_outside"
-        ? `Per ${formatDateLabel(payload.dateISO)} alle ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.`
-        : `Sì, per ${formatDateLabel(payload.dateISO)} alle ${time24} vedo disponibilità.`;
+        ? `Per ${formatDateLabel(payload.dateISO)} alle ore ${time24} c'è disponibilità, ma potrebbe essere necessario un tavolo esterno o tavoli separati.`
+        : `Sì, per ${formatDateLabel(payload.dateISO)} alle ore ${time24} vedo disponibilità.`;
 
     sayIt(vr, reply);
     vr.hangup();
@@ -2065,7 +2411,7 @@ async function handleInfoFlow(session, req, vr, speech, emptySpeech) {
 }
 
 async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
-  const state = String(session.operatorState || "");
+  let state = String(session.operatorState || "");
   const tt = normalizeText(speech);
 
   const softReturnToMenu = (message) => {
@@ -2104,6 +2450,10 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     }
     resetRetries(session);
     session.manageDateISO = dateISO;
+    session.managePeople = null;
+    session.managePhoneLast3 = "";
+    session.managePeople = null;
+    session.managePhoneLast3 = "";
     session.operatorState = "manage_cancel_surname";
     gatherSpeech(vr, "Perfetto. Dimmi il cognome della prenotazione.");
     return { kind: "vr", twiml: vr.toString() };
@@ -2118,7 +2468,16 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       return { kind: "vr", twiml: vr.toString() };
     }
     resetRetries(session);
-    session.manageSurname = speech.trim().slice(0, 60);
+    const sn = extractSurnameFromSpeech(speech) || speech.trim();
+    if (!sn) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(`Richiesta annullamento prenotazione: cognome non riconosciuto (data ${session.manageDateISO || ""})`);
+      }
+      gatherSpeech(vr, "Non ho capito il cognome. Puoi ripeterlo?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    session.manageSurname = sn.slice(0, 60);
     session.operatorState = "manage_cancel_time";
     gatherSpeech(vr, "Se ricordi anche l'orario dimmelo, altrimenti dì: non lo ricordo.");
     return { kind: "vr", twiml: vr.toString() };
@@ -2139,33 +2498,87 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       session.manageTime24 = parseTimeIT(speech);
     }
     session.operatorState = "manage_cancel_search";
-    // fallthrough
+    state = session.operatorState;
+    return handleManageBookingFlow(session, req, vr, speech, false);
   }
 
   if (state === "manage_cancel_search") {
-    const { match, candidates } = await findBookingEventMatch({
+    const callerPhoneE164 = parsePhoneNumber(req?.body?.From || "");
+    const { match, candidates, needsPeople, needsPhone, usedPhone, matchPhone } = await findBookingEventMatch({
       dateISO: session.manageDateISO,
       time24: session.manageTime24,
       surname: session.manageSurname,
+      people: session.managePeople,
+      phoneLast3: session.managePhoneLast3,
+      callerPhoneE164,
     });
 
     if (!match) {
-      return forwardBecause(`Richiesta annullamento prenotazione: non trovata (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""}, orario ${session.manageTime24 || "non indicato"})`);
-    }
-
-    // Se più prenotazioni con stesso cognome e nessun orario, chiedi orario
-    if (candidates && candidates.length > 1 && !session.manageTime24) {
-      session.operatorState = "manage_cancel_time_disambiguate";
-      gatherSpeech(vr, "Ho trovato più prenotazioni con quel cognome. Mi dici anche l'orario?");
-      return { kind: "vr", twiml: vr.toString() };
+      if (needsPeople) {
+        session.operatorState = "manage_cancel_people_disambiguate";
+        gatherSpeech(vr, "Per quante persone era la prenotazione?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+      if (needsPhone) {
+        session.operatorState = "manage_cancel_phone_disambiguate";
+        gatherSpeech(vr, "Per aiutarmi a identificarla, dimmi le ultime tre cifre del numero con cui hai prenotato.");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+      return forwardBecause(
+        `Richiesta annullamento prenotazione: impossibile identificare (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""}, orario ${session.manageTime24 || "non indicato"}, persone ${session.managePeople || "non indicate"})`
+      );
     }
 
     session.manageCandidateEventId = match.id;
     session.manageCandidateEvent = match;
+    session.manageUsedPhone = Boolean(usedPhone);
+    session.manageMatchedPhone = matchPhone || "";
+
     session.operatorState = "manage_cancel_confirm";
-    gatherSpeech(vr, `Ho trovato questa prenotazione: ${match.summary || ""}. Vuoi annullarla?`);
+
+    const phoneVoice = session.manageUsedPhone && session.manageMatchedPhone ? ` È associata al numero ${formatPhoneForVoiceFull(session.manageMatchedPhone)}.` : "";
+    gatherSpeech(vr, `Ho trovato questa prenotazione: ${match.summary || ""}.${phoneVoice} Vuoi annullarla?`);
     return { kind: "vr", twiml: vr.toString() };
   }
+
+  if (state === "manage_cancel_people_disambiguate") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Per quante persone era la prenotazione?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta annullamento prenotazione: persone non fornite (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const people = parsePeopleIT(speech);
+    if (!Number.isFinite(people)) {
+      gatherSpeech(vr, "Non ho capito quante persone. Puoi ripeterlo?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    session.managePeople = people;
+    session.operatorState = "manage_cancel_search";
+    return handleManageBookingFlow(session, req, vr, speech, false);
+  }
+
+  if (state === "manage_cancel_phone_disambiguate") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(vr, "Dimmi le ultime tre cifre del numero con cui hai prenotato.")
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta annullamento prenotazione: telefono non fornito (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const last3 = parsePhoneLast3FromSpeech(speech);
+    if (!last3) {
+      gatherSpeech(vr, "Non ho capito le ultime tre cifre. Puoi ripeterle?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    session.managePhoneLast3 = last3;
+    session.operatorState = "manage_cancel_search";
+    return handleManageBookingFlow(session, req, vr, speech, false);
+  }
+
 
   if (state === "manage_cancel_time_disambiguate") {
     if (emptySpeech) {
@@ -2199,7 +2612,7 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       return { kind: "vr", twiml: vr.toString() };
     }
     if (yn !== true) {
-      gatherSpeech(vr, "Non ho capito. Vuoi annullare la prenotazione? Rispondi sì o no.");
+      gatherSpeech(vr, "Non ho capito. Vuoi annullare la prenotazione? Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
       return { kind: "vr", twiml: vr.toString() };
     }
 
@@ -2207,9 +2620,8 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     if (!ok) {
       return forwardBecause(`Richiesta annullamento prenotazione: errore aggiornamento (evento ${session.manageCandidateEventId || ""})`);
     }
-    sayIt(vr, "Perfetto. Ho annullato la prenotazione. Grazie e a presto.");
-    vr.hangup();
-    session.operatorState = null;
+    softReturnToMenu("Perfetto. Ho annullato la prenotazione.");
+    return { kind: "vr", twiml: vr.toString() };
     return { kind: "vr", twiml: vr.toString() };
   }
 
@@ -2246,8 +2658,11 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       }
       return { kind: "vr", twiml: vr.toString() };
     }
-    const time24 = parseTimeIT(speech);
-    if (!time24) {
+    let time24 = parseTimeIT(speech);
+    if (tt.includes("non lo ricordo") || tt.includes("non ricordo")) {
+      time24 = null;
+    }
+    if (!time24 && !(tt.includes("non lo ricordo") || tt.includes("non ricordo"))) {
       session.retries = (session.retries || 0) + 1;
       if (session.retries >= 2) {
         return forwardBecause(`Richiesta modifica prenotazione: orario non riconosciuto (data ${session.manageDateISO || ""})`);
@@ -2256,7 +2671,7 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       return { kind: "vr", twiml: vr.toString() };
     }
     resetRetries(session);
-    session.manageTime24 = time24;
+    session.manageTime24 = time24 || null;
     session.operatorState = "manage_modify_surname";
     gatherSpeech(vr, "Mi dici anche il cognome della prenotazione? Se non lo ricordi, dì: non lo ricordo.");
     return { kind: "vr", twiml: vr.toString() };
@@ -2274,78 +2689,118 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     if (tt.includes("non lo ricordo") || tt.includes("non ricordo") || isNoRequestsText(speech)) {
       session.manageSurname = null;
     } else {
-      session.manageSurname = speech.trim().slice(0, 60);
+      const sn = extractSurnameFromSpeech(speech) || speech.trim();
+      if (!sn) {
+        session.retries = (session.retries || 0) + 1;
+        if (session.retries >= 2) {
+          return forwardBecause(`Richiesta modifica prenotazione: cognome non riconosciuto (data ${session.manageDateISO || ""}, orario ${session.manageTime24 || "non indicato"})`);
+        }
+        gatherSpeech(vr, "Non ho capito il cognome. Puoi ripeterlo?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+      session.manageSurname = sn.slice(0, 60);
     }
     session.operatorState = "manage_modify_search";
-    // fallthrough
+    state = session.operatorState;
+    return handleManageBookingFlow(session, req, vr, speech, false);
   }
 
   if (state === "manage_modify_search") {
-    const { match } = await findBookingEventMatch({
+    const callerPhoneE164 = parsePhoneNumber(req?.body?.From || "");
+    const { match, needsPeople, needsPhone, usedPhone, matchPhone } = await findBookingEventMatch({
       dateISO: session.manageDateISO,
       time24: session.manageTime24,
       surname: session.manageSurname,
+      people: session.managePeople,
+      phoneLast3: session.managePhoneLast3,
+      callerPhoneE164,
     });
+
     if (!match) {
-      return forwardBecause(`Richiesta modifica prenotazione: non trovata (data ${session.manageDateISO || ""}, orario ${session.manageTime24 || ""}, cognome ${session.manageSurname || "non indicato"})`);
+      if (needsPeople) {
+        session.operatorState = "manage_modify_people_disambiguate";
+        gatherSpeech(vr, "Per quante persone era la prenotazione?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+      if (needsPhone) {
+        session.operatorState = "manage_modify_phone_disambiguate";
+        gatherSpeech(vr, "Per aiutarmi a identificarla, dimmi le ultime tre cifre del numero con cui hai prenotato.");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+      return forwardBecause(
+        `Richiesta modifica prenotazione: impossibile identificare (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || "non indicato"}, orario ${session.manageTime24 || "non indicato"}, persone ${session.managePeople || "non indicate"})`
+      );
     }
+
     session.manageCandidateEventId = match.id;
     session.manageCandidateEvent = match;
+    session.manageUsedPhone = Boolean(usedPhone);
+    session.manageMatchedPhone = matchPhone || "";
+
     session.operatorState = "manage_modify_ask_change";
     gatherSpeech(vr, `Ho trovato questa prenotazione: ${match.summary || ""}. Cosa vuoi modificare?`);
     return { kind: "vr", twiml: vr.toString() };
   }
 
+  if (state === "manage_modify_people_disambiguate") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Per quante persone era la prenotazione?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica prenotazione: persone non fornite (data ${session.manageDateISO || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const people = parsePeopleIT(speech);
+    if (!Number.isFinite(people)) {
+      gatherSpeech(vr, "Non ho capito quante persone. Puoi ripeterlo?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    session.managePeople = people;
+    session.operatorState = "manage_modify_search";
+    return handleManageBookingFlow(session, req, vr, speech, false);
+  }
+
+  if (state === "manage_modify_phone_disambiguate") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(vr, "Dimmi le ultime tre cifre del numero con cui hai prenotato.")
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica prenotazione: telefono non fornito (data ${session.manageDateISO || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const last3 = parsePhoneLast3FromSpeech(speech);
+    if (!last3) {
+      gatherSpeech(vr, "Non ho capito le ultime tre cifre. Puoi ripeterle?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    session.managePhoneLast3 = last3;
+    session.operatorState = "manage_modify_search";
+    return handleManageBookingFlow(session, req, vr, speech, false);
+  }
+
+
   if (state === "manage_modify_ask_change") {
     if (emptySpeech) {
       const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi cosa vuoi modificare."));
       if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta modifica prenotazione: dettaglio non fornito (evento ${session.manageCandidateEventId || ""})`);
+        return forwardBecause(`Richiesta modifica prenotazione: dettagli modifica non forniti (evento ${session.manageCandidateEventId || ""})`);
       }
       return { kind: "vr", twiml: vr.toString() };
     }
 
     session.manageModificationRaw = String(speech || "").trim().slice(0, 200);
 
-    const n = normalizeText(speech || "");
-    const wantsTime = n.includes("orario") || n.includes("ora");
-    const wantsPeople = n.includes("persone") || n.includes("persona") || n.includes("pax") || n.includes("posti") || n.includes("coperti");
-    const wantsDate = n.includes("giorno") || n.includes("data") || n.includes("domani") || n.includes("oggi") || n.includes("dopodomani");
-
-    const mentionedTime = parseTimeIT(speech);
-    const mentionedPeople = parsePeopleIT(speech);
-    const mentionedDateISO = parseDateWithWeekday(speech);
-
-    // Se l'utente indica il campo ("l'orario") ma non fornisce il nuovo valore, chiedilo esplicitamente
-    if (wantsTime && !mentionedTime && !session.manageNewTime24) {
-      session.operatorState = "manage_modify_new_time";
-      session.retries = 0;
-      gatherSpeech(vr, "Ok. Qual è il nuovo orario?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    if (wantsPeople && !mentionedPeople && !session.manageNewPeople) {
-      session.operatorState = "manage_modify_new_people";
-      session.retries = 0;
-      gatherSpeech(vr, "Ok. Per quante persone deve essere la prenotazione?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-    if ((wantsDate || mentionedDateISO) && !mentionedDateISO && !session.manageNewDateISO) {
-      session.operatorState = "manage_modify_new_date";
-      session.retries = 0;
-      gatherSpeech(vr, "Ok. Qual è il nuovo giorno o la nuova data?");
-      return { kind: "vr", twiml: vr.toString() };
-    }
-
     const original = session.manageCandidateEvent || {};
     const originalDateISO = String(original?.start?.dateTime || original?.start?.date || session.manageDateISO || "").slice(0, 10);
     const originalTime24 = parseTimeIT(original?.start?.dateTime || "") || session.manageTime24;
-    const originalPeople =
-      extractPeopleFromDescription(original?.description) || extractPeopleFromSummary(original?.summary) || 2;
+    const originalPeople = extractPeopleFromDescription(original?.description) || extractPeopleFromSummary(original?.summary) || 2;
     const originalNotes = extractNotesFromDescription(original?.description) || "";
 
-    const newDateISO = session.manageNewDateISO || mentionedDateISO || originalDateISO;
-    const newTime24 = session.manageNewTime24 || mentionedTime || originalTime24;
-    const newPeople = session.manageNewPeople || mentionedPeople || originalPeople;
+    const newDateISO = parseDateWithWeekday(speech) || originalDateISO;
+    const newTime24 = parseTimeIT(speech) || originalTime24;
+    const newPeople = parsePeopleIT(speech) || originalPeople;
     const newNotes = extractNotesHint(speech) || originalNotes;
 
     if (!newDateISO || !newTime24) {
@@ -2359,10 +2814,8 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       ignoreEventId: session.manageCandidateEventId,
     });
 
-    if (!selectionResult.ok) {
-      return forwardBecause(
-        `Richiesta modifica prenotazione: nessuna disponibilità per ${newPeople} persone il ${newDateISO} alle ${newTime24} (evento ${session.manageCandidateEventId || ""})`
-      );
+    if (selectionResult.status === "closed" || selectionResult.status === "unavailable") {
+      return forwardBecause(`Richiesta modifica prenotazione: non disponibile (nuova data ${newDateISO}, nuovo orario ${newTime24}, persone ${newPeople})`);
     }
 
     session.managePendingUpdate = {
@@ -2376,87 +2829,15 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       originalDateISO,
     };
 
-    // pulisci draft (evita effetti collaterali se poi si rifà una gestione)
-    session.manageNewDateISO = null;
-    session.manageNewTime24 = null;
-    session.manageNewPeople = null;
-
     session.operatorState = "manage_modify_confirm_apply";
-    gatherSpeech(vr, `Ok. Vuoi confermare la modifica a ${formatDateLabel(newDateISO)} alle ${newTime24} per ${newPeople} persone?`);
+    gatherSpeech(
+      vr,
+      `Ok. Vuoi confermare la modifica a ${formatDateLabel(newDateISO)} alle ${newTime24} per ${newPeople} persone?`
+    );
     return { kind: "vr", twiml: vr.toString() };
   }
 
-  
-if (state === "manage_modify_new_time") {
-  if (emptySpeech) {
-    const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Qual è il nuovo orario?"));
-    if (silenceResult.action === "forward") {
-      return forwardBecause(`Richiesta modifica prenotazione: nuovo orario non fornito (evento ${session.manageCandidateEventId || ""})`);
-    }
-    return { kind: "vr", twiml: vr.toString() };
-  }
-  const t24 = parseTimeIT(speech);
-  if (!t24) {
-    session.retries = (session.retries || 0) + 1;
-    if (session.retries >= 2) {
-      return forwardBecause(`Richiesta modifica prenotazione: nuovo orario non chiaro (evento ${session.manageCandidateEventId || ""})`);
-    }
-    gatherSpeech(vr, "Non ho capito. Qual è il nuovo orario?");
-    return { kind: "vr", twiml: vr.toString() };
-  }
-  session.manageNewTime24 = t24;
-  session.operatorState = "manage_modify_ask_change";
-  session.retries = 0;
-  return handleManageBookingFlow(session, req, vr, `Orario ${t24}`, false);
-}
-
-if (state === "manage_modify_new_date") {
-  if (emptySpeech) {
-    const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Qual è il nuovo giorno o la nuova data?"));
-    if (silenceResult.action === "forward") {
-      return forwardBecause(`Richiesta modifica prenotazione: nuova data non fornita (evento ${session.manageCandidateEventId || ""})`);
-    }
-    return { kind: "vr", twiml: vr.toString() };
-  }
-  const dateISO = parseDateWithWeekday(speech);
-  if (!dateISO) {
-    session.retries = (session.retries || 0) + 1;
-    if (session.retries >= 2) {
-      return forwardBecause(`Richiesta modifica prenotazione: nuova data non chiara (evento ${session.manageCandidateEventId || ""})`);
-    }
-    gatherSpeech(vr, "Non ho capito. Qual è il nuovo giorno o la nuova data?");
-    return { kind: "vr", twiml: vr.toString() };
-  }
-  session.manageNewDateISO = dateISO;
-  session.operatorState = "manage_modify_ask_change";
-  session.retries = 0;
-  return handleManageBookingFlow(session, req, vr, `Data ${dateISO}`, false);
-}
-
-if (state === "manage_modify_new_people") {
-  if (emptySpeech) {
-    const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Per quante persone deve essere la prenotazione?"));
-    if (silenceResult.action === "forward") {
-      return forwardBecause(`Richiesta modifica prenotazione: nuovo numero persone non fornito (evento ${session.manageCandidateEventId || ""})`);
-    }
-    return { kind: "vr", twiml: vr.toString() };
-  }
-  const p = parsePeopleIT(speech);
-  if (!Number.isFinite(p) || p <= 0) {
-    session.retries = (session.retries || 0) + 1;
-    if (session.retries >= 2) {
-      return forwardBecause(`Richiesta modifica prenotazione: nuovo numero persone non chiaro (evento ${session.manageCandidateEventId || ""})`);
-    }
-    gatherSpeech(vr, "Non ho capito. Per quante persone?");
-    return { kind: "vr", twiml: vr.toString() };
-  }
-  session.manageNewPeople = p;
-  session.operatorState = "manage_modify_ask_change";
-  session.retries = 0;
-  return handleManageBookingFlow(session, req, vr, `Persone ${p}`, false);
-}
-
-if (state === "manage_modify_confirm_apply") {
+  if (state === "manage_modify_confirm_apply") {
     if (emptySpeech) {
       const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Vuoi confermare la modifica?"));
       if (silenceResult.action === "forward") {
@@ -2527,10 +2908,23 @@ function extractNotesHint(speech) {
 }
 
 function parseYesNo(speech) {
-  const tt = normalizeText(speech);
+  const raw = String(speech || "").trim();
+  const tt = normalizeText(raw);
   if (!tt) return null;
+
+  // DTMF: 1 = sì, 2 = no
+  if (tt === "1") return true;
+  if (tt === "2") return false;
+
+  // sì/no via voce
   if (YES_WORDS.some((w) => tt.includes(w))) return true;
   if (NO_WORDS.some((w) => tt.includes(w))) return false;
+
+  // gestisci frasi tipo "non voglio", "non procedere"
+  if (tt.startsWith("non ") && (tt.includes("voglio") || tt.includes("proced") || tt.includes("conferm") || tt.includes("annull") || tt.includes("fare"))) {
+    return false;
+  }
+
   return null;
 }
 
@@ -4168,7 +4562,7 @@ async function handleVoiceRequest(req, res) {
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(vr.toString());
           }
-          gatherSpeech(vr, offerBookingPrompt);
+          gatherSpeech(vr, offerBookingPrompt + " Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(vr.toString());
         }
@@ -4204,7 +4598,7 @@ async function handleVoiceRequest(req, res) {
           if (session.infoMoreSilence >= 2) {
             session.operatorState = "info_offer_booking";
             session.infoOfferTries = 0;
-            gatherSpeech(vr, offerBookingPrompt);
+            gatherSpeech(vr, offerBookingPrompt + " Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
             res.set("Content-Type", "text/xml; charset=utf-8");
             return res.send(vr.toString());
           }
@@ -4218,7 +4612,7 @@ async function handleVoiceRequest(req, res) {
         if (isNoLike(speech)) {
           session.operatorState = "info_offer_booking";
           session.infoOfferTries = 0;
-          gatherSpeech(vr, offerBookingPrompt);
+          gatherSpeech(vr, offerBookingPrompt + " Puoi dire sì o no. Se preferisci, premi 1 per sì e 2 per no.", { input: "speech dtmf", numDigits: 1, hints: ["si","no","certo","ok","confermo","annulla","cancella"] });
           res.set("Content-Type", "text/xml; charset=utf-8");
           return res.send(vr.toString());
         }
@@ -4551,11 +4945,6 @@ async function handleVoiceRequest(req, res) {
           session.manageSurname = null;
           session.manageCandidateEventId = null;
           session.manageCandidateEvent = null;
-          session.managePeople = null;
-          session.managePhoneLast3 = null;
-          session.manageNewDateISO = null;
-          session.manageNewTime24 = null;
-          session.manageNewPeople = null;
           session.operatorState = "manage_cancel_date";
           gatherSpeech(vr, "Va bene. Dimmi la data della prenotazione da annullare.");
           break;
@@ -4570,11 +4959,6 @@ async function handleVoiceRequest(req, res) {
           session.manageCandidateEvent = null;
           session.manageModificationRaw = null;
           session.managePendingUpdate = null;
-          session.managePeople = null;
-          session.managePhoneLast3 = null;
-          session.manageNewDateISO = null;
-          session.manageNewTime24 = null;
-          session.manageNewPeople = null;
           session.operatorState = "manage_modify_date";
           gatherSpeech(vr, "Va bene. Dimmi la data della prenotazione da modificare.");
           break;
