@@ -1252,27 +1252,30 @@ function isNoRequestsText(speech) {
 function parseModificationChoices(speech) {
   const tt = normalizeText(speech);
   if (!tt) return [];
+
   // "tutto/tutte" => modifica tutto
   if (tt.includes("tutto") || tt.includes("tutte") || tt.includes("tutti")) {
     return ["date", "time", "people", "notes"];
   }
 
+  // Cerchiamo parole-chiave in modo robusto (word-boundary), così "data" a inizio frase funziona.
   const defs = [
-    { key: "date", kws: [" data", "giorno", "sposta a", "spostare a", "cambia data", "cambiare data", "posticipa", "anticipa"] },
-    { key: "time", kws: ["orario", " ora", "alle ", "sposta alle", "cambia ora", "cambiare ora", "cambia orario", "cambiare orario"] },
-    { key: "people", kws: ["persone", "persona", "pax", "coperti", "posti", "numero di persone", "in quanti"] },
-    { key: "notes", kws: ["richiesta", "richieste", "note", "richieste particolari", "allerg", "intoller", "senza glutine", "veg", "compleanno", "torta"] },
+    { key: "date", res: [/\bdata\b/, /\bgiorno\b/, /\bsposta\b/, /\bspostare\b/, /\bcambia\b\s+data\b/, /\bcambiare\b\s+data\b/, /\bposticipa\b/, /\banticipa\b/] },
+    { key: "time", res: [/\borario\b/, /\bora\b/, /\balle\b/, /\bcambia\b\s+ora\b/, /\bcambiare\b\s+ora\b/, /\bcambia\b\s+orario\b/, /\bcambiare\b\s+orario\b/] },
+    { key: "people", res: [/\bnumero\b\s+di\s+persone\b/, /\bpersone?\b/, /\bpax\b/, /\bcoperti\b/, /\bposti\b/, /\bin\s+quanti\b/] },
+    { key: "notes", res: [/\brichieste?\b/, /\bnote\b/, /\bintoller\w*\b/, /\ballerg\w*\b/, /\bsenza\s+glutine\b/, /\bveg\w*\b/, /\bcompleanno\b/, /\btorta\b/] },
   ];
 
   const found = [];
   for (const d of defs) {
     let pos = Infinity;
-    for (const kw of d.kws) {
-      const p = tt.indexOf(kw);
-      if (p >= 0 && p < pos) pos = p;
+    for (const re of d.res) {
+      const m = re.exec(tt);
+      if (m && typeof m.index === "number") pos = Math.min(pos, m.index);
     }
     if (pos !== Infinity) found.push({ key: d.key, pos });
   }
+
   found.sort((a, b) => a.pos - b.pos);
 
   // dedup preservando ordine
@@ -1282,7 +1285,6 @@ function parseModificationChoices(speech) {
   }
   return out;
 }
-
 
 function gotoModifyField(session, vr, field, isFirst) {
   const intro = (msgFirst, msgNext) => (isFirst ? msgFirst : msgNext);
