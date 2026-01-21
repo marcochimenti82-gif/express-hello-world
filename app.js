@@ -42,6 +42,7 @@ const BUSINESS_NAME = process.env.BUSINESS_NAME || "TuttiBrilli";
 const BUSINESS_CONTEXT = process.env.BUSINESS_CONTEXT || "";
 const GOOGLE_CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || "";
 const GOOGLE_CALENDAR_TZ = process.env.GOOGLE_CALENDAR_TZ || "Europe/Rome";
+const CANCELED_EVENT_COLOR_ID = process.env.CANCELED_EVENT_COLOR_ID || "11"; // rosso
 const GOOGLE_SERVICE_ACCOUNT_JSON_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
 
@@ -1373,7 +1374,7 @@ async function patchBookingAsCanceled(eventId, dateISO, originalEvent) {
     oldDesc || "-",
   ].join("\n");
 
-  const patchBody = { summary: newSummary, description: newDesc };
+  const patchBody = { summary: newSummary, description: newDesc, ...(CANCELED_EVENT_COLOR_ID ? { colorId: CANCELED_EVENT_COLOR_ID } : {}) };
 
   const logGoogleErr = (label, err) => {
     const status = err?.response?.status ?? err?.code ?? null;
