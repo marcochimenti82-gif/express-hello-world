@@ -1249,6 +1249,96 @@ function isNoRequestsText(speech) {
   );
 }
 
+function parseModificationChoices(speech) {
+  const tt = normalizeText(speech);
+  if (!tt) return [];
+  // "tutto/tutte" => modifica tutto
+  if (tt.includes("tutto") || tt.includes("tutte") || tt.includes("tutti")) {
+    return ["date", "time", "people", "notes"];
+  }
+
+  const defs = [
+    { key: "date", kws: [" data", "giorno", "sposta a", "spostare a", "cambia data", "cambiare data", "posticipa", "anticipa"] },
+    { key: "time", kws: ["orario", " ora", "alle ", "sposta alle", "cambia ora", "cambiare ora", "cambia orario", "cambiare orario"] },
+    { key: "people", kws: ["persone", "persona", "pax", "coperti", "posti", "numero di persone", "in quanti"] },
+    { key: "notes", kws: ["richiesta", "richieste", "note", "richieste particolari", "allerg", "intoller", "senza glutine", "veg", "compleanno", "torta"] },
+  ];
+
+  const found = [];
+  for (const d of defs) {
+    let pos = Infinity;
+    for (const kw of d.kws) {
+      const p = tt.indexOf(kw);
+      if (p >= 0 && p < pos) pos = p;
+    }
+    if (pos !== Infinity) found.push({ key: d.key, pos });
+  }
+  found.sort((a, b) => a.pos - b.pos);
+
+  // dedup preservando ordine
+  const out = [];
+  for (const f of found) {
+    if (!out.includes(f.key)) out.push(f.key);
+  }
+  return out;
+}
+
+
+function gotoModifyField(session, vr, field, isFirst) {
+  const intro = (msgFirst, msgNext) => (isFirst ? msgFirst : msgNext);
+
+  if (field === "date") {
+    session.operatorState = "manage_modify_set_date";
+    gatherSpeech(
+      vr,
+      intro(
+        "Ok perfetto, cominciamo con la data. Per quale giorno vuoi spostare la prenotazione?",
+        "Perfetto. Adesso modifichiamo la data. Per quale giorno vuoi spostare la prenotazione?"
+      )
+    );
+    return true;
+  }
+
+  if (field === "time") {
+    session.operatorState = "manage_modify_set_time";
+    gatherSpeech(
+      vr,
+      intro(
+        "Ok perfetto, cominciamo con l'orario. Per che ora prenoto il vostro tavolo?",
+        "Perfetto. Adesso modifichiamo l'orario. Per che ora prenoto il vostro tavolo?"
+      )
+    );
+    return true;
+  }
+
+  if (field === "people") {
+    session.operatorState = "manage_modify_set_people";
+    gatherSpeech(
+      vr,
+      intro(
+        "Ok perfetto, cominciamo con il numero di persone. In quanti sarete?",
+        "Perfetto. Adesso modifichiamo il numero di persone. In quanti sarete?"
+      )
+    );
+    return true;
+  }
+
+  if (field === "notes") {
+    session.operatorState = "manage_modify_set_notes";
+    gatherSpeech(
+      vr,
+      intro(
+        "Ok. Dimmi le richieste particolari da aggiungere o modificare. Se non ce ne sono, dì: nessuna.",
+        "Perfetto. Adesso le richieste particolari. Dimmi cosa vuoi aggiungere o modificare. Se non ce ne sono, dì: nessuna."
+      )
+    );
+    return true;
+  }
+
+  return false;
+}
+
+
 function parseNextWeekdayISO(speech) {
   const tt = normalizeText(speech);
   if (!tt) return null;
@@ -2476,35 +2566,299 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     }
     session.manageCandidateEventId = match.id;
     session.manageCandidateEvent = match;
-    session.operatorState = "manage_modify_ask_change";
-    gatherSpeech(vr, `Ho trovato questa prenotazione: ${match.summary || ""}. Cosa vuoi modificare?`);
+    session.operatorState = "manage_modify_choose_fields";
+    // reset piano modifica
+    session.manageChangeQueue = null;
+    session.manageProposed = null;
+    session.manageOriginal = null;
+    gatherSpeech(
+      vr,
+      `Ho trovato questa prenotazione: ${match.summary || ""}. Cosa vuoi modificare? Puoi scegliere: la data, l'orario, il numero di persone, oppure aggiungere richieste particolari. Puoi dire anche più cose, ad esempio: orario e numero di persone.`
+    );
     return { kind: "vr", twiml: vr.toString() };
   }
 
-  if (state === "manage_modify_ask_change") {
+    if (state === "manage_modify_choose_fields") {
     if (emptySpeech) {
-      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi cosa vuoi modificare."));
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(
+          vr,
+          "Dimmi cosa vuoi modificare: la data, l'orario, il numero di persone, oppure richieste particolari. Puoi scegliere anche più cose."
+        )
+      );
       if (silenceResult.action === "forward") {
-        return forwardBecause(`Richiesta modifica prenotazione: dettagli modifica non forniti (evento ${session.manageCandidateEventId || ""})`);
+        return forwardBecause(
+          `Richiesta modifica prenotazione: scelta modifiche non fornita (evento ${session.manageCandidateEventId || ""})`
+        );
       }
       return { kind: "vr", twiml: vr.toString() };
     }
 
-    session.manageModificationRaw = String(speech || "").trim().slice(0, 200);
+    const choices = parseModificationChoices(speech);
+    if (!choices || choices.length === 0) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(
+          `Richiesta modifica prenotazione: scelta modifiche non riconosciuta (evento ${session.manageCandidateEventId || ""})`
+        );
+      }
+      gatherSpeech(
+        vr,
+        "Non ho capito. Puoi scegliere: la data, l'orario, il numero di persone, oppure richieste particolari. Puoi dire anche: orario e numero di persone."
+      );
+      return { kind: "vr", twiml: vr.toString() };
+    }
 
+    // baseline dall'evento trovato
     const original = session.manageCandidateEvent || {};
-    const originalDateISO = String(original?.start?.dateTime || original?.start?.date || session.manageDateISO || "").slice(0, 10);
+    const originalDateISO = String(
+      original?.start?.dateTime || original?.start?.date || session.manageDateISO || ""
+    ).slice(0, 10);
     const originalTime24 = parseTimeIT(original?.start?.dateTime || "") || session.manageTime24;
-    const originalPeople = extractPeopleFromDescription(original?.description) || extractPeopleFromSummary(original?.summary) || 2;
+    const originalPeople =
+      extractPeopleFromDescription(original?.description) || extractPeopleFromSummary(original?.summary) || 2;
     const originalNotes = extractNotesFromDescription(original?.description) || "";
 
-    const newDateISO = parseDateWithWeekday(speech) || originalDateISO;
-    const newTime24 = parseTimeIT(speech) || originalTime24;
-    const newPeople = parsePeopleIT(speech) || originalPeople;
-    const newNotes = extractNotesHint(speech) || originalNotes;
+    session.manageOriginal = { originalDateISO, originalTime24, originalPeople, originalNotes };
+    session.manageProposed = {
+      dateISO: originalDateISO,
+      time24: originalTime24,
+      people: originalPeople,
+      notes: originalNotes,
+    };
+
+    session.manageModificationRaw = String(speech || "").trim().slice(0, 200);
+    session.manageChangeQueue = choices.slice();
+
+    resetRetries(session);
+
+    const first = session.manageChangeQueue.shift();
+    gotoModifyField(session, vr, first, true);
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_modify_set_date") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(vr, "Non ho capito la data. Per quale giorno vuoi spostare la prenotazione?")
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(
+          `Richiesta modifica prenotazione: data non fornita (evento ${session.manageCandidateEventId || ""})`
+        );
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const d = parseDateWithWeekday(speech);
+    if (!d) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(
+          `Richiesta modifica prenotazione: data non riconosciuta (evento ${session.manageCandidateEventId || ""})`
+        );
+      }
+      gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    resetRetries(session);
+    session.manageProposed = session.manageProposed || {};
+    session.manageProposed.dateISO = d;
+
+    const next = (session.manageChangeQueue || []).shift();
+    if (next) {
+      gotoModifyField(session, vr, next, false);
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    session.operatorState = "manage_modify_other_requests_yn";
+    gatherSpeech(vr, "Ci sono altre richieste particolari da aggiungere? Rispondi sì o no.");
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_modify_set_time") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(vr, "Non ho capito l'orario. Per che ora prenoto il vostro tavolo?")
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(
+          `Richiesta modifica prenotazione: orario non fornito (evento ${session.manageCandidateEventId || ""})`
+        );
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const t = parseTimeIT(speech);
+    if (!t) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(
+          `Richiesta modifica prenotazione: orario non riconosciuto (evento ${session.manageCandidateEventId || ""})`
+        );
+      }
+      gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    resetRetries(session);
+    session.manageProposed = session.manageProposed || {};
+    session.manageProposed.time24 = t;
+
+    const next = (session.manageChangeQueue || []).shift();
+    if (next) {
+      gotoModifyField(session, vr, next, false);
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    session.operatorState = "manage_modify_other_requests_yn";
+    gatherSpeech(vr, "Ci sono altre richieste particolari da aggiungere? Rispondi sì o no.");
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_modify_set_people") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(vr, "Non ho capito il numero di persone. In quanti sarete?")
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(
+          `Richiesta modifica prenotazione: numero persone non fornito (evento ${session.manageCandidateEventId || ""})`
+        );
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const p = parsePeopleIT(speech);
+    if (!p) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(
+          `Richiesta modifica prenotazione: numero persone non riconosciuto (evento ${session.manageCandidateEventId || ""})`
+        );
+      }
+      gatherSpeech(vr, "Non ho capito. In quanti sarete?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    resetRetries(session);
+    session.manageProposed = session.manageProposed || {};
+    session.manageProposed.people = p;
+
+    const next = (session.manageChangeQueue || []).shift();
+    if (next) {
+      gotoModifyField(session, vr, next, false);
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    session.operatorState = "manage_modify_other_requests_yn";
+    gatherSpeech(vr, "Ci sono altre richieste particolari da aggiungere? Rispondi sì o no.");
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_modify_set_notes") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(vr, "Dimmi le richieste particolari. Se non ce ne sono, dì: nessuna.")
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(
+          `Richiesta modifica prenotazione: richieste particolari non fornite (evento ${session.manageCandidateEventId || ""})`
+        );
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const cleaned = String(speech || "").trim().slice(0, 300);
+    resetRetries(session);
+    session.manageProposed = session.manageProposed || {};
+    session.manageProposed.notes = isNoRequestsText(speech) ? "" : cleaned;
+
+    const next = (session.manageChangeQueue || []).shift();
+    if (next) {
+      gotoModifyField(session, vr, next, false);
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    session.operatorState = "manage_modify_other_requests_yn";
+    gatherSpeech(vr, "Ci sono altre richieste particolari da aggiungere? Rispondi sì o no.");
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_modify_other_requests_yn") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(vr, "Ci sono altre richieste particolari da aggiungere? Rispondi sì o no.")
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(
+          `Richiesta modifica prenotazione: conferma richieste non fornita (evento ${session.manageCandidateEventId || ""})`
+        );
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const tt = normalizeText(speech);
+    if (tt && (tt === "si" || tt === "sì" || tt.includes("si ") || tt.includes("sì ") || tt.includes("certo"))) {
+      resetRetries(session);
+      session.operatorState = "manage_modify_other_requests_capture";
+      gatherSpeech(vr, "Dimmi pure la richiesta particolare.");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    // default: no
+    resetRetries(session);
+    session.operatorState = "manage_modify_finalize";
+    return handleManageBookingFlow(session, req, vr, speech, false);
+  }
+
+  if (state === "manage_modify_other_requests_capture") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi pure la richiesta particolare."));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(
+          `Richiesta modifica prenotazione: richiesta particolare non fornita (evento ${session.manageCandidateEventId || ""})`
+        );
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const add = String(speech || "").trim().slice(0, 300);
+    resetRetries(session);
+
+    session.manageProposed = session.manageProposed || {};
+    const prev = String(session.manageProposed.notes || "").trim();
+    if (!isNoRequestsText(add)) {
+      session.manageProposed.notes = prev ? `${prev}\n${add}` : add;
+    }
+
+    session.operatorState = "manage_modify_finalize";
+    return handleManageBookingFlow(session, req, vr, speech, false);
+  }
+
+  if (state === "manage_modify_finalize") {
+    const original = session.manageCandidateEvent || {};
+    const originalNotes = extractNotesFromDescription(original?.description) || "";
+    const originalDateISO =
+      (session.manageOriginal && session.manageOriginal.originalDateISO) ||
+      String(original?.start?.dateTime || original?.start?.date || session.manageDateISO || "").slice(0, 10);
+
+    const proposed = session.manageProposed || {};
+    const newDateISO = proposed.dateISO || originalDateISO;
+    const newTime24 = proposed.time24 || (session.manageOriginal && session.manageOriginal.originalTime24) || session.manageTime24;
+    const newPeople =
+      proposed.people ||
+      (session.manageOriginal && session.manageOriginal.originalPeople) ||
+      extractPeopleFromDescription(original?.description) ||
+      extractPeopleFromSummary(original?.summary) ||
+      2;
+    const newNotes = typeof proposed.notes === "string" ? proposed.notes : originalNotes;
 
     if (!newDateISO || !newTime24) {
-      return forwardBecause(`Richiesta modifica prenotazione: dati insufficienti (evento ${session.manageCandidateEventId || ""})`);
+      return forwardBecause(
+        `Richiesta modifica prenotazione: dati insufficienti (evento ${session.manageCandidateEventId || ""})`
+      );
     }
 
     const selectionResult = await computeTableSelectionForChange({
@@ -2515,7 +2869,9 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     });
 
     if (selectionResult.status === "closed" || selectionResult.status === "unavailable") {
-      return forwardBecause(`Richiesta modifica prenotazione: non disponibile (nuova data ${newDateISO}, nuovo orario ${newTime24}, persone ${newPeople})`);
+      return forwardBecause(
+        `Richiesta modifica prenotazione: non disponibile (data ${newDateISO}, ora ${newTime24}, persone ${newPeople})`
+      );
     }
 
     session.managePendingUpdate = {
@@ -2530,9 +2886,11 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     };
 
     session.operatorState = "manage_modify_confirm_apply";
+
+    const notesLabel = newNotes && String(newNotes).trim().length > 0 ? String(newNotes).trim() : "nessuna";
     gatherSpeech(
       vr,
-      `Ok. Vuoi confermare la modifica a ${formatDateLabel(newDateISO)} alle ${newTime24} per ${newPeople} persone?`
+      `Perfetto. Riepilogo: ${formatDateLabel(newDateISO)} alle ${newTime24}, per ${newPeople} persone. Richieste: ${notesLabel}. Vuoi confermare la modifica?`
     );
     return { kind: "vr", twiml: vr.toString() };
   }
