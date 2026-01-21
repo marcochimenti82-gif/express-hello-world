@@ -376,7 +376,17 @@ function buildTwiml() {
 
 function sanitizeForTTS(input) {
   let t = String(input || "");
-  // normalizza spazi e caratteri
+  // --- Fix apostrofi/accents per TTS ---
+  // Normalizza Unicode (accenti coerenti) e spazi non standard
+  try { t = t.normalize("NFC"); } catch (e) {}
+  t = t.replace(/\u00A0/g, " "); // NBSP -> space
+
+  // Apostrofi/virgolette tipografici -> ASCII
+  t = t.replace(/[’‘]/g, "'").replace(/[“”]/g, '"');
+
+  // Evita lettura "apostrofo" nelle elisioni (l'acqua -> l acqua)
+  t = t.replace(/([A-Za-zÀ-ÖØ-öø-ÿ])'([A-Za-zÀ-ÖØ-öø-ÿ])/g, "$1 $2");
+// normalizza spazi e caratteri
   t = t.replace(/ /g, " ").replace(/\s+/g, " ").trim();
 
   // espandi abbreviazioni frequenti (lettura voce)
