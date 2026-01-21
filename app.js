@@ -1354,9 +1354,8 @@ async function findBookingEventMatch({ dateISO, time24, surname }) {
 }
 
 async function patchBookingAsCanceled(eventId, dateISO, originalEvent) {
-  // Patch minimo e robusto:
-  // - aggiorna SOLO summary/description
-  // - NON modifica start/end (evita conversioni dateTime <-> date che causano errori 400)
+  // Versione "anti-bug": tenta più strategie e logga l'errore reale.
+  // Obiettivo: marcare l'evento come annullato senza rompere lo start/end.
   if (!GOOGLE_CALENDAR_ID || !eventId || !dateISO) return null;
   const calendar = buildCalendarClient();
   if (!calendar) return null;
@@ -1372,30 +1371,74 @@ async function patchBookingAsCanceled(eventId, dateISO, originalEvent) {
     "",
     "DESCRIZIONE PRECEDENTE:",
     oldDesc || "-",
-    "",
-    "Tavolo: ",
   ].join("\n");
 
+  const patchBody = { summary: newSummary, description: newDesc };
+
+  const logGoogleErr = (label, err) => {
+    const status = err?.response?.status ?? err?.code ?? null;
+    const data = err?.response?.data ?? null;
+    const message = err?.message ?? null;
+    console.error(`[GOOGLE] Cancel ${label} failed:`, { status, message, data });
+  };
+
+  // Tentativo 1: PATCH minimale (summary/description)
   try {
     const result = await calendar.events.patch({
       calendarId: GOOGLE_CALENDAR_ID,
       eventId,
-      requestBody: {
-        summary: newSummary,
-        description: newDesc,
-      },
+      sendUpdates: "none",
+      requestBody: patchBody,
+    });
+    await upsertAvailabilityEvent(dateISO);
+    console.log("[GOOGLE] Cancel PATCH ok", { eventId });
+    return result?.data || null;
+  } catch (err1) {
+    logGoogleErr("PATCH", err1);
+  }
+
+  // Tentativo 2: GET + UPDATE completo (alcuni calendari/oggetti falliscono con PATCH)
+  try {
+    const current = await calendar.events.get({
+      calendarId: GOOGLE_CALENDAR_ID,
+      eventId,
     });
 
-    // Aggiorna disponibilità sul giorno della prenotazione annullata
+    // UPDATE richiede un body completo: partiamo dall'evento attuale e sovrascriviamo i campi.
+    // (Non tocchiamo start/end, organizer, attendees, ecc.)
+    const body = { ...(current?.data || {}), ...patchBody };
+
+    const result2 = await calendar.events.update({
+      calendarId: GOOGLE_CALENDAR_ID,
+      eventId,
+      sendUpdates: "none",
+      requestBody: body,
+    });
+
     await upsertAvailabilityEvent(dateISO);
-    return result?.data || null;
-  } catch (err) {
-    // Log più leggibile (utile su Render)
-    const status = err?.response?.status ?? err?.code ?? null;
-    const data = err?.response?.data ?? null;
-    console.error("[GOOGLE] Cancel booking patch failed:", { status, data });
-    return null;
+    console.log("[GOOGLE] Cancel GET+UPDATE ok", { eventId });
+    return result2?.data || null;
+  } catch (err2) {
+    logGoogleErr("GET+UPDATE", err2);
   }
+
+  // Tentativo 3: PATCH con status cancelled (fallback estremo)
+  // Nota: può far sparire l'evento dalla vista standard del calendario (equivale a cancellazione).
+  try {
+    const result3 = await calendar.events.patch({
+      calendarId: GOOGLE_CALENDAR_ID,
+      eventId,
+      sendUpdates: "none",
+      requestBody: { ...patchBody, status: "cancelled" },
+    });
+    await upsertAvailabilityEvent(dateISO);
+    console.log("[GOOGLE] Cancel PATCH(status=cancelled) ok", { eventId });
+    return result3?.data || null;
+  } catch (err3) {
+    logGoogleErr("PATCH(status=cancelled)", err3);
+  }
+
+  return null;
 }
 
 async function computeTableSelectionForChange({ dateISO, time24, people, ignoreEventId }) {
