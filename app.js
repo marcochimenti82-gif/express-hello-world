@@ -1047,7 +1047,8 @@ function promptForStep(vr, session) {
 // ====== parsing basilari (per arrivare al punto: FIX crash step 5) ======
 function parseTimeIT(speech) {
   const tt = normalizeText(speech);
-  const hm = tt.match(/(\d{1,2})[:\s](\d{2})/);
+  if (!tt) return null;
+  const hm = tt.match(/\b(\d{1,2})[:\.](\d{2})\b/);
   if (hm) {
     const hh = Number(hm[1]);
     const mm = Number(hm[2]);
@@ -1055,12 +1056,23 @@ function parseTimeIT(speech) {
       return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
     }
   }
-  const onlyH = tt.match(/\b(\d{1,2})\b/);
-  if (onlyH) {
-    const hh = Number(onlyH[1]);
+  const prefixed = tt.match(/\b(?:alle|ore)\s*(\d{1,2})(?:\s*(?:e|:)?\s*(\d{2}))?\b/);
+  if (prefixed) {
+    const hh = Number(prefixed[1]);
+    const mm = prefixed[2] ? Number(prefixed[2]) : 0;
+    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+      return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+    }
+  }
+  if (/^\d{1,2}$/.test(tt)) {
+    const hh = Number(tt);
     if (hh >= 0 && hh <= 23) return `${String(hh).padStart(2, "0")}:00`;
   }
   return null;
+}
+
+function safeParseTime(speech) {
+  return parseTimeIT(speech);
 }
 
 function parseDateIT(speech) {
@@ -1296,11 +1308,9 @@ function extractDateISOFromEvent(ev) {
   return String(dt).slice(0, 10);
 }
 
-
-function extractSurnameFromSpeech(raw) {
+function cleanSurnameFromSpeech(raw) {
   const t = normalizeText(raw);
   if (!t) return "";
-  // rimuovi riempitivi/filler che spesso l'ASR mette prima del cognome
   const fillers = [
     "si",
     "ok",
@@ -1329,28 +1339,28 @@ function extractSurnameFromSpeech(raw) {
   for (const f of fillers) {
     const ff = normalizeText(f);
     if (!ff) continue;
-    // rimuovi solo se appare come parola intera
     s = s.replace(new RegExp(`\\b${ff}\\b`, "g"), " ");
   }
   s = s.replace(/\s+/g, " ").trim();
 
-  // se rimane solo consenso/stopwords, considera vuoto
   if (!s || YES_WORDS.includes(s) || NO_WORDS.includes(s)) return "";
 
-  // tieni gli ultimi 1-3 token (gestisce cognomi composti: "de luca", "di marco")
   const tokens = s.split(" ").filter(Boolean);
   if (!tokens.length) return "";
 
   const connectors = new Set(["de", "di", "del", "della", "dello", "dei", "da", "la", "lo"]);
   let keep = 1;
-  // se l'ultimo token è corto e connettivo, aumenta
-  for (let i = tokens.length - 2; i >= 0 && keep < 3; i--) {
+  for (let i = tokens.length - 2; i >= 0 && keep < 2; i--) {
     if (connectors.has(tokens[i])) keep += 1;
     else break;
   }
 
-  const picked = tokens.slice(-keep).join(" ").trim();
-  return picked;
+  return tokens.slice(-keep).join(" ").trim();
+}
+
+
+function extractSurnameFromSpeech(raw) {
+  return cleanSurnameFromSpeech(raw);
 }
 
 function levenshteinDistance(a, b) {
@@ -1452,6 +1462,57 @@ function extractPhoneE164FromEvent(ev) {
   return isValidPhoneE164(parsed) ? parsed : "";
 }
 
+function extractEventFields(ev) {
+  const peopleRaw = extractPeopleFromDescription(ev?.description) || extractPeopleFromSummary(ev?.summary);
+  return {
+    surname: extractSurnameFromEvent(ev),
+    time24: extractTime24FromEvent(ev),
+    people: Number.isFinite(Number(peopleRaw)) ? Number(peopleRaw) : null,
+    phoneE164: extractPhoneE164FromEvent(ev),
+  };
+}
+
+function scoreCandidate(fields, query) {
+  let score = 0;
+  let phoneMatched = false;
+
+  if (query.surname) {
+    score += similarityRatio(query.surname, fields.surname) * 0.55;
+  } else {
+    score += 0.05;
+  }
+
+  if (query.time24 && fields.time24) {
+    if (query.time24 === fields.time24) {
+      score += 0.22;
+    } else {
+      const [h1, m1] = query.time24.split(":").map(Number);
+      const [h2, m2] = fields.time24.split(":").map(Number);
+      if (Number.isFinite(h1) && Number.isFinite(m1) && Number.isFinite(h2) && Number.isFinite(m2)) {
+        const diff = Math.abs(h1 * 60 + m1 - (h2 * 60 + m2));
+        if (diff <= 15) score += 0.12;
+      }
+    }
+  }
+
+  if (query.people && Number.isFinite(fields.people)) {
+    if (Number(fields.people) === query.people) score += 0.15;
+    else if (Math.abs(Number(fields.people) - query.people) === 1) score += 0.08;
+  }
+
+  if (query.phoneLast3 && fields.phoneE164) {
+    const evDigits = fields.phoneE164.replace(/\D/g, "").replace(/^39/, "");
+    if (evDigits.endsWith(query.phoneLast3)) {
+      score += 0.25;
+      phoneMatched = true;
+    }
+  } else if (query.callerPhoneE164 && fields.phoneE164 && fields.phoneE164 === query.callerPhoneE164) {
+    score += 0.18;
+  }
+
+  return { score, phoneMatched };
+}
+
 function parsePhoneLast3FromSpeech(raw) {
   const t = normalizeText(raw);
   if (!t) return "";
@@ -1496,68 +1557,30 @@ function formatPhoneForVoiceFull(phoneE164) {
 async function findBookingEventMatch({ dateISO, time24, surname, people, phoneLast3, callerPhoneE164 }) {
   const candidates = await findBookingCandidatesByDate(dateISO);
 
-  const targetSurname = normalizeText(surname || "");
+  const targetSurname = cleanSurnameFromSpeech(surname || "");
   const targetTime = time24 ? String(time24) : "";
   const targetPeople = Number.isFinite(Number(people)) ? Number(people) : null;
   const targetLast3 = String(phoneLast3 || "").replace(/\D/g, "").slice(-3) || "";
   const caller = isValidPhoneE164(callerPhoneE164) ? callerPhoneE164 : "";
 
   const scored = (candidates || []).map((ev) => {
-    const evSurname = extractSurnameFromEvent(ev);
-    const evTime = extractTime24FromEvent(ev);
-    const evPeople = extractPeopleFromDescription(ev?.description) || extractPeopleFromSummary(ev?.summary);
-    const evPhone = extractPhoneE164FromEvent(ev);
-
-    let score = 0;
-
-    // cognome: fuzzy
-    if (targetSurname) {
-      score += similarityRatio(targetSurname, evSurname) * 0.55;
-    } else {
-      // se non ho cognome, piccolo bonus per non penalizzare troppo
-      score += 0.05;
-    }
-
-    // orario
-    if (targetTime && evTime) {
-      if (targetTime === evTime) score += 0.22;
-      else {
-        // tolleranza 15 min
-        const [h1, m1] = targetTime.split(":").map(Number);
-        const [h2, m2] = evTime.split(":").map(Number);
-        if (Number.isFinite(h1) && Number.isFinite(m1) && Number.isFinite(h2) && Number.isFinite(m2)) {
-          const diff = Math.abs((h1 * 60 + m1) - (h2 * 60 + m2));
-          if (diff <= 15) score += 0.12;
-        }
-      }
-    }
-
-    // persone
-    if (targetPeople && Number.isFinite(evPeople)) {
-      if (Number(evPeople) === targetPeople) score += 0.15;
-      else if (Math.abs(Number(evPeople) - targetPeople) === 1) score += 0.08;
-    }
-
-    // telefono (disambiguazione)
-    let phoneMatched = false;
-    if (targetLast3 && evPhone) {
-      const evDigits = evPhone.replace(/\D/g, "").replace(/^39/, "");
-      if (evDigits.endsWith(targetLast3)) {
-        score += 0.25;
-        phoneMatched = true;
-      }
-    } else if (caller && evPhone && evPhone === caller) {
-      score += 0.18; // aiuto "silenzioso" senza chiederlo
-    }
+    const fields = extractEventFields(ev);
+    const scoring = scoreCandidate(fields, {
+      surname: targetSurname,
+      time24: targetTime,
+      people: targetPeople,
+      phoneLast3: targetLast3,
+      callerPhoneE164: caller,
+    });
 
     return {
       ev,
-      score,
-      evSurname,
-      evTime,
-      evPeople: Number.isFinite(evPeople) ? Number(evPeople) : null,
-      evPhone,
-      phoneMatched,
+      score: scoring.score,
+      evSurname: fields.surname,
+      evTime: fields.time24,
+      evPeople: fields.people,
+      evPhone: fields.phoneE164,
+      phoneMatched: scoring.phoneMatched,
     };
   });
 
@@ -1575,8 +1598,16 @@ async function findBookingEventMatch({ dateISO, time24, surname, people, phoneLa
   const gap = bestScore - secondScore;
 
   const isConfident = bestScore >= 0.60 && (gap >= 0.14 || scored.length === 1);
+  const bestSurnameScore = targetSurname ? similarityRatio(targetSurname, best.evSurname) : 0;
 
-  if (isConfident) {
+  if (isConfident || (scored.length === 1 && bestSurnameScore >= 0.85 && bestScore >= 0.45)) {
+    console.log("[MANAGE] Match trovato:", {
+      eventId: best.ev?.id || "",
+      score: bestScore,
+      surname: best.evSurname,
+      time24: best.evTime,
+      people: best.evPeople,
+    });
     return {
       match: best.ev,
       candidates: scored.map((x) => x.ev),
@@ -1590,6 +1621,12 @@ async function findBookingEventMatch({ dateISO, time24, surname, people, phoneLa
   // ambiguo: chiedi persone, poi ultime 3 cifre (solo se serve)
   const needsPeople = !targetPeople;
   const needsPhone = !needsPeople && !targetLast3;
+  console.log("[MANAGE] Match ambiguo:", {
+    bestScore,
+    candidates: scored.length,
+    needsPeople,
+    needsPhone,
+  });
 
   return {
     match: null,
@@ -2431,6 +2468,53 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
   // utility parse date: anche giorni settimana
   const parseDateWithWeekday = (text) => parseDateIT(text) || parseNextWeekdayISO(text);
 
+  const finalizeModificationUpdate = async ({ newDateISO, newTime24, newPeople, newNotes, modificationRaw }) => {
+    const original = session.manageCandidateEvent || {};
+    const originalDateISO = String(original?.start?.dateTime || original?.start?.date || session.manageDateISO || "").slice(0, 10);
+    const originalTime24 = parseTimeIT(original?.start?.dateTime || "") || session.manageTime24;
+    const originalPeople =
+      extractPeopleFromDescription(original?.description) || extractPeopleFromSummary(original?.summary) || 2;
+    const originalNotes = extractNotesFromDescription(original?.description) || "";
+
+    const finalDateISO = newDateISO || originalDateISO;
+    const finalTime24 = newTime24 || originalTime24;
+    const finalPeople = newPeople || originalPeople;
+    const finalNotes = newNotes || originalNotes;
+
+    if (!finalDateISO || !finalTime24) {
+      return forwardBecause(`Richiesta modifica prenotazione: dati insufficienti (evento ${session.manageCandidateEventId || ""})`);
+    }
+
+    const selectionResult = await computeTableSelectionForChange({
+      dateISO: finalDateISO,
+      time24: finalTime24,
+      people: finalPeople,
+      ignoreEventId: session.manageCandidateEventId,
+    });
+
+    if (selectionResult.status === "closed" || selectionResult.status === "unavailable") {
+      return forwardBecause(`Richiesta modifica prenotazione: non disponibile (nuova data ${finalDateISO}, nuovo orario ${finalTime24}, persone ${finalPeople})`);
+    }
+
+    session.managePendingUpdate = {
+      newDateISO: finalDateISO,
+      newTime24: finalTime24,
+      newPeople: finalPeople,
+      newNotes: finalNotes,
+      durationMinutes: selectionResult.durationMinutes,
+      newTableLocks: selectionResult.selection?.locks || [],
+      modificationRaw: modificationRaw || session.manageModificationRaw,
+      originalDateISO,
+    };
+
+    session.operatorState = "manage_modify_confirm_apply";
+    gatherSpeech(
+      vr,
+      `Ok. Vuoi confermare la modifica a ${formatDateLabel(finalDateISO)} alle ${finalTime24} per ${finalPeople} persone?`
+    );
+    return { kind: "vr", twiml: vr.toString() };
+  };
+
   if (state === "manage_cancel_date") {
     if (emptySpeech) {
       const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi la data della prenotazione da annullare."));
@@ -2468,7 +2552,7 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       return { kind: "vr", twiml: vr.toString() };
     }
     resetRetries(session);
-    const sn = extractSurnameFromSpeech(speech) || speech.trim();
+    const sn = cleanSurnameFromSpeech(speech) || speech.trim();
     if (!sn) {
       session.retries = (session.retries || 0) + 1;
       if (session.retries >= 2) {
@@ -2495,7 +2579,12 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     if (tt.includes("non lo ricordo") || tt.includes("non ricordo") || isNoRequestsText(speech)) {
       session.manageTime24 = null;
     } else {
-      session.manageTime24 = parseTimeIT(speech);
+      const parsedTime = safeParseTime(speech);
+      if (!parsedTime) {
+        session.manageTime24 = null;
+      } else {
+        session.manageTime24 = parsedTime;
+      }
     }
     session.operatorState = "manage_cancel_search";
     state = session.operatorState;
@@ -2524,6 +2613,12 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
         gatherSpeech(vr, "Per aiutarmi a identificarla, dimmi le ultime tre cifre del numero con cui hai prenotato.");
         return { kind: "vr", twiml: vr.toString() };
       }
+      session.manageSearchRetries = Number(session.manageSearchRetries || 0) + 1;
+      if (session.manageSearchRetries <= 2) {
+        session.operatorState = "manage_cancel_surname";
+        gatherSpeech(vr, "Non ho trovato la prenotazione. Mi ripeti il cognome o un dettaglio come orario o numero persone?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
       return forwardBecause(
         `Richiesta annullamento prenotazione: impossibile identificare (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""}, orario ${session.manageTime24 || "non indicato"}, persone ${session.managePeople || "non indicate"})`
       );
@@ -2533,6 +2628,7 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     session.manageCandidateEvent = match;
     session.manageUsedPhone = Boolean(usedPhone);
     session.manageMatchedPhone = matchPhone || "";
+    session.manageSearchRetries = 0;
 
     session.operatorState = "manage_cancel_confirm";
 
@@ -2551,9 +2647,13 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     }
     const people = parsePeopleIT(speech);
     if (!Number.isFinite(people)) {
+      if (bumpRetries(session) >= 2) {
+        return forwardBecause(`Richiesta annullamento prenotazione: persone non riconosciute (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""})`);
+      }
       gatherSpeech(vr, "Non ho capito quante persone. Puoi ripeterlo?");
       return { kind: "vr", twiml: vr.toString() };
     }
+    resetRetries(session);
     session.managePeople = people;
     session.operatorState = "manage_cancel_search";
     return handleManageBookingFlow(session, req, vr, speech, false);
@@ -2571,9 +2671,13 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     }
     const last3 = parsePhoneLast3FromSpeech(speech);
     if (!last3) {
+      if (bumpRetries(session) >= 2) {
+        return forwardBecause(`Richiesta annullamento prenotazione: telefono non riconosciuto (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""})`);
+      }
       gatherSpeech(vr, "Non ho capito le ultime tre cifre. Puoi ripeterle?");
       return { kind: "vr", twiml: vr.toString() };
     }
+    resetRetries(session);
     session.managePhoneLast3 = last3;
     session.operatorState = "manage_cancel_search";
     return handleManageBookingFlow(session, req, vr, speech, false);
@@ -2588,11 +2692,15 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       }
       return { kind: "vr", twiml: vr.toString() };
     }
-    const time24 = parseTimeIT(speech);
+    const time24 = safeParseTime(speech);
     if (!time24) {
+      if (bumpRetries(session) >= 2) {
+        return forwardBecause(`Richiesta annullamento prenotazione: disambiguazione orario non riconosciuta (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || ""})`);
+      }
       gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
       return { kind: "vr", twiml: vr.toString() };
     }
+    resetRetries(session);
     session.manageTime24 = time24;
     session.operatorState = "manage_cancel_search";
     return handleManageBookingFlow(session, req, vr, speech, false);
@@ -2620,8 +2728,8 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     if (!ok) {
       return forwardBecause(`Richiesta annullamento prenotazione: errore aggiornamento (evento ${session.manageCandidateEventId || ""})`);
     }
+    console.log("[MANAGE] Prenotazione annullata:", { eventId: session.manageCandidateEventId });
     softReturnToMenu("Perfetto. Ho annullato la prenotazione.");
-    return { kind: "vr", twiml: vr.toString() };
     return { kind: "vr", twiml: vr.toString() };
   }
 
@@ -2658,11 +2766,17 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       }
       return { kind: "vr", twiml: vr.toString() };
     }
-    let time24 = parseTimeIT(speech);
+    let time24 = safeParseTime(speech);
     if (tt.includes("non lo ricordo") || tt.includes("non ricordo")) {
       time24 = null;
     }
     if (!time24 && !(tt.includes("non lo ricordo") || tt.includes("non ricordo"))) {
+      if (tt && /[a-z]/i.test(tt)) {
+        session.manageTime24 = null;
+        session.operatorState = "manage_modify_surname";
+        gatherSpeech(vr, "Mi dici anche il cognome della prenotazione? Se non lo ricordi, dì: non lo ricordo.");
+        return { kind: "vr", twiml: vr.toString() };
+      }
       session.retries = (session.retries || 0) + 1;
       if (session.retries >= 2) {
         return forwardBecause(`Richiesta modifica prenotazione: orario non riconosciuto (data ${session.manageDateISO || ""})`);
@@ -2689,7 +2803,7 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     if (tt.includes("non lo ricordo") || tt.includes("non ricordo") || isNoRequestsText(speech)) {
       session.manageSurname = null;
     } else {
-      const sn = extractSurnameFromSpeech(speech) || speech.trim();
+      const sn = cleanSurnameFromSpeech(speech) || speech.trim();
       if (!sn) {
         session.retries = (session.retries || 0) + 1;
         if (session.retries >= 2) {
@@ -2727,6 +2841,12 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
         gatherSpeech(vr, "Per aiutarmi a identificarla, dimmi le ultime tre cifre del numero con cui hai prenotato.");
         return { kind: "vr", twiml: vr.toString() };
       }
+      session.manageSearchRetries = Number(session.manageSearchRetries || 0) + 1;
+      if (session.manageSearchRetries <= 2) {
+        session.operatorState = "manage_modify_surname";
+        gatherSpeech(vr, "Non ho trovato la prenotazione. Mi ripeti il cognome o un dettaglio come orario o numero persone?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
       return forwardBecause(
         `Richiesta modifica prenotazione: impossibile identificare (data ${session.manageDateISO || ""}, cognome ${session.manageSurname || "non indicato"}, orario ${session.manageTime24 || "non indicato"}, persone ${session.managePeople || "non indicate"})`
       );
@@ -2736,6 +2856,7 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     session.manageCandidateEvent = match;
     session.manageUsedPhone = Boolean(usedPhone);
     session.manageMatchedPhone = matchPhone || "";
+    session.manageSearchRetries = 0;
 
     session.operatorState = "manage_modify_ask_change";
     gatherSpeech(vr, `Ho trovato questa prenotazione: ${match.summary || ""}. Cosa vuoi modificare?`);
@@ -2752,9 +2873,13 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     }
     const people = parsePeopleIT(speech);
     if (!Number.isFinite(people)) {
+      if (bumpRetries(session) >= 2) {
+        return forwardBecause(`Richiesta modifica prenotazione: persone non riconosciute (data ${session.manageDateISO || ""})`);
+      }
       gatherSpeech(vr, "Non ho capito quante persone. Puoi ripeterlo?");
       return { kind: "vr", twiml: vr.toString() };
     }
+    resetRetries(session);
     session.managePeople = people;
     session.operatorState = "manage_modify_search";
     return handleManageBookingFlow(session, req, vr, speech, false);
@@ -2772,9 +2897,13 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     }
     const last3 = parsePhoneLast3FromSpeech(speech);
     if (!last3) {
+      if (bumpRetries(session) >= 2) {
+        return forwardBecause(`Richiesta modifica prenotazione: telefono non riconosciuto (data ${session.manageDateISO || ""})`);
+      }
       gatherSpeech(vr, "Non ho capito le ultime tre cifre. Puoi ripeterle?");
       return { kind: "vr", twiml: vr.toString() };
     }
+    resetRetries(session);
     session.managePhoneLast3 = last3;
     session.operatorState = "manage_modify_search";
     return handleManageBookingFlow(session, req, vr, speech, false);
@@ -2791,50 +2920,110 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     }
 
     session.manageModificationRaw = String(speech || "").trim().slice(0, 200);
+    resetRetries(session);
 
-    const original = session.manageCandidateEvent || {};
-    const originalDateISO = String(original?.start?.dateTime || original?.start?.date || session.manageDateISO || "").slice(0, 10);
-    const originalTime24 = parseTimeIT(original?.start?.dateTime || "") || session.manageTime24;
-    const originalPeople = extractPeopleFromDescription(original?.description) || extractPeopleFromSummary(original?.summary) || 2;
-    const originalNotes = extractNotesFromDescription(original?.description) || "";
+    const wantsTimeChange = tt.includes("orario") || (tt.includes("ora") && tt.includes("camb"));
+    const wantsDateChange = tt.includes("data") || tt.includes("giorno");
+    const wantsPeopleChange = tt.includes("persone") || tt.includes("pax") || tt.includes("numero");
 
-    const newDateISO = parseDateWithWeekday(speech) || originalDateISO;
-    const newTime24 = parseTimeIT(speech) || originalTime24;
-    const newPeople = parsePeopleIT(speech) || originalPeople;
-    const newNotes = extractNotesHint(speech) || originalNotes;
+    const newDateISO = parseDateWithWeekday(speech);
+    const newTime24 = safeParseTime(speech);
+    const newPeople = parsePeopleIT(speech);
+    const newNotes = extractNotesHint(speech);
 
-    if (!newDateISO || !newTime24) {
-      return forwardBecause(`Richiesta modifica prenotazione: dati insufficienti (evento ${session.manageCandidateEventId || ""})`);
+    if (wantsTimeChange && !newTime24) {
+      session.manageModifyTarget = "time";
+      session.operatorState = "manage_modify_need_value";
+      gatherSpeech(vr, "Ok, qual è il nuovo orario?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    if (wantsDateChange && !newDateISO) {
+      session.manageModifyTarget = "date";
+      session.operatorState = "manage_modify_need_value";
+      gatherSpeech(vr, "Ok, qual è la nuova data?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    if (wantsPeopleChange && !Number.isFinite(newPeople)) {
+      session.manageModifyTarget = "people";
+      session.operatorState = "manage_modify_need_value";
+      gatherSpeech(vr, "Ok, per quante persone?");
+      return { kind: "vr", twiml: vr.toString() };
     }
 
-    const selectionResult = await computeTableSelectionForChange({
-      dateISO: newDateISO,
-      time24: newTime24,
-      people: newPeople,
-      ignoreEventId: session.manageCandidateEventId,
+    if (!wantsTimeChange && !wantsDateChange && !wantsPeopleChange && !newDateISO && !newTime24 && !Number.isFinite(newPeople) && !newNotes) {
+      if (bumpRetries(session) >= 2) {
+        return forwardBecause(`Richiesta modifica prenotazione: dettagli modifica non chiari (evento ${session.manageCandidateEventId || ""})`);
+      }
+      gatherSpeech(vr, "Non ho capito cosa vuoi modificare. Puoi dire orario, data o numero persone.");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    return finalizeModificationUpdate({
+      newDateISO,
+      newTime24,
+      newPeople: Number.isFinite(newPeople) ? newPeople : null,
+      newNotes: newNotes || null,
+      modificationRaw: session.manageModificationRaw,
     });
+  }
 
-    if (selectionResult.status === "closed" || selectionResult.status === "unavailable") {
-      return forwardBecause(`Richiesta modifica prenotazione: non disponibile (nuova data ${newDateISO}, nuovo orario ${newTime24}, persone ${newPeople})`);
+  if (state === "manage_modify_need_value") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Puoi ripetere il nuovo valore?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica prenotazione: nuovo valore non fornito (evento ${session.manageCandidateEventId || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
     }
 
-    session.managePendingUpdate = {
+    const target = session.manageModifyTarget || "";
+    let newDateISO = null;
+    let newTime24 = null;
+    let newPeople = null;
+
+    if (target === "time") {
+      newTime24 = safeParseTime(speech);
+      if (!newTime24) {
+        if (bumpRetries(session) >= 2) {
+          return forwardBecause(`Richiesta modifica prenotazione: nuovo orario non riconosciuto (evento ${session.manageCandidateEventId || ""})`);
+        }
+        gatherSpeech(vr, "Non ho capito il nuovo orario. Puoi ripeterlo?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+    } else if (target === "date") {
+      newDateISO = parseDateWithWeekday(speech);
+      if (!newDateISO) {
+        if (bumpRetries(session) >= 2) {
+          return forwardBecause(`Richiesta modifica prenotazione: nuova data non riconosciuta (evento ${session.manageCandidateEventId || ""})`);
+        }
+        gatherSpeech(vr, "Non ho capito la nuova data. Puoi ripeterla?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+    } else if (target === "people") {
+      const parsedPeople = parsePeopleIT(speech);
+      if (!Number.isFinite(parsedPeople)) {
+        if (bumpRetries(session) >= 2) {
+          return forwardBecause(`Richiesta modifica prenotazione: numero persone non riconosciuto (evento ${session.manageCandidateEventId || ""})`);
+        }
+        gatherSpeech(vr, "Non ho capito quante persone. Puoi ripeterlo?");
+        return { kind: "vr", twiml: vr.toString() };
+      }
+      newPeople = parsedPeople;
+    } else {
+      return forwardBecause(`Richiesta modifica prenotazione: target modifica non valido (evento ${session.manageCandidateEventId || ""})`);
+    }
+
+    resetRetries(session);
+    session.manageModificationRaw = `${session.manageModificationRaw || ""} ${String(speech || "").trim()}`.trim().slice(0, 200);
+    session.manageModifyTarget = null;
+
+    return finalizeModificationUpdate({
       newDateISO,
       newTime24,
       newPeople,
-      newNotes,
-      durationMinutes: selectionResult.durationMinutes,
-      newTableLocks: selectionResult.selection?.locks || [],
+      newNotes: null,
       modificationRaw: session.manageModificationRaw,
-      originalDateISO,
-    };
-
-    session.operatorState = "manage_modify_confirm_apply";
-    gatherSpeech(
-      vr,
-      `Ok. Vuoi confermare la modifica a ${formatDateLabel(newDateISO)} alle ${newTime24} per ${newPeople} persone?`
-    );
-    return { kind: "vr", twiml: vr.toString() };
+    });
   }
 
   if (state === "manage_modify_confirm_apply") {
@@ -2870,9 +3059,8 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     if (!ok) {
       return forwardBecause(`Richiesta modifica prenotazione: errore aggiornamento (evento ${session.manageCandidateEventId || ""})`);
     }
-    sayIt(vr, "Perfetto. Ho modificato la prenotazione. Grazie e a presto.");
-    vr.hangup();
-    session.operatorState = null;
+    console.log("[MANAGE] Prenotazione modificata:", { eventId: session.manageCandidateEventId });
+    softReturnToMenu("Perfetto. Ho modificato la prenotazione. Ti serve altro?");
     return { kind: "vr", twiml: vr.toString() };
   }
 
@@ -4890,12 +5078,14 @@ async function handleVoiceRequest(req, res) {
         // Nuovo: annulla/modifica prenotazione
         if (
           (normalized.includes("annull") || normalized.includes("cancell") || normalized.includes("disdir")) &&
-          (normalized.includes("prenot") || normalized.includes("prenotazione"))
+          !normalized.includes("menu") &&
+          !normalized.includes("orari") &&
+          !normalized.includes("evento")
         ) {
           intent = "manage_cancel";
         } else if (
           (normalized.includes("modific") || normalized.includes("cambi") || normalized.includes("spost") || normalized.includes("varia")) &&
-          (normalized.includes("prenot") || normalized.includes("prenotazione"))
+          (normalized.includes("prenot") || normalized.includes("prenotazione") || normalized.includes("tavolo") || normalized.includes("orario") || normalized.includes("data") || normalized.includes("persone"))
         ) {
           intent = "manage_modify";
         } else if (normalized.includes("tavolo") || normalized.includes("prenot")) {
@@ -4945,6 +5135,7 @@ async function handleVoiceRequest(req, res) {
           session.manageSurname = null;
           session.manageCandidateEventId = null;
           session.manageCandidateEvent = null;
+          session.manageSearchRetries = 0;
           session.operatorState = "manage_cancel_date";
           gatherSpeech(vr, "Va bene. Dimmi la data della prenotazione da annullare.");
           break;
@@ -4959,6 +5150,7 @@ async function handleVoiceRequest(req, res) {
           session.manageCandidateEvent = null;
           session.manageModificationRaw = null;
           session.managePendingUpdate = null;
+          session.manageSearchRetries = 0;
           session.operatorState = "manage_modify_date";
           gatherSpeech(vr, "Va bene. Dimmi la data della prenotazione da modificare.");
           break;
