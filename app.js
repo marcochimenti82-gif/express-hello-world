@@ -1354,6 +1354,9 @@ async function findBookingEventMatch({ dateISO, time24, surname }) {
 }
 
 async function patchBookingAsCanceled(eventId, dateISO, originalEvent) {
+  // Patch minimo e robusto:
+  // - aggiorna SOLO summary/description
+  // - NON modifica start/end (evita conversioni dateTime <-> date che causano errori 400)
   if (!GOOGLE_CALENDAR_ID || !eventId || !dateISO) return null;
   const calendar = buildCalendarClient();
   if (!calendar) return null;
@@ -1380,14 +1383,17 @@ async function patchBookingAsCanceled(eventId, dateISO, originalEvent) {
       requestBody: {
         summary: newSummary,
         description: newDesc,
-        start: { date: dateISO },
-        end: { date: getNextDateISO(dateISO) },
       },
     });
+
+    // Aggiorna disponibilità sul giorno della prenotazione annullata
     await upsertAvailabilityEvent(dateISO);
     return result?.data || null;
   } catch (err) {
-    console.error("[GOOGLE] Cancel booking patch failed:", err);
+    // Log più leggibile (utile su Render)
+    const status = err?.response?.status ?? err?.code ?? null;
+    const data = err?.response?.data ?? null;
+    console.error("[GOOGLE] Cancel booking patch failed:", { status, data });
     return null;
   }
 }
