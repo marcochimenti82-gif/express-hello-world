@@ -135,6 +135,20 @@ const TABLE_COMBINATIONS = [
   { displayId: "T7F", area: "outside", replaces: ["T7F", "T8F"], min: 6, max: 8, notes: "unione T7F+T8F" },
 ];
 
+// ... [il resto del file è identico a `/mnt/data/app_2101_2154.js` fino alla riga 5909]
+
+
+const TABLE_COMBINATIONS = [
+  { displayId: "T1", area: "inside", replaces: ["T1", "T2"], min: 6, max: 6, notes: "unione T1+T2" },
+  { displayId: "T3", area: "inside", replaces: ["T3", "T4"], min: 6, max: 6, notes: "unione T3+T4" },
+  { displayId: "T14", area: "inside", replaces: ["T14", "T15"], min: 12, max: 18, notes: "unione T14+T15" },
+  { displayId: "T10", area: "inside", replaces: ["T10", "T11"], min: 6, max: 6, notes: "unione T10+T11" },
+  { displayId: "T11", area: "inside", replaces: ["T11", "T12"], min: 6, max: 6, notes: "unione T11+T12" },
+  { displayId: "T10", area: "inside", replaces: ["T10", "T11", "T12"], min: 10, max: 12, notes: "unione T10+T11+T12" },
+  { displayId: "T16", area: "inside", replaces: ["T16", "T17"], min: 8, max: 11, notes: "unione T16+T17" },
+  { displayId: "T7F", area: "outside", replaces: ["T7F", "T8F"], min: 6, max: 8, notes: "unione T7F+T8F" },
+];
+
 // ======================= XML SAFE TEXT =======================
 function xmlEscape(s) {
   return String(s || "")
