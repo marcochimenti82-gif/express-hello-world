@@ -2831,11 +2831,11 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
   if (state === "manage_modify_set_notes") {
     if (emptySpeech) {
       const silenceResult = handleSilence(session, vr, () =>
-        gatherSpeech(vr, "Dimmi le . Se non ce ne sono, dì: nessuna.")
+        gatherSpeech(vr, "Dimmi le richieste particolari. Se non ce ne sono, dì: nessuna.")
       );
       if (silenceResult.action === "forward") {
         return forwardBecause(
-          `Richiesta modifica prenotazione:  non fornite (evento ${session.manageCandidateEventId || ""})`
+          `Richiesta modifica prenotazione: richieste particolari non fornite (evento ${session.manageCandidateEventId || ""})`
         );
       }
       return { kind: "vr", twiml: vr.toString() };
@@ -2856,18 +2856,6 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
     return await handleModifyFinalize(session, vr);
   }
 
-      const add = String(speech || "").trim().slice(0, 300);
-    resetRetries(session);
-
-    session.manageProposed = session.manageProposed || {};
-    const prev = String(session.manageProposed.notes || "").trim();
-    if (!isNoRequestsText(add)) {
-      session.manageProposed.notes = prev ? `${prev}\n${add}` : add;
-    }
-
-    session.operatorState = "manage_modify_finalize";
-    return handleManageBookingFlow(session, req, vr, speech, false);
-  }
 
   if (state === "manage_modify_finalize") {
     return await handleModifyFinalize(session, vr);
