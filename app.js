@@ -1539,12 +1539,48 @@ function filterCandidatesBySurname(candidates, surnameRaw) {
 
 function filterCandidatesByTime(candidates, time24) {
   if (!time24) return candidates;
-  const t = String(time24);
+
+  const target = String(time24).trim(); // HH:MM
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+
+  const toMinutes = (t) => {
+    const mm = String(t || "").match(/(\d{1,2}):(\d{2})/);
+    if (!mm) return null;
+    const h = Number(mm[1]);
+    const m = Number(mm[2]);
+    if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+    return h * 60 + m;
+  };
+
+  const targetMin = toMinutes(target);
+  if (targetMin == null) return candidates;
+
+  // 1) Prova match su start.dateTime (più affidabile del summary)
+  const withStart = (candidates || []).filter((ev) => {
+    const dt = ev?.start?.dateTime;
+    if (!dt) return false;
+    try {
+      const d = new Date(dt);
+      const parts = getPartsInTimeZone(d, tz);
+      const evMin = parts.hour * 60 + parts.minute;
+      // tolleranza +/- 20 minuti (speech e arrotondamenti)
+      return Math.abs(evMin - targetMin) <= 20;
+    } catch {
+      return false;
+    }
+  });
+
+  if (withStart.length) return withStart;
+
+  // 2) Fallback: match su summary "Ore HH:MM"
+  const t = target;
   return (candidates || []).filter((ev) => {
     const sum = String(ev?.summary || "");
     return sum.toLowerCase().includes(`ore ${t}`.toLowerCase());
   });
 }
+
+function extractDateISOFromEvent
 
 function extractDateISOFromEvent(ev) {
   const dt = ev?.start?.dateTime || ev?.start?.date || "";
@@ -1553,12 +1589,24 @@ function extractDateISOFromEvent(ev) {
 
 async function findBookingEventMatch({ dateISO, time24, surname }) {
   const base = await findBookingCandidatesByDate(dateISO);
-  const bySurname = filterCandidatesBySurname(base, surname);
-  const candidates = bySurname;
-  const byTime = filterCandidatesByTime(bySurname, time24);
-  const match = (byTime && byTime.length ? byTime[0] : candidates[0]) || null;
-  return { match, candidates };
+
+  // Se il cognome viene estratto male o l'evento non contiene il cognome nel summary/descrizione,
+  // non vogliamo fallire: proviamo prima con cognome, poi fallback senza cognome.
+  let candidates = filterCandidatesBySurname(base, surname);
+  let surnameWasUsed = Boolean(normalizeText(surname));
+
+  if (surnameWasUsed && (!candidates || candidates.length === 0)) {
+    candidates = base;
+    surnameWasUsed = false;
+  }
+
+  const byTime = filterCandidatesByTime(candidates, time24);
+  const match =
+    (byTime && byTime.length ? byTime[0] : (candidates && candidates.length ? candidates[0] : null)) || null;
+
+  return { match, candidates, surnameWasUsed };
 }
+
 
 async function patchBookingAsCanceled(eventId, dateISO, originalEvent) {
   // Versione "anti-bug": tenta più strategie e logga l'errore reale.
