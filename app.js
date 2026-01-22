@@ -1015,7 +1015,40 @@ function formatDateLabel(dateISO) {
     ];
     return `${weekdays[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]} ${date.getFullYear()}`;
   }
+
 }
+
+/**
+ * Extracts event duration in minutes from a Google Calendar event.
+ * Returns null if it cannot be computed safely.
+ */
+function extractDurationMinutesFromEvent(ev) {
+  try {
+    if (!ev || !ev.start || !ev.end) return null;
+
+    // Google Calendar may use dateTime (timed) or date (all-day).
+    const startRaw = ev.start.dateTime || (ev.start.date ? `${ev.start.date}T00:00:00` : null);
+    const endRaw = ev.end.dateTime || (ev.end.date ? `${ev.end.date}T00:00:00` : null);
+    if (!startRaw || !endRaw) return null;
+
+    const start = new Date(startRaw);
+    const end = new Date(endRaw);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+
+    const diffMs = end.getTime() - start.getTime();
+    const diffMin = Math.round(diffMs / 60000);
+
+    // Guardrails: avoid crazy values (negative / too long).
+    if (!Number.isFinite(diffMin)) return null;
+    if (diffMin <= 0) return null;
+    if (diffMin > 12 * 60) return null; // > 12h, likely wrong for a booking
+
+    return diffMin;
+  } catch {
+    return null;
+  }
+}
+
 
 
 // ---- Back/edit commands
@@ -1675,6 +1708,10 @@ async function patchBookingAsModified({
   const name = (nameMatch?.[1] || "").trim() || "Cliente";
   const people = Number.isFinite(newPeople) ? newPeople : Number((oldDesc.match(/^Persone:\s*(\d+)/im) || [])[1]) || null;
   const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+  const safeColorId = (typeof MODIFIED_EVENT_COLOR_ID === "string" && /^[0-9]+$/.test(MODIFIED_EVENT_COLOR_ID)
+    && Number(MODIFIED_EVENT_COLOR_ID) >= 1 && Number(MODIFIED_EVENT_COLOR_ID) <= 11)
+    ? MODIFIED_EVENT_COLOR_ID
+    : null;
   const endDateTime = computeEndDateTime(newDateISO, newTime24, durationMinutes || 120, tz);
 
   const baseDescLines = [
@@ -1701,17 +1738,36 @@ async function patchBookingAsModified({
     .join("\n");
 
   try {
-    const result = await calendar.events.patch({
-      calendarId: GOOGLE_CALENDAR_ID,
-      eventId,
-      requestBody: {
-        summary: `Ore ${newTime24}, tav ${tableLabel}, ${name}, ${people || ""} pax`.trim(),
-        description: updatedDescription,
-        colorId: MODIFIED_EVENT_COLOR_ID,
-        start: { dateTime: `${newDateISO}T${newTime24}:00`, timeZone: GOOGLE_CALENDAR_TZ },
-        end: { dateTime: endDateTime, timeZone: GOOGLE_CALENDAR_TZ },
-      },
-    });
+    const requestBody = {
+      summary: `Ore ${newTime24}, tav ${tableLabel}, ${name}, ${people || ""} pax`.trim(),
+      description: updatedDescription,
+      ...(safeColorId ? { colorId: safeColorId } : {}),
+      start: { dateTime: `${newDateISO}T${newTime24}:00`, timeZone: tz },
+      end: { dateTime: endDateTime, timeZone: tz },
+    };
+
+    let result;
+    try {
+      result = await calendar.events.patch({
+        calendarId: GOOGLE_CALENDAR_ID,
+        eventId,
+        requestBody,
+      });
+    } catch (err) {
+      // If Google rejects the colorId, retry once without it.
+      if (safeColorId) {
+        console.warn("[GOOGLE] Patch failed with colorId, retrying without colorId:", err?.message);
+        const rb2 = { ...requestBody };
+        delete rb2.colorId;
+        result = await calendar.events.patch({
+          calendarId: GOOGLE_CALENDAR_ID,
+          eventId,
+          requestBody: rb2,
+        });
+      } else {
+        throw err;
+      }
+    }
     const oldDateISO = extractDateISOFromEvent(originalEvent);
     if (oldDateISO) await upsertAvailabilityEvent(oldDateISO);
     await upsertAvailabilityEvent(newDateISO);
