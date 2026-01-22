@@ -1539,48 +1539,12 @@ function filterCandidatesBySurname(candidates, surnameRaw) {
 
 function filterCandidatesByTime(candidates, time24) {
   if (!time24) return candidates;
-
-  const target = String(time24).trim(); // HH:MM
-  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-
-  const toMinutes = (t) => {
-    const mm = String(t || "").match(/(\d{1,2}):(\d{2})/);
-    if (!mm) return null;
-    const h = Number(mm[1]);
-    const m = Number(mm[2]);
-    if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
-    return h * 60 + m;
-  };
-
-  const targetMin = toMinutes(target);
-  if (targetMin == null) return candidates;
-
-  // 1) Prova match su start.dateTime (più affidabile del summary)
-  const withStart = (candidates || []).filter((ev) => {
-    const dt = ev?.start?.dateTime;
-    if (!dt) return false;
-    try {
-      const d = new Date(dt);
-      const parts = getPartsInTimeZone(d, tz);
-      const evMin = parts.hour * 60 + parts.minute;
-      // tolleranza +/- 20 minuti (speech e arrotondamenti)
-      return Math.abs(evMin - targetMin) <= 20;
-    } catch {
-      return false;
-    }
-  });
-
-  if (withStart.length) return withStart;
-
-  // 2) Fallback: match su summary "Ore HH:MM"
-  const t = target;
+  const t = String(time24);
   return (candidates || []).filter((ev) => {
     const sum = String(ev?.summary || "");
     return sum.toLowerCase().includes(`ore ${t}`.toLowerCase());
   });
 }
-
-function extractDateISOFromEvent
 
 function extractDateISOFromEvent(ev) {
   const dt = ev?.start?.dateTime || ev?.start?.date || "";
@@ -1588,25 +1552,80 @@ function extractDateISOFromEvent(ev) {
 }
 
 async function findBookingEventMatch({ dateISO, time24, surname }) {
-  const base = await findBookingCandidatesByDate(dateISO);
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+    const base = await findBookingCandidatesByDate(dateISO);
+    const normalizedSurname = normalizeText(surname);
 
-  // Se il cognome viene estratto male o l'evento non contiene il cognome nel summary/descrizione,
-  // non vogliamo fallire: proviamo prima con cognome, poi fallback senza cognome.
-  let candidates = filterCandidatesBySurname(base, surname);
-  let surnameWasUsed = Boolean(normalizeText(surname));
+    // 1) Se il cognome filtra a zero risultati, NON fallire: fallback ai candidati del giorno
+    let candidates = base || [];
+    if (normalizedSurname) {
+      const bySurname = filterCandidatesBySurname(candidates, surname);
+      if (bySurname && bySurname.length) candidates = bySurname;
+    }
 
-  if (surnameWasUsed && (!candidates || candidates.length === 0)) {
-    candidates = base;
-    surnameWasUsed = false;
-  }
+    // Helper per estrarre HH:MM dall'evento usando start.dateTime (più affidabile del summary)
+    const parseHHMM = (hhmm) => {
+      const m = String(hhmm || "").match(/^(\d{1,2}):(\d{2})$/);
+      if (!m) return null;
+      const hh = Number(m[1]);
+      const mm = Number(m[2]);
+      if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+      if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+      return hh * 60 + mm;
+    };
 
-  const byTime = filterCandidatesByTime(candidates, time24);
-  const match =
-    (byTime && byTime.length ? byTime[0] : (candidates && candidates.length ? candidates[0] : null)) || null;
+    const getEventMinutes = (ev) => {
+      try {
+        const dt = ev?.start?.dateTime || ev?.start?.date;
+        if (!dt) return null;
+        const d = new Date(dt);
+        if (Number.isNaN(d.getTime())) return null;
+        const parts = getPartsInTimeZone(d, tz);
+        const hh = Number(parts.hour);
+        const mm = Number(parts.minute);
+        if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+        return hh * 60 + mm;
+      } catch {
+        return null;
+      }
+    };
 
-  return { match, candidates, surnameWasUsed };
+    const targetMinutes = parseHHMM(time24);
+
+    // 2) Se abbiamo orario, scegli il candidato con differenza minima (tolleranza)
+    let match = null;
+    if (targetMinutes != null && candidates.length) {
+      const scored = candidates
+        .map((ev) => {
+          const evMin = getEventMinutes(ev);
+          const diff = evMin == null ? null : Math.abs(evMin - targetMinutes);
+          const sum = normalizeText(ev?.summary || "");
+          const desc = normalizeText(ev?.description || "");
+          const surnameHit = normalizedSurname ? (sum.includes(normalizedSurname) || desc.includes(normalizedSurname)) : false;
+          const summaryHit = sum.includes(normalizeText(`ore ${time24}`));
+          // score: diff in minuti (basso è meglio), bonus se matcha cognome/summary
+          const score =
+            (diff == null ? 9999 : diff) -
+            (surnameHit ? 5 : 0) -
+            (summaryHit ? 2 : 0);
+          return { ev, diff, score };
+        })
+        .sort((a, b) => a.score - b.score);
+
+      // accetta se diff entro 30 minuti, altrimenti fallback
+      if (scored[0] && (scored[0].diff == null || scored[0].diff <= 30)) {
+        match = scored[0].ev;
+      }
+    }
+
+    // 3) Fallback: vecchio matching su summary "Ore HH:MM"
+    if (!match) {
+      const byTime = filterCandidatesByTime(candidates, time24);
+      match = (byTime && byTime.length ? byTime[0] : candidates[0]) || null;
+    }
+
+    return { match, candidates };
 }
-
 
 async function patchBookingAsCanceled(eventId, dateISO, originalEvent) {
   // Versione "anti-bug": tenta più strategie e logga l'errore reale.
