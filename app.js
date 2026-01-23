@@ -4609,6 +4609,7 @@ async function createEventCalendarEvent(session) {
     end: { date: endDateISO },
     // non blocca free/busy
     transparency: "transparent",
+    colorId: "4", // Fenicottero (Flamingo)
     extendedProperties: {
       private: {
         type: "evento",
