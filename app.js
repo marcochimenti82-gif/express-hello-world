@@ -1118,7 +1118,7 @@ function promptForStep(vr, session) {
       gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
       return;
     case 9:
-      gatherSpeech(vr, "Hai altre ? Se sì, dimmelo ora.");
+      gatherSpeech(vr, "Ci sono altre richieste particolari? Se sì, dimmelo ora. Se no, dì: nessuna.");
       return;
     case 10:
       gatherSpeech(
@@ -1216,7 +1216,8 @@ function parsePeopleIT(speech) {
   if (!tt) return null;
 
   // digits anywhere: "8", "siamo in 8", "8 persone"
-  const m = tt.match(/\b(\d{1,2})\b/);
+  // digits anywhere (robusto): prende anche "in 6", "6,", "6." ecc.
+  const m = tt.match(/(\d{1,2})/);
   if (m) {
     const n = Number(m[1]);
     if (Number.isFinite(n) && n > 0) return n;
@@ -1408,7 +1409,7 @@ function parseTableIdIT(speech) {
   if (!tt) return null;
 
   // digits
-  const m = tt.match(/\b(\d{1,2})\b/);
+  // digits anywhere (robusto): prende anche "in 6", "6,", "6." ecc.\n  const m = tt.match(/(\d{1,2})/);
   let n = null;
   if (m) {
     const v = Number(m[1]);
@@ -1682,23 +1683,34 @@ function handleModifyFinalize(session, vr) {
   // verifica disponibilità tavolo per la nuova combinazione
   // (esclude l'evento da modificare)
   return (async () => {
-    const selection = await computeTableSelectionForChange({
+    const selectionResult = await computeTableSelectionForChange({
       dateISO: newDateISO,
       time24: newTime24,
       people: newPeople,
       ignoreEventId: session.manageCandidateEventId,
     });
 
-    if (!selection || selection.status === "closed") {
+    if (!selectionResult || selectionResult.status === "closed") {
       return forwardBecause(
         `Richiesta modifica prenotazione: giorno chiuso (${newDateISO}) (evento ${session.manageCandidateEventId || ""})`
       );
     }
-    if (selection.status === "unavailable") {
+    if (selectionResult.status === "unavailable") {
       return forwardBecause(
         `Richiesta modifica prenotazione: non disponibile (${newDateISO} ${newTime24} ${newPeople}) (evento ${session.manageCandidateEventId || ""})`
       );
     }
+
+    const chosenSelection =
+      (selectionResult && selectionResult.selection) ? selectionResult.selection :
+      (selectionResult && selectionResult.locks) ? selectionResult :
+      null;
+    if (!chosenSelection) {
+      return forwardBecause(
+        `Richiesta modifica prenotazione: impossibile assegnare tavolo (${newDateISO} ${newTime24} ${newPeople}) (evento ${session.manageCandidateEventId || ""})`
+      );
+    }
+
 
     session.managePendingUpdate = {
       eventId: session.manageCandidateEventId,
@@ -1707,8 +1719,8 @@ function handleModifyFinalize(session, vr) {
       newTime24,
       newPeople,
       newNotes,
-      newSelection: selection,
-      durationMinutes: extractDurationMinutesFromEvent(original) || 120,
+      newSelection: chosenSelection,
+      durationMinutes: (selectionResult && selectionResult.durationMinutes) ? selectionResult.durationMinutes : (extractDurationMinutesFromEvent(original) || 120),
       modificationRaw: session.manageModificationRaw || "",
     };
 
@@ -6232,12 +6244,12 @@ async function handleVoiceRequest(req, res) {
         session.step9NeedsDetail = false;
         maybeSayApericenaNotices(vr, session);
         maybeSayLiveMusicNotice(vr, session);
-        gatherSpeech(vr, "Hai altre ? Se sì, dimmelo ora.");
+        gatherSpeech(vr, "Ci sono altre richieste particolari? Se sì, dimmelo ora. Se no, dì: nessuna.");
         break;
       }
       case 9: {
-        const basePrompt = "Hai altre ? Se sì, dimmelo ora.";
-        const clarifyPrompt = "Va bene. Dimmi qual è la richiesta.";
+        const basePrompt = "Ci sono altre richieste particolari? Se sì, dimmelo ora. Se no, dì: nessuna.";
+        const clarifyPrompt = "Va bene. Dimmi qual è la richiesta particolare.";
 
         // gestione silenzio dedicata: 1° silenzio ripete, 2° silenzio consecutivo = NO
         if (emptySpeech) {
