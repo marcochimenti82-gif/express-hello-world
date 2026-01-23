@@ -1369,6 +1369,285 @@ function gotoModifyField(session, vr, field, isFirst) {
   return false;
 }
 
+// ====== gestione MODIFICA BLOCCO TAVOLO (LOCK / SLOT) ======
+
+function parseLockModificationChoices(speech) {
+  const t = normalizeText(speech || "");
+  if (!t) return [];
+
+  const found = [];
+  const push = (key, pos) => found.push({ key, pos });
+
+  // Data
+  const mDate = t.search(/\b(data|giorno|domani|dopodomani|oggi)\b/);
+  if (mDate >= 0) push("date", mDate);
+
+  // Orario
+  const mTime = t.search(/\b(orario|ora)\b/);
+  if (mTime >= 0) push("time", mTime);
+
+  // Durata
+  const mDur = t.search(/\b(durata|minuti|ore|ora)\b/);
+  if (mDur >= 0 && !found.some((x) => x.key === "duration")) push("duration", mDur);
+
+  // Tavolo
+  const mTab = t.search(/\b(tavolo|tav\.?|tav)\b/);
+  if (mTab >= 0) push("table", mTab);
+
+  // Dedup preserving order
+  found.sort((a, b) => a.pos - b.pos);
+  const out = [];
+  for (const f of found) {
+    if (!out.includes(f.key)) out.push(f.key);
+  }
+  return out;
+}
+
+function parseTableIdIT(speech) {
+  const tt = normalizeText(speech);
+  if (!tt) return null;
+
+  // digits
+  const m = tt.match(/\b(\d{1,2})\b/);
+  let n = null;
+  if (m) {
+    const v = Number(m[1]);
+    if (Number.isFinite(v) && v > 0) n = v;
+  }
+
+  if (n == null) {
+    // common italian number words (same as parsePeopleIT)
+    const map = {
+      uno: 1, una: 1, due: 2, tre: 3, quattro: 4, cinque: 5, sei: 6,
+      sette: 7, otto: 8, nove: 9, dieci: 10, undici: 11, dodici: 12,
+      tredici: 13, quattordici: 14, quindici: 15, sedici: 16, diciassette: 17,
+    };
+    const words = tt.split(/\s+/).filter(Boolean);
+    for (const w of words) {
+      if (Object.prototype.hasOwnProperty.call(map, w)) { n = map[w]; break; }
+    }
+  }
+
+  if (n == null) return null;
+
+  const wantsOutside =
+    tt.includes("fuori") || tt.includes("esterno") || tt.includes("all'aperto") || tt.includes("outside") ||
+    tt.includes("terrazza");
+
+  const suffix = wantsOutside || tt.includes(" f") || tt.includes("effe") ? "F" : "";
+  return normalizeTableId(`T${n}${suffix}`);
+}
+
+function parseDurationMinutesIT(speech) {
+  const tt = normalizeText(speech);
+  if (!tt) return null;
+
+  // direct minutes number
+  const m = tt.match(/\b(\d{1,3})\b/);
+  if (m) {
+    const v = Number(m[1]);
+    if (Number.isFinite(v) && v >= 15 && v <= 600) return v;
+  }
+
+  // patterns: "due ore", "un'ora", "ora e mezza", "mezz'ora"
+  const hasMezza = tt.includes("mezza") || tt.includes("mezzo") || tt.includes("mezzora") || tt.includes("mezz'ora");
+  const map = {
+    un: 1, una: 1, uno: 1,
+    due: 2, tre: 3, quattro: 4, cinque: 5, sei: 6, sette: 7, otto: 8, nove: 9, dieci: 10,
+  };
+
+  // "X ore"
+  const mOre = tt.match(/\b(un|una|uno|due|tre|quattro|cinque|sei|sette|otto|nove|dieci)\b.*\bore?\b/);
+  if (mOre) {
+    const h = map[mOre[1]];
+    if (h) return h * 60 + (hasMezza ? 30 : 0);
+  }
+
+  // "mezz'ora"
+  if (hasMezza && (tt.includes("ora") || tt.includes("ore"))) return 90; // default "un'ora e mezza" interpreted as 90
+  if (hasMezza && !tt.includes("ora") && !tt.includes("ore")) return 30;
+
+  return null;
+}
+
+function isAvailabilityEvent(ev) {
+  const kind = ev?.extendedProperties?.private?.ai_kind;
+  const s = String(ev?.summary || "").toLowerCase();
+  const d = String(ev?.description || "").toLowerCase();
+  return (
+    kind === "availability" ||
+    s.includes("lock") ||
+    (s.includes("tav") && s.includes("occup")) ||
+    d.includes("lock") ||
+    (d.includes("tav") && d.includes("occup"))
+  );
+}
+
+function getLockTableIdFromEvent(ev) {
+  const priv = ev?.extendedProperties?.private || {};
+  if (priv.tableId) return normalizeTableId(priv.tableId);
+
+  const tables = extractTablesFromEvent(ev);
+  if (tables && tables.length > 0) return normalizeTableId(tables[0]);
+
+  return null;
+}
+
+function findAvailabilityLockMatchFromEvents({ eventsForDate, dateISO, time24, tableId, tz }) {
+  const targetStart = makeUtcDateFromZoned(dateISO, time24, tz);
+  if (!targetStart) return null;
+  const targetMs = targetStart.getTime();
+
+  const candidates = (eventsForDate || []).filter((ev) => isAvailabilityEvent(ev));
+
+  let filtered = candidates;
+  if (tableId) {
+    filtered = candidates.filter((ev) => getLockTableIdFromEvent(ev) === tableId);
+    if (filtered.length === 0) filtered = candidates; // fallback
+  }
+
+  let best = null;
+  let bestDistMin = Infinity;
+
+  for (const ev of filtered) {
+    const r = getEventTimeRange(ev);
+    if (!r) continue;
+    const distMin = Math.abs(r.start.getTime() - targetMs) / 60000;
+    if (distMin < bestDistMin) {
+      bestDistMin = distMin;
+      best = ev;
+    }
+  }
+
+  if (!best) return null;
+  if (bestDistMin > 30) return null; // tolleranza 30 min
+  return best;
+}
+
+function gotoLockModifyField(session, vr, field, isFirst) {
+  const intro = (msgFirst, msgNext) => (isFirst ? msgFirst : msgNext);
+
+  if (field === "date") {
+    session.operatorState = "manage_lock_set_date";
+    gatherSpeech(
+      vr,
+      intro(
+        "Ok perfetto, cominciamo con la data. Per quale giorno vuoi spostare il blocco tavolo?",
+        "Perfetto. Adesso modifichiamo la data. Per quale giorno vuoi spostare il blocco tavolo?"
+      )
+    );
+    return true;
+  }
+
+  if (field === "time") {
+    session.operatorState = "manage_lock_set_time";
+    gatherSpeech(
+      vr,
+      intro(
+        "Ok perfetto, cominciamo con l'orario. A che ora deve iniziare il blocco?",
+        "Perfetto. Adesso modifichiamo l'orario. A che ora deve iniziare il blocco?"
+      )
+    );
+    return true;
+  }
+
+  if (field === "duration") {
+    session.operatorState = "manage_lock_set_duration";
+    gatherSpeech(
+      vr,
+      intro(
+        "Ok perfetto, cominciamo con la durata. Quanti minuti deve durare il blocco? Puoi dire anche: due ore.",
+        "Perfetto. Adesso modifichiamo la durata. Quanti minuti deve durare il blocco?"
+      )
+    );
+    return true;
+  }
+
+  if (field === "table") {
+    session.operatorState = "manage_lock_set_table";
+    gatherSpeech(
+      vr,
+      intro(
+        "Ok perfetto, cominciamo con il tavolo. Quale tavolo vuoi bloccare?",
+        "Perfetto. Adesso modifichiamo il tavolo. Quale tavolo vuoi bloccare?"
+      )
+    );
+    return true;
+  }
+
+  return false;
+}
+
+async function patchAvailabilityLockEvent({
+  eventId,
+  newDateISO,
+  newTime24,
+  newDurationMinutes,
+  newTableId,
+}) {
+  if (!GOOGLE_CALENDAR_ID) return false;
+  const calendar = buildCalendarClient();
+  if (!calendar) return false;
+  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+
+  const startDate = makeUtcDateFromZoned(newDateISO, newTime24, tz) || new Date(`${newDateISO}T${newTime24}:00`);
+  const duration = Number.isFinite(newDurationMinutes) && newDurationMinutes > 0 ? newDurationMinutes : 120;
+  const endDate = new Date(startDate.getTime() + duration * 60000);
+
+  const colorId = safeColorId("11"); // rosso per blocchi
+
+  const requestBodyBase = {
+    summary: newTableId ? `LOCK ${newTableId}` : "LOCK",
+    description: [
+      "BLOCCO TAVOLO",
+      newTableId ? `Tavolo: ${newTableId}` : "",
+      `Durata: ${duration} minuti`,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    start: { dateTime: startDate.toISOString(), timeZone: tz },
+    end: { dateTime: endDate.toISOString(), timeZone: tz },
+    extendedProperties: {
+      private: {
+        ai_kind: "availability",
+        ...(newTableId ? { tableId: String(newTableId) } : {}),
+      },
+    },
+    ...(colorId ? { colorId } : {}),
+  };
+
+  try {
+    await calendar.events.patch({
+      calendarId: GOOGLE_CALENDAR_ID,
+      eventId,
+      requestBody: requestBodyBase,
+    });
+    return true;
+  } catch (err) {
+    console.error("[GOOGLE] Patch lock failed:", err?.message);
+    console.error("[GOOGLE] Patch lock details:", err?.response?.data || err);
+
+    // retry without colorId if it might be the cause
+    if (requestBodyBase.colorId) {
+      try {
+        const retryBody = { ...requestBodyBase };
+        delete retryBody.colorId;
+        await calendar.events.patch({
+          calendarId: GOOGLE_CALENDAR_ID,
+          eventId,
+          requestBody: retryBody,
+        });
+        return true;
+      } catch (err2) {
+        console.error("[GOOGLE] Patch lock retry (no color) failed:", err2?.message);
+        console.error("[GOOGLE] Patch lock retry details:", err2?.response?.data || err2);
+      }
+    }
+    return false;
+  }
+}
+
+
 
 function handleModifyFinalize(session, vr) {
   const original = session.manageCandidateEvent || {};
@@ -3018,6 +3297,368 @@ async function handleManageBookingFlow(session, req, vr, speech, emptySpeech) {
       return forwardBecause(`Richiesta modifica prenotazione: errore aggiornamento (evento ${session.manageCandidateEventId || ""})`);
     }
     sayIt(vr, "Perfetto. Ho modificato la prenotazione. Grazie e a presto.");
+    vr.hangup();
+    session.operatorState = null;
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+
+  // ===== MODIFICA BLOCCO TAVOLO (LOCK / SLOT) =====
+  if (state === "manage_lock_date") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Dimmi la data del blocco tavolo da modificare."));
+      if (silenceResult.action === "forward") {
+        return forwardBecause("Richiesta modifica blocco tavolo: data non fornita");
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const dateISO = parseDateWithWeekday(speech);
+    if (!dateISO) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause("Richiesta modifica blocco tavolo: data non riconosciuta");
+      }
+      gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    session.manageLockDateISO = dateISO;
+    session.operatorState = "manage_lock_time";
+    gatherSpeech(vr, "Perfetto. A che ora inizia il blocco?");
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_lock_time") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "A che ora inizia il blocco?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica blocco tavolo: orario non fornito (data ${session.manageLockDateISO || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const time24 = parseTimeIT(speech);
+    if (!time24) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(`Richiesta modifica blocco tavolo: orario non riconosciuto (data ${session.manageLockDateISO || ""})`);
+      }
+      gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    session.manageLockTime24 = time24;
+    session.operatorState = "manage_lock_table";
+    gatherSpeech(vr, "Perfetto. Quale tavolo è bloccato? Dimmi il numero del tavolo.");
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_lock_table") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Quale tavolo è bloccato?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(
+          `Richiesta modifica blocco tavolo: tavolo non fornito (data ${session.manageLockDateISO || ""}, ora ${session.manageLockTime24 || ""})`
+        );
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const tableId = parseTableIdIT(speech);
+    if (!tableId) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(
+          `Richiesta modifica blocco tavolo: tavolo non riconosciuto (data ${session.manageLockDateISO || ""}, ora ${session.manageLockTime24 || ""})`
+        );
+      }
+      gatherSpeech(vr, "Non ho capito il tavolo. Puoi ripeterlo? Per esempio: tavolo 7.");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    resetRetries(session);
+    session.manageLockTableId = tableId;
+
+    const dateISO = session.manageLockDateISO;
+    const time24 = session.manageLockTime24;
+    const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
+
+    const eventsForDate = await listCalendarEventsBetweenISO(dateISO, dateISO);
+    const match = findAvailabilityLockMatchFromEvents({
+      eventsForDate,
+      dateISO,
+      time24,
+      tableId,
+      tz,
+    });
+
+    if (!match) {
+      return forwardBecause(
+        `Richiesta modifica blocco tavolo: blocco non trovato (data ${dateISO || ""}, ora ${time24 || ""}, tavolo ${tableId || ""})`
+      );
+    }
+
+    session.manageLockCandidateEvent = match;
+    session.manageLockCandidateEventId = match.id;
+
+    session.operatorState = "manage_lock_choose_fields";
+    gatherSpeech(
+      vr,
+      `Ho trovato il blocco del ${dateISO} alle ${time24} sul ${tableId}. Cosa vuoi modificare? Puoi scegliere: la data, l'orario, la durata o il tavolo. Puoi dire anche più cose, per esempio: orario e durata.`
+    );
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_lock_choose_fields") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(
+          vr,
+          "Cosa vuoi modificare del blocco? Puoi scegliere: la data, l'orario, la durata o il tavolo."
+        )
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(
+          `Richiesta modifica blocco tavolo: scelta campi non fornita (evento ${session.manageLockCandidateEventId || ""})`
+        );
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const choices = parseLockModificationChoices(speech);
+    if (!choices || choices.length === 0) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(
+          `Richiesta modifica blocco tavolo: scelta campi non riconosciuta (evento ${session.manageLockCandidateEventId || ""})`
+        );
+      }
+      gatherSpeech(
+        vr,
+        "Non ho capito. Puoi scegliere: la data, l'orario, la durata o il tavolo. Puoi dire anche: orario e durata."
+      );
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const original = session.manageLockCandidateEvent || {};
+    const originalDateISO = String(original?.start?.dateTime || original?.start?.date || session.manageLockDateISO || "").slice(0, 10);
+    const originalTime24 = parseTimeIT(original?.start?.dateTime || "") || session.manageLockTime24;
+    const originalDurationMinutes = extractDurationMinutesFromEvent(original) || 120;
+    const originalTableId = getLockTableIdFromEvent(original) || session.manageLockTableId;
+
+    session.manageLockOriginal = {
+      originalDateISO,
+      originalTime24,
+      originalDurationMinutes,
+      originalTableId,
+    };
+
+    session.manageLockProposed = {
+      dateISO: originalDateISO,
+      time24: originalTime24,
+      durationMinutes: originalDurationMinutes,
+      tableId: originalTableId,
+    };
+
+    session.manageLockModificationRaw = String(speech || "").trim().slice(0, 200);
+
+    // Normalizza chiavi
+    session.manageLockChangeQueue = choices.map((c) => (c === "date" ? "date" : c));
+    resetRetries(session);
+
+    const first = session.manageLockChangeQueue.shift();
+    gotoLockModifyField(session, vr, first, true);
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_lock_set_date") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(vr, "Non ho capito la data. Per quale giorno vuoi spostare il blocco tavolo?")
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica blocco tavolo: data non fornita (evento ${session.manageLockCandidateEventId || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const d = parseDateWithWeekday(speech);
+    if (!d) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(`Richiesta modifica blocco tavolo: data non riconosciuta (evento ${session.manageLockCandidateEventId || ""})`);
+      }
+      gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    session.manageLockProposed = session.manageLockProposed || {};
+    session.manageLockProposed.dateISO = d;
+
+    const next = (session.manageLockChangeQueue || []).shift();
+    session.manageLockChangeQueue = session.manageLockChangeQueue || [];
+    if (next) {
+      gotoLockModifyField(session, vr, next, false);
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    session.operatorState = "manage_lock_confirm_apply";
+    const p = session.manageLockProposed || {};
+    gatherSpeech(
+      vr,
+      `Riepilogo blocco: ${p.tableId || ""} il ${p.dateISO || ""} alle ${p.time24 || ""} per ${p.durationMinutes || 120} minuti. Vuoi confermare?`
+    );
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_lock_set_time") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(vr, "Non ho capito l'orario. A che ora deve iniziare il blocco?")
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica blocco tavolo: orario non fornito (evento ${session.manageLockCandidateEventId || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const t = parseTimeIT(speech);
+    if (!t) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(`Richiesta modifica blocco tavolo: orario non riconosciuto (evento ${session.manageLockCandidateEventId || ""})`);
+      }
+      gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    session.manageLockProposed = session.manageLockProposed || {};
+    session.manageLockProposed.time24 = t;
+
+    const next = (session.manageLockChangeQueue || []).shift();
+    session.manageLockChangeQueue = session.manageLockChangeQueue || [];
+    if (next) {
+      gotoLockModifyField(session, vr, next, false);
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    session.operatorState = "manage_lock_confirm_apply";
+    const p = session.manageLockProposed || {};
+    gatherSpeech(
+      vr,
+      `Riepilogo blocco: ${p.tableId || ""} il ${p.dateISO || ""} alle ${p.time24 || ""} per ${p.durationMinutes || 120} minuti. Vuoi confermare?`
+    );
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_lock_set_duration") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(vr, "Non ho capito la durata. Quanti minuti deve durare il blocco?")
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica blocco tavolo: durata non fornita (evento ${session.manageLockCandidateEventId || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const dur = parseDurationMinutesIT(speech);
+    if (!dur) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(`Richiesta modifica blocco tavolo: durata non riconosciuta (evento ${session.manageLockCandidateEventId || ""})`);
+      }
+      gatherSpeech(vr, "Non ho capito la durata. Puoi dire per esempio: 120 minuti, oppure due ore.");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    session.manageLockProposed = session.manageLockProposed || {};
+    session.manageLockProposed.durationMinutes = dur;
+
+    const next = (session.manageLockChangeQueue || []).shift();
+    session.manageLockChangeQueue = session.manageLockChangeQueue || [];
+    if (next) {
+      gotoLockModifyField(session, vr, next, false);
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    session.operatorState = "manage_lock_confirm_apply";
+    const p = session.manageLockProposed || {};
+    gatherSpeech(
+      vr,
+      `Riepilogo blocco: ${p.tableId || ""} il ${p.dateISO || ""} alle ${p.time24 || ""} per ${p.durationMinutes || 120} minuti. Vuoi confermare?`
+    );
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_lock_set_table") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () =>
+        gatherSpeech(vr, "Non ho capito il tavolo. Quale tavolo vuoi bloccare?")
+      );
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica blocco tavolo: tavolo non fornito (evento ${session.manageLockCandidateEventId || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    const tableId = parseTableIdIT(speech);
+    if (!tableId) {
+      session.retries = (session.retries || 0) + 1;
+      if (session.retries >= 2) {
+        return forwardBecause(`Richiesta modifica blocco tavolo: tavolo non riconosciuto (evento ${session.manageLockCandidateEventId || ""})`);
+      }
+      gatherSpeech(vr, "Non ho capito il tavolo. Puoi ripeterlo? Per esempio: tavolo 7.");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    resetRetries(session);
+    session.manageLockProposed = session.manageLockProposed || {};
+    session.manageLockProposed.tableId = tableId;
+
+    const next = (session.manageLockChangeQueue || []).shift();
+    session.manageLockChangeQueue = session.manageLockChangeQueue || [];
+    if (next) {
+      gotoLockModifyField(session, vr, next, false);
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    session.operatorState = "manage_lock_confirm_apply";
+    const p = session.manageLockProposed || {};
+    gatherSpeech(
+      vr,
+      `Riepilogo blocco: ${p.tableId || ""} il ${p.dateISO || ""} alle ${p.time24 || ""} per ${p.durationMinutes || 120} minuti. Vuoi confermare?`
+    );
+    return { kind: "vr", twiml: vr.toString() };
+  }
+
+  if (state === "manage_lock_confirm_apply") {
+    if (emptySpeech) {
+      const silenceResult = handleSilence(session, vr, () => gatherSpeech(vr, "Vuoi confermare la modifica del blocco?"));
+      if (silenceResult.action === "forward") {
+        return forwardBecause(`Richiesta modifica blocco tavolo: conferma non fornita (evento ${session.manageLockCandidateEventId || ""})`);
+      }
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const yn = parseYesNo(speech);
+    if (yn === false) {
+      softReturnToMenu("Va bene, non modifico nulla.");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+    if (yn !== true) {
+      gatherSpeech(vr, "Non ho capito. Vuoi confermare la modifica del blocco? Rispondi sì o no.");
+      return { kind: "vr", twiml: vr.toString() };
+    }
+
+    const p = session.manageLockProposed || {};
+    const ok = await patchAvailabilityLockEvent({
+      eventId: session.manageLockCandidateEventId,
+      newDateISO: p.dateISO,
+      newTime24: p.time24,
+      newDurationMinutes: p.durationMinutes,
+      newTableId: p.tableId,
+    });
+
+    if (!ok) {
+      return forwardBecause(`Richiesta modifica blocco tavolo: errore aggiornamento (evento ${session.manageLockCandidateEventId || ""})`);
+    }
+
+    sayIt(vr, "Perfetto. Ho modificato il blocco tavolo. Grazie e a presto.");
     vr.hangup();
     session.operatorState = null;
     return { kind: "vr", twiml: vr.toString() };
@@ -5029,6 +5670,12 @@ async function handleVoiceRequest(req, res) {
           intent = "manage_cancel";
         } else if (
           (normalized.includes("modific") || normalized.includes("cambi") || normalized.includes("spost") || normalized.includes("varia")) &&
+          (normalized.includes("blocco") || normalized.includes("slot") || normalized.includes("lock") || normalized.includes("occupat")) &&
+          (normalized.includes("tavolo") || normalized.includes("tav"))
+        ) {
+          intent = "manage_modify_lock";
+        } else if (
+          (normalized.includes("modific") || normalized.includes("cambi") || normalized.includes("spost") || normalized.includes("varia")) &&
           (normalized.includes("prenot") || normalized.includes("prenotazione"))
         ) {
           intent = "manage_modify";
@@ -5081,6 +5728,21 @@ async function handleVoiceRequest(req, res) {
           session.manageCandidateEvent = null;
           session.operatorState = "manage_cancel_date";
           gatherSpeech(vr, "Va bene. Dimmi la data della prenotazione da annullare.");
+          break;
+        }
+
+
+        if (intent === "manage_modify_lock") {
+          session.manageAction = "modify_lock";
+          session.manageLockDateISO = null;
+          session.manageLockTime24 = null;
+          session.manageLockTableId = null;
+          session.manageLockCandidateEventId = null;
+          session.manageLockCandidateEvent = null;
+          session.manageLockModificationRaw = null;
+          session.manageLockPendingUpdate = null;
+          session.operatorState = "manage_lock_date";
+          gatherSpeech(vr, "Va bene. Dimmi la data del blocco tavolo da modificare.");
           break;
         }
 
