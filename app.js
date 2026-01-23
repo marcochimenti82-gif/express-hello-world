@@ -512,6 +512,10 @@ function buildFallbackEmailPayload(session, req, reason) {
     eventName: session?.eventName || "",
     eventDateISO: session?.eventDateISO || "",
     eventTime24: session?.eventTime24 || "",
+    eventTypeKey: session?.eventTypeKey || "",
+    eventTypeLabel: session?.eventTypeLabel || "",
+    eventGuests: session?.eventGuests ?? "",
+    eventOtherRequestsRaw: session?.eventOtherRequestsRaw || "",
   };
   return {
     subject: "Fallback richiesta prenotazione",
@@ -610,7 +614,26 @@ function buildOperatorEmailPayload(session, req, reason) {
   const caller = session?.phone || req?.body?.From || "";
   const state = session?.step || "unknown";
   const requestType = session?.intent || "";
-  const payload = {
+
+  // Branch dedicato EVENTI
+  if (requestType === "event") {
+    return {
+      subject: "Inoltro operatore - richiesta EVENTO",
+      text: [
+        `Numero cliente: ${caller}`,
+        `Nome cliente: ${session?.name || ""}`,
+        `Data evento: ${session?.eventDateISO || ""}`,
+        `Tipologia: ${session?.eventTypeLabel || session?.eventTypeKey || ""}`,
+        `Invitati (circa): ${session?.eventGuests ?? ""}`,
+        `Altre richieste: ${session?.eventOtherRequestsRaw || ""}`,
+        `Stato flusso: ${state}`,
+        `Motivo inoltro: ${reason || "non specificato"}`,
+      ].join("\n"),
+    };
+  }
+
+  // Default: prenotazione tavolo / altro
+  return {
     subject: "Inoltro operatore - contesto prenotazione",
     text: [
       `Numero cliente: ${caller}`,
@@ -624,7 +647,6 @@ function buildOperatorEmailPayload(session, req, reason) {
       `Motivo inoltro: ${reason || "non specificato"}`,
     ].join("\n"),
   };
-  return payload;
 }
 
 async function sendOperatorEmail(session, req, reason) {
@@ -749,6 +771,16 @@ function getSession(callSid) {
       eventName: null,
       eventDateISO: null,
       eventTime24: null,
+      eventTypeKey: null,
+      eventTypeLabel: null,
+      eventGuests: null,
+      eventOtherRequestsRaw: null,
+      operatorState: null,
+      operatorKind: null,
+      operatorReasonTries: 0,
+      operatorReasonRaw: null,
+      operatorPrompt: null,
+      operatorRetryPrompt: null,
       wantsOutside: false,
       extraRequestsRaw: null,
       liveMusicNoticePending: false,
@@ -1263,6 +1295,36 @@ function parsePeopleIT(speech) {
 
   return null;
 }
+
+
+function parseEventTypeIT(speech) {
+  const tt = normalizeText(speech);
+  if (!tt) return null;
+
+  const has = (s) => tt.includes(s);
+
+  if (has("compleanno")) return { key: "birthday", label: "Compleanno" };
+  if (has("laurea")) return { key: "degree", label: "Laurea" };
+  if (has("aziendale") || has("azienda") || has("corporate")) return { key: "corporate", label: "Aziendale" };
+  if (has("anniversario")) return { key: "anniversary", label: "Anniversario" };
+  if (has("matrimonio") || has("nozze")) return { key: "wedding", label: "Matrimonio" };
+  if (has("battesimo")) return { key: "baptism", label: "Battesimo" };
+  if (has("comunione")) return { key: "communion", label: "Comunione" };
+  if (has("cresima")) return { key: "confirmation", label: "Cresima" };
+  if (has("nubilato") || has("celibato")) return { key: "henstag", label: "Addio al nubilato/celibato" };
+  if (has("festa") || has("evento")) return { key: "party", label: "Festa/Evento" };
+
+  return null;
+}
+
+function addDaysISO(dateISO, days) {
+  const [y, m, d] = String(dateISO || "").split("-").map((x) => Number(x));
+  if (!y || !m || !d) return null;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + Number(days || 0));
+  return dt.toISOString().slice(0, 10);
+}
+
 
 // ====== intent / info helpers (VOICE) ======
 function buildMainMenuPrompt() {
@@ -4521,25 +4583,38 @@ async function createEventCalendarEvent(session) {
   if (!GOOGLE_CALENDAR_ID) return null;
   const calendar = buildCalendarClient();
   if (!calendar) return null;
-  if (!session?.eventDateISO || !session?.eventTime24 || !session?.eventName) return null;
+  if (!session?.eventDateISO) return null;
 
-  const startDateTime = `${session.eventDateISO}T${session.eventTime24}:00`;
+  const typeLabel = session?.eventTypeLabel || "Evento";
+  const customer = session?.name || "Cliente";
+  const summary = `Richiesta ${typeLabel} - ${customer}`;
 
-  const tz = GOOGLE_CALENDAR_TZ || "Europe/Rome";
-  const endDateTime = computeEndDateTime(session.eventDateISO, session.eventTime24, 120, tz);
+  // ALL-DAY: end.date deve essere il giorno successivo (exclusive)
+  const endDateISO = addDaysISO(session.eventDateISO, 1);
+  if (!endDateISO) return null;
+
+  const descriptionLines = [
+    `Tipo: ${typeLabel}`,
+    `Nome cliente: ${customer}`,
+    `Telefono: ${session?.phone || ""}`,
+    `Data: ${session.eventDateISO}`,
+    `Invitati (circa): ${session?.eventGuests ?? ""}`,
+    `Altre richieste: ${session?.eventOtherRequestsRaw || ""}`,
+  ];
 
   const event = {
-    summary: `Evento - ${session.eventName}`,
-    description: [
-      `Nome evento: ${session.eventName}`,
-      `Data: ${session.eventDateISO}`,
-      `Ora: ${session.eventTime24}`,
-    ].join("\n"),
-    start: { dateTime: startDateTime, timeZone: GOOGLE_CALENDAR_TZ },
-    end: { dateTime: endDateTime, timeZone: GOOGLE_CALENDAR_TZ },
+    summary,
+    description: descriptionLines.join("\n"),
+    start: { date: session.eventDateISO },
+    end: { date: endDateISO },
+    // non blocca free/busy
+    transparency: "transparent",
     extendedProperties: {
       private: {
         type: "evento",
+        eventTypeKey: session?.eventTypeKey || "",
+        eventTypeLabel: typeLabel,
+        eventGuests: String(session?.eventGuests ?? ""),
       },
     },
   };
@@ -4555,6 +4630,7 @@ async function createEventCalendarEvent(session) {
     return null;
   }
 }
+
 
 
 
@@ -5264,6 +5340,11 @@ async function handleVoiceRequest(req, res) {
   const speech = String(req.body.SpeechResult || req.body.Digits || "");
   const session = getSession(callSid);
   if (session && !session.callSid) session.callSid = callSid;
+  // salva sempre il numero chiamante (utile per email/operatori e Calendar)
+  if (session && !session.phone) {
+    const from = String(req.body.From || "").trim();
+    if (from) session.phone = from;
+  }
   const vr = buildTwiml();
 
   try {
@@ -5784,14 +5865,13 @@ async function handleVoiceRequest(req, res) {
         }
 
         if (intent === "event") {
-          // Procedura ibrida: raccogli motivo, registra su Calendar e tenta inoltro operatore
-          session.operatorState = "await_reason";
-          session.operatorReasonTries = 0;
-          session.operatorReasonRaw = null;
+          // Wizard EVENTO: nome cliente -> data -> tipologia -> invitati -> richieste particolari
+          session.operatorState = null;
           session.operatorKind = "event";
-          session.operatorPrompt = "Va bene. Dimmi in poche parole i dettagli dell\'evento e cosa ti serve.";
-          session.operatorRetryPrompt = "Quali dettagli dell\'evento e cosa ti serve?";
-          gatherSpeech(vr, session.operatorPrompt);
+          resetRetries(session);
+          resetSilence(session);
+          session.step = "event_customer_name";
+          gatherSpeech(vr, "Perfetto. Come ti chiami?");
           break;
         }
 
@@ -5800,31 +5880,32 @@ async function handleVoiceRequest(req, res) {
         break;
       }
 
-      case "event_name": {
+      case "event_customer_name": {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "Perfetto. Come si chiama l'evento?")
+            gatherSpeech(vr, "Perfetto. Come ti chiami?")
           );
           if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_event_name");
-            void sendOperatorEmail(session, req, "silence_event_name");
+            await sendFallbackEmail(session, req, "silence_event_customer_name");
+            void sendOperatorEmail(session, req, "silence_event_customer_name");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
             return res.send(forwardToHumanTwiml());
           }
           break;
         }
-        session.eventName = speech.trim().slice(0, 80);
+
+        session.name = speech.trim().slice(0, 60);
         resetRetries(session);
         session.step = "event_date";
-        gatherSpeech(vr, "Per quale data vuoi prenotare l'evento?");
+        gatherSpeech(vr, "Per quale data è l'evento?");
         break;
       }
 
       case "event_date": {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "Per quale data vuoi prenotare l'evento?")
+            gatherSpeech(vr, "Per quale data è l'evento?")
           );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_event_date");
@@ -5835,39 +5916,100 @@ async function handleVoiceRequest(req, res) {
           }
           break;
         }
+
         const eventDateISO = parseDateIT(speech);
         if (!eventDateISO) {
           gatherSpeech(vr, "Non ho capito la data. Puoi ripeterla?");
           break;
         }
+
         session.eventDateISO = eventDateISO;
         resetRetries(session);
-        session.step = "event_time";
-        gatherSpeech(vr, "A che ora vuoi prenotare l'evento?");
+        session.step = "event_type";
+        gatherSpeech(vr, "Che tipologia di evento è? Compleanno, laurea, aziendale o altro?");
         break;
       }
 
-      case "event_time": {
+      case "event_type": {
+        if (emptySpeech) {
+          session.retries = (session.retries || 0) + 1;
+          if (session.retries <= 1) {
+            gatherSpeech(vr, "Che tipologia di evento è? Ad esempio compleanno, laurea, aziendale o altro.");
+            break;
+          }
+          session.eventTypeKey = "other";
+          session.eventTypeLabel = "Altro";
+          resetRetries(session);
+          session.step = "event_guests";
+          gatherSpeech(vr, "Quante persone circa parteciperanno?");
+          break;
+        }
+
+        const parsed = parseEventTypeIT(speech);
+        if (parsed) {
+          session.eventTypeKey = parsed.key;
+          session.eventTypeLabel = parsed.label;
+        } else {
+          session.eventTypeKey = "other";
+          session.eventTypeLabel = String(speech || "").trim().slice(0, 80) || "Altro";
+        }
+
+        resetRetries(session);
+        session.step = "event_guests";
+        gatherSpeech(vr, "Quante persone circa parteciperanno?");
+        break;
+      }
+
+      case "event_guests": {
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "A che ora vuoi prenotare l'evento?")
+            gatherSpeech(vr, "Quante persone circa parteciperanno?")
           );
           if (silenceResult.action === "forward") {
-            await sendFallbackEmail(session, req, "silence_event_time");
-            void sendOperatorEmail(session, req, "silence_event_time");
+            await sendFallbackEmail(session, req, "silence_event_guests");
+            void sendOperatorEmail(session, req, "silence_event_guests");
             res.set("Content-Type", "text/xml; charset=utf-8");
             await safeCreateFailedCallCalendarEvent(session, req, "fallback");
             return res.send(forwardToHumanTwiml());
           }
           break;
         }
-        const eventTime24 = parseTimeIT(speech);
-        if (!eventTime24) {
-          gatherSpeech(vr, "Non ho capito l'orario. Puoi ripeterlo?");
+
+        const n = parsePeopleIT(speech);
+        if (!n) {
+          gatherSpeech(vr, "Non ho capito il numero. Puoi dirmi un numero approssimativo di invitati?");
           break;
         }
-        session.eventTime24 = eventTime24;
+
+        session.eventGuests = n;
         resetRetries(session);
+        session.step = "event_other_requests";
+        gatherSpeech(
+          vr,
+          "Ci sono altre richieste particolari? Musica, torta, allestimento, menù, intolleranze, budget…"
+        );
+        break;
+      }
+
+      case "event_other_requests": {
+        if (emptySpeech) {
+          session.retries = (session.retries || 0) + 1;
+          if (session.retries <= 1) {
+            gatherSpeech(vr, "Hai altre richieste particolari? Se non ce ne sono, dimmi 'nessuna'.");
+            break;
+          }
+          session.eventOtherRequestsRaw = "nessuna";
+        } else {
+          const tt = normalizeText(speech);
+          if (tt === "nessuna" || tt === "no" || tt.includes("nessun") || tt.includes("niente") || tt.includes("nulla")) {
+            session.eventOtherRequestsRaw = "nessuna";
+          } else {
+            session.eventOtherRequestsRaw = String(speech || "").trim().slice(0, 400);
+          }
+        }
+
+        resetRetries(session);
+
         const createdEvent = await createEventCalendarEvent(session);
         if (!createdEvent && canForwardToHuman()) {
           await sendFallbackEmail(session, req, "event_calendar_failed");
@@ -5876,14 +6018,17 @@ async function handleVoiceRequest(req, res) {
           await safeCreateFailedCallCalendarEvent(session, req, "errore di sistema");
           return res.send(forwardToHumanTwiml());
         }
+
         sayIt(vr, "Grazie. Ho registrato la tua richiesta per l'evento. Ti contatteremo presto.");
         await sendFallbackEmail(session, req, "event_request_completed");
+        void sendOperatorEmail(session, req, "event_request_completed");
+
         if (canForwardToHuman()) {
-          void sendOperatorEmail(session, req, "event_request_completed");
           res.set("Content-Type", "text/xml; charset=utf-8");
           await safeCreateFailedCallCalendarEvent(session, req, "richiesta operatore");
           return res.send(forwardToHumanTwiml());
         }
+
         vr.hangup();
         res.set("Content-Type", "text/xml; charset=utf-8");
         return res.send(vr.toString());
