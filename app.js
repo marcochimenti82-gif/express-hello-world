@@ -5772,8 +5772,16 @@ async function handleVoiceRequest(req, res) {
           (normalized.includes("prenot") || normalized.includes("prenotazione"))
         ) {
           intent = "manage_modify";
-        } else if (normalized.includes("tavolo") || normalized.includes("prenot")) {
-          intent = "table";
+        } else if (
+          normalized.includes("evento") ||
+          normalized.includes("festa") ||
+          normalized.includes("compleanno") ||
+          normalized.includes("laurea") ||
+          normalized.includes("aziendal") ||
+          normalized.includes("azienda") ||
+          normalized.includes("ricevimento")
+        ) {
+          intent = "event";
         } else if (
           normalized.includes("info") ||
           normalized.includes("informazioni") ||
@@ -5781,12 +5789,8 @@ async function handleVoiceRequest(req, res) {
           normalized.includes("menu")
         ) {
           intent = "info";
-        } else if (
-          normalized.includes("evento") ||
-          normalized.includes("festa") ||
-          normalized.includes("compleanno")
-        ) {
-          intent = "event";
+        } else if (normalized.includes("tavolo") || normalized.includes("prenot")) {
+          intent = "table";
         }
 
         if (!intent) {
