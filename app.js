@@ -1200,7 +1200,7 @@ function promptForStep(vr, session) {
         );
         return;
       }
-      gatherSpeech(vr, "Perfetto. Per il preordine puoi dire: cena, apericena, oppure niente.");
+      gatherSpeech(vr, "Perfetto. Vuoi preordinare qualcosa? Puoi dire: cena, apericena oppure, se non vuoi, dì niente.");
       return;
     }
     case 7:
@@ -1210,7 +1210,15 @@ function promptForStep(vr, session) {
       );
       return;
     case 8:
-      gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
+      if (session.phoneCaptureMode === "manual") {
+        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
+        return;
+      }
+      gatherSpeech(
+        vr,
+        "Perfetto, posso usare il numero da cui stai chiamando per la prenotazione? Se preferisci lasciare un altro recapito, dimmi no.",
+        { input: "speech dtmf" }
+      );
       return;
     case 9:
       gatherSpeech(vr, "Ci sono altre richieste particolari? Se sì, dimmelo ora. Se no, dì: nessuna.");
@@ -4702,7 +4710,7 @@ async function createEventCalendarEvent(session) {
 
 function buildFailedCallEventPayload(session, req, reason) {
   const callSid = (session && (session.callSid || session.sid)) || req?.body?.CallSid || "";
-  const from = (session && session.phone) || req?.body?.From || "";
+  const from = (session && (session.phone || session.callerPhone)) || req?.body?.From || "";
   const state = (session && session.step) || "unknown";
   const intent = (session && session.intent) || "";
 
@@ -4749,7 +4757,7 @@ async function createFailedCallCalendarEvent(session, req, reason) {
   const dayISO = formatISODateInTimeZone(new Date(createdAt), tz);
   const nextDayISO = addDaysToISODate(dayISO, 1) || getNextDateISO(dayISO);
 
-  const fromNumber = (session && session.phone) || req?.body?.From || "";
+  const fromNumber = (session && (session.phone || session.callerPhone)) || req?.body?.From || "";
   const payload = buildFailedCallEventPayload(session || {}, req, reason);
 
   const event = {
@@ -4794,7 +4802,7 @@ async function createOperatorCallbackCalendarEvent(session, req, dialStatus) {
 
   try {
     const todayISO = toISODate(new Date());
-    const phone = req?.body?.From || session.phone || "";
+    const phone = req?.body?.From || session.phone || session.callerPhone || "";
     const callSid = req?.body?.CallSid || "";
     const status = String(dialStatus || "").trim() || "callback";
 
@@ -5406,9 +5414,9 @@ async function handleVoiceRequest(req, res) {
   const session = getSession(callSid);
   if (session && !session.callSid) session.callSid = callSid;
   // salva sempre il numero chiamante (utile per email/operatori e Calendar)
-  if (session && !session.phone) {
+  if (session) {
     const from = String(req.body.From || "").trim();
-    if (from) session.phone = from;
+    if (from) session.callerPhone = from;
   }
   const vr = buildTwiml();
 
@@ -6239,7 +6247,7 @@ async function handleVoiceRequest(req, res) {
         session.preorderFridayPromoBlocked = false;
         gatherSpeech(
           vr,
-          "Perfetto. Per il preordine puoi dire: cena, apericena, oppure niente."
+          "Perfetto. Vuoi preordinare qualcosa? Puoi dire: cena, apericena oppure, se non vuoi, dì niente."
         );
         break;
       }
@@ -6407,16 +6415,23 @@ async function handleVoiceRequest(req, res) {
           session.criticalReservation = true;
           session.step = 8;
           maybeSayDivanettiNotice(vr, session);
+          session.phoneCaptureMode = "ask_use_caller";
           gatherSpeech(
             vr,
-            "La prenotazione è stata effettuata con criticità. Ti richiamerà un operatore. Intanto mi lasci un numero di telefono? Se è italiano, aggiungo io il +39."
+            "La prenotazione è stata effettuata con criticità. Ti richiamerà un operatore. Posso usare il numero da cui stai chiamando per ricontattarti? Se preferisci lasciare un altro recapito, dimmi no.",
+            { input: "speech dtmf" }
           );
           break;
         }
         resetRetries(session);
         session.step = 8;
         maybeSayDivanettiNotice(vr, session);
-        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
+        session.phoneCaptureMode = "ask_use_caller";
+        gatherSpeech(
+          vr,
+          "Perfetto, posso usare il numero da cui stai chiamando per la prenotazione? Se preferisci lasciare un altro recapito, dimmi no.",
+          { input: "speech dtmf" }
+        );
         break;
       }
 
@@ -6464,14 +6479,94 @@ async function handleVoiceRequest(req, res) {
         }
         resetRetries(session);
         session.step = 8;
-        gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
+        session.phoneCaptureMode = "ask_use_caller";
+        gatherSpeech(
+          vr,
+          "Perfetto, posso usare il numero da cui stai chiamando per la prenotazione? Se preferisci lasciare un altro recapito, dimmi no.",
+          { input: "speech dtmf" }
+        );
         break;
       }
 
+
       case 8: {
+        // Step 8: telefono — prima chiedi se possiamo usare il numero chiamante, altrimenti chiedi un recapito diverso.
+        if (!session.phoneCaptureMode) session.phoneCaptureMode = "ask_use_caller";
+
+        const afterPhoneCaptured = async () => {
+          resetRetries(session);
+          session.phoneCaptureMode = null;
+
+          if (session.criticalReservation) {
+            const calendarEvent = await createCalendarEvent(session);
+            const summary = `Data ${session.dateLabel || session.dateISO || ""}, ore ${session.time24 || ""}, ${session.people || ""} persone.`;
+            await notifyCriticalReservation(session.phone, summary);
+            await sendCriticalReservationSms(summary);
+            if (calendarEvent?.status === "closed") {
+              session.step = 2;
+              session.criticalReservation = false;
+              gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
+              return false;
+            }
+            if (calendarEvent?.status === "unavailable") {
+              session.step = 4;
+              session.criticalReservation = false;
+              gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
+              return false;
+            }
+            resetRetries(session);
+            session.step = 1;
+            session.criticalReservation = false;
+            sayIt(vr, "La prenotazione è stata effettuata. Verrai richiamato da un operatore per confermare i dettagli.");
+            vr.hangup();
+            res.set("Content-Type", "text/xml; charset=utf-8");
+            res.send(vr.toString());
+            return true;
+          }
+
+          session.step = 9;
+          session.step9SilenceConsecutive = 0;
+          session.step9NeedsDetail = false;
+          // NOTE: le notice su apericena/promo vengono dette nello Step 6 (preordine) per evitare ripetizioni.
+          maybeSayLiveMusicNotice(vr, session);
+          gatherSpeech(vr, "Ci sono altre richieste particolari? Se sì, dimmelo ora. Se no, dì: nessuna.");
+          return false;
+        };
+
+        if (session.phoneCaptureMode === "manual") {
+          // Modalità inserimento manuale numero
+          if (emptySpeech) {
+            const silenceResult = handleSilence(session, vr, () =>
+              gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?", { input: "speech dtmf" })
+            );
+            if (silenceResult.action === "forward") {
+              await sendFallbackEmail(session, req, "silence_step8");
+              void sendOperatorEmail(session, req, "silence_step8");
+              res.set("Content-Type", "text/xml; charset=utf-8");
+              await safeCreateFailedCallCalendarEvent(session, req, "fallback");
+              return res.send(forwardToHumanTwiml());
+            }
+            break;
+          }
+          const phone = parsePhoneNumber(speech);
+          if (!phone) {
+            gatherSpeech(vr, "Scusami, non ho capito il numero. Puoi ripeterlo?", { input: "speech dtmf" });
+            break;
+          }
+          session.phone = phone;
+          const handled = await afterPhoneCaptured();
+          if (handled) return;
+          break;
+        }
+
+        // Modalità consenso uso numero chiamante
         if (emptySpeech) {
           const silenceResult = handleSilence(session, vr, () =>
-            gatherSpeech(vr, "Scusami, non ho sentito il numero. Me lo ripeti?", { input: "speech dtmf" })
+            gatherSpeech(
+              vr,
+              "Scusami, posso usare il numero da cui stai chiamando per la prenotazione? Se vuoi lasciarne un altro, dimmi no.",
+              { input: "speech dtmf" }
+            )
           );
           if (silenceResult.action === "forward") {
             await sendFallbackEmail(session, req, "silence_step8");
@@ -6482,44 +6577,36 @@ async function handleVoiceRequest(req, res) {
           }
           break;
         }
-        const phone = parsePhoneNumber(speech);
-        if (!phone) {
-          gatherSpeech(vr, "Scusami, non ho capito il numero. Puoi ripeterlo?", { input: "speech dtmf" });
+
+        const tt = String(speech || "").trim();
+        const yn = tt === "1" ? true : tt === "2" ? false : parseYesNo(tt);
+
+        if (yn === true) {
+          const callerRaw = String(session.callerPhone || req.body.From || "").trim();
+          const callerParsed = parsePhoneNumber(callerRaw) || callerRaw;
+          if (!callerParsed) {
+            session.phoneCaptureMode = "manual";
+            gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
+            break;
+          }
+          session.phone = callerParsed;
+          const handled = await afterPhoneCaptured();
+          if (handled) return;
           break;
         }
-        session.phone = phone;
-        resetRetries(session);
-        if (session.criticalReservation) {
-          const calendarEvent = await createCalendarEvent(session);
-          const summary = `Data ${session.dateLabel || session.dateISO || ""}, ore ${session.time24 || ""}, ${session.people || ""} persone.`;
-          await notifyCriticalReservation(session.phone, summary);
-          await sendCriticalReservationSms(summary);
-          if (calendarEvent?.status === "closed") {
-            session.step = 2;
-            session.criticalReservation = false;
-            gatherSpeech(vr, "Mi dispiace, risulta che quel giorno il locale è chiuso. Vuoi scegliere un'altra data?");
-            break;
-          }
-          if (calendarEvent?.status === "unavailable") {
-            session.step = 4;
-            session.criticalReservation = false;
-            gatherSpeech(vr, "Mi dispiace, a quell'orario non ci sono tavoli disponibili. Vuoi provare un altro orario?");
-            break;
-          }
+
+        if (yn === false) {
           resetRetries(session);
-          session.step = 1;
-          session.criticalReservation = false;
-          sayIt(vr, "La prenotazione è stata effettuata. Verrai richiamato da un operatore per confermare i dettagli.");
-          vr.hangup();
-          res.set("Content-Type", "text/xml; charset=utf-8");
-          return res.send(vr.toString());
+          session.phoneCaptureMode = "manual";
+          gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
+          break;
         }
-        session.step = 9;
-        session.step9SilenceConsecutive = 0;
-        session.step9NeedsDetail = false;
-        maybeSayApericenaNotices(vr, session);
-        maybeSayLiveMusicNotice(vr, session);
-        gatherSpeech(vr, "Ci sono altre richieste particolari? Se sì, dimmelo ora. Se no, dì: nessuna.");
+
+        gatherSpeech(
+          vr,
+          "Scusami, dimmi solo sì oppure no. Posso usare il numero da cui stai chiamando per la prenotazione?",
+          { input: "speech dtmf" }
+        );
         break;
       }
       case 9: {
