@@ -87,10 +87,9 @@ const OPENING = {
 // ======================= PREORDER MENU =======================
 const PREORDER_OPTIONS = [
   { key: "cena", label: "Cena", priceEUR: null, constraints: {} },
-  { key: "apericena", label: "Apericena", priceEUR: null, constraints: {} },
-  { key: "dopocena", label: "Dopocena (dopo le 22:30)", priceEUR: null, constraints: { minTime: "22:30" } },
+  { key: "apericena", label: "Apericena alla carta", priceEUR: null, constraints: {} },
   { key: "piatto_apericena", label: "Piatto Apericena", priceEUR: 25, constraints: {} },
-  { key: "piatto_apericena_promo", label: "Piatto Apericena in promo (previa registrazione)", priceEUR: null, constraints: { promoOnly: true } },
+  { key: "piatto_apericena_promo", label: "Piatto Apericena promo (Brilli Tasting)", priceEUR: null, constraints: { promoOnly: true } },
 ];
 
 function getPreorderOptionByKey(key) {
@@ -749,6 +748,8 @@ function getSession(callSid) {
       specialRequestsRaw: null,
       preorderChoiceKey: null,
       preorderLabel: null,
+      preorderMenu: "level1",
+      preorderFridayPromoBlocked: false,
       area: null,
       pendingOutsideConfirm: false,
       phone: null,
@@ -829,6 +830,14 @@ function normalizeText(s) {
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[.,!?]/g, "")
     .replace(/\s+/g, " ");
+}
+
+function includesWord(tt, word) {
+  if (!tt || !word) return false;
+  const w = String(word || "").trim().toLowerCase();
+  if (!w) return false;
+  const escaped = w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`\\b${escaped}\\b`).test(tt);
 }
 
 function extractSurnameFromSpeech(raw) {
@@ -1149,7 +1158,14 @@ function goBack(session) {
   else if (session.step === 9) session.step = 8;
   else if (session.step === 10) session.step = 9;
   else session.step = Math.max(1, session.step - 1);
+
+  // When going back to the preorder step, restart from the first preorder menu.
+  if (session.step === 6) {
+    session.preorderMenu = "level1";
+    session.preorderFridayPromoBlocked = false;
+  }
 }
+
 
 function promptForStep(vr, session) {
   switch (session.step) {
@@ -1168,12 +1184,25 @@ function promptForStep(vr, session) {
     case 5:
       gatherSpeech(vr, t("step5_party_size_ask_notes.main", { partySize: session.people || "" }));
       return;
-    case 6:
-      gatherSpeech(
-        vr,
-        "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
-      );
+    case 6: {
+      const menu = session.preorderMenu || "level1";
+      if (menu === "level2") {
+        if (session.preorderFridayPromoBlocked) {
+          gatherSpeech(
+            vr,
+            "Nota: Brilli Tasting non è disponibile il venerdì. Preferisci apericena alla carta oppure piatto apericena a 25 euro, coperto e drink incluso?"
+          );
+          return;
+        }
+        gatherSpeech(
+          vr,
+          "Perfetto. Quando dici apericena, cosa intendi? Puoi dire: apericena alla carta, piatto apericena, oppure piatto apericena promo, cioè Brilli Tasting."
+        );
+        return;
+      }
+      gatherSpeech(vr, "Perfetto. Per il preordine puoi dire: cena, apericena, oppure niente.");
       return;
+    }
     case 7:
       gatherSpeech(
         vr,
@@ -3816,6 +3845,8 @@ function hasGlutenIntolerance(text) {
   if (!tt) return false;
   return (
     tt.includes("celiachia") ||
+    tt.includes("celiaco") ||
+    tt.includes("celiaca") ||
     tt.includes("glutine") ||
     tt.includes("senza glutine") ||
     tt.includes("intolleranza al glutine")
@@ -5203,7 +5234,7 @@ async function computeWhatsAppReply(session, userText) {
     if (!text) return "Hai ? Se no scrivi: nessuna";
     session.specialRequestsRaw = normalizeText(text).includes("nessun") ? "nessuna" : text.slice(0, 200);
     session.wa.step = "ask_preorder";
-    return "Vuoi preordinare qualcosa? (cena, apericena, dopocena, piatto apericena, piatto apericena promo) — oppure scrivi: nessuno";
+    return "Vuoi preordinare qualcosa? (cena, apericena, piatto apericena, piatto apericena promo) — oppure scrivi: nessuno";
   }
 
   if (step === "ask_preorder") {
@@ -5216,23 +5247,22 @@ async function computeWhatsAppReply(session, userText) {
       session.preorderLabel = "nessuno";
     } else if (normalized.includes("apericena promo")) {
       const promoOption = getPreorderOptionByKey("piatto_apericena_promo");
-      if (isFriday) return "L'apericena promo non è disponibile il venerdì. Scegli un'altra opzione oppure scrivi: nessuno";
+      if (isFriday) return "Nota: Brilli Tasting non è disponibile il venerdì. Preferisci apericena alla carta oppure piatto apericena a 25 euro, coperto e drink incluso?";
       session.preorderChoiceKey = promoOption?.key || "piatto_apericena_promo";
       session.preorderLabel = promoOption?.label || "Piatto Apericena in promo (previa registrazione)";
       if (glutenIntolerance) {
         // non blocchiamo, ma avvisiamo
       }
     } else if (normalized.includes("apericena") && !normalized.includes("piatto")) {
-      if (glutenIntolerance) return "L'apericena non è disponibile per celiaci o intolleranti al glutine. Vuoi scegliere un'alternativa o scrivere: nessuno?";
       const option = getPreorderOptionByKey("apericena");
       session.preorderChoiceKey = option?.key || "apericena";
-      session.preorderLabel = option?.label || "Apericena";
+      session.preorderLabel = option?.label || "Apericena alla carta";
     } else {
       const option =
         PREORDER_OPTIONS.find(
           (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
         ) || null;
-      if (!option) return "Non ho capito la scelta. Puoi scrivere: cena, apericena, dopocena, piatto apericena, piatto apericena promo — oppure: nessuno";
+      if (!option) return "Non ho capito la scelta. Puoi scrivere: cena, apericena, piatto apericena, piatto apericena promo — oppure: nessuno";
       session.preorderChoiceKey = option.key;
       session.preorderLabel = option.label;
     }
@@ -6205,12 +6235,15 @@ async function handleVoiceRequest(req, res) {
         session.specialRequestsRaw = emptySpeech ? "nessuna" : speech.trim().slice(0, 200);
         resetRetries(session);
         session.step = 6;
+        session.preorderMenu = "level1";
+        session.preorderFridayPromoBlocked = false;
         gatherSpeech(
           vr,
-          "Vuoi preordinare qualcosa dal menù? Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+          "Perfetto. Per il preordine puoi dire: cena, apericena, oppure niente."
         );
         break;
       }
+
 
       case 6: {
         if (emptySpeech) {
@@ -6224,70 +6257,127 @@ async function handleVoiceRequest(req, res) {
           }
           break;
         }
+
         const normalized = normalizeText(speech);
         const glutenIntolerance = hasGlutenIntolerance(session.specialRequestsRaw);
         const isFriday = session.dateISO ? new Date(`${session.dateISO}T00:00:00`).getDay() === 5 : false;
+
+        // Two-level preorder menu:
+        // Level 1: cena / apericena / niente
+        // Level 2 (only if "apericena"): alla carta / piatto apericena / promo (Brilli Tasting)
+        session.preorderMenu = session.preorderMenu || "level1";
+
+        const wantsNone =
+          normalized.includes("nessuno") ||
+          includesWord(normalized, "niente") ||
+          includesWord(normalized, "nulla") ||
+          includesWord(normalized, "no");
+
+        const wantsCena = includesWord(normalized, "cena");
+
+        // Reset notices before selecting (they will be re-set on final choice)
         session.glutenPiattoNotice = false;
         session.promoRegistrationNotice = false;
-        if (normalized.includes("nessuno") || normalized.includes("niente") || normalized.includes("no")) {
-          session.preorderChoiceKey = null;
-          session.preorderLabel = "nessuno";
+
+        // ----- LEVEL 1 -----
+        if (session.preorderMenu === "level1") {
+          session.preorderFridayPromoBlocked = false;
+
+          if (wantsNone) {
+            session.preorderChoiceKey = null;
+            session.preorderLabel = "nessuno";
+          } else if (wantsCena) {
+            const option = getPreorderOptionByKey("cena");
+            session.preorderChoiceKey = option?.key || "cena";
+            session.preorderLabel = option?.label || "Cena";
+          } else if (normalized.includes("apericena")) {
+            // Go to level 2 menu
+            session.preorderMenu = "level2";
+            gatherSpeech(
+              vr,
+              "Perfetto. Quando dici apericena, cosa intendi? Puoi dire: apericena alla carta, piatto apericena, oppure piatto apericena promo, cioè Brilli Tasting."
+            );
+            break;
+          } else {
+            gatherSpeech(vr, "Non ho capito. Per il preordine puoi dire: cena, apericena, oppure niente.");
+            break;
+          }
         } else {
-          if (normalized.includes("apericena promo")) {
-            const promoOption = getPreorderOptionByKey("piatto_apericena_promo");
+          // ----- LEVEL 2 -----
+          const wantsPromo =
+            normalized.includes("promo") || normalized.includes("brilli") || normalized.includes("tasting");
+          const wantsPiatto = normalized.includes("piatto");
+          const wantsAllaCarta =
+            normalized.includes("alla carta") || includesWord(normalized, "carta") || normalized.includes("a la carta");
+
+          // Allow user to say "cena" or "niente" also in level 2
+          if (wantsNone) {
+            session.preorderChoiceKey = null;
+            session.preorderLabel = "nessuno";
+          } else if (wantsCena) {
+            const option = getPreorderOptionByKey("cena");
+            session.preorderChoiceKey = option?.key || "cena";
+            session.preorderLabel = option?.label || "Cena";
+          } else if (wantsPromo) {
             if (isFriday) {
+              session.preorderFridayPromoBlocked = true;
               gatherSpeech(
                 vr,
-                "L'apericena promo non è disponibile il venerdì. Puoi scegliere l'apericena standard oppure un altro piatto."
+                "Nota: Brilli Tasting non è disponibile il venerdì. Preferisci apericena alla carta oppure piatto apericena a 25 euro, coperto e drink incluso?"
               );
               break;
             }
+            const promoOption = getPreorderOptionByKey("piatto_apericena_promo");
             session.preorderChoiceKey = promoOption?.key || "piatto_apericena_promo";
-            session.preorderLabel = promoOption?.label || "Piatto Apericena in promo (previa registrazione)";
+            session.preorderLabel = promoOption?.label || "Piatto Apericena promo (Brilli Tasting)";
             session.promoRegistrationNotice = true;
+
             if (glutenIntolerance) {
               session.glutenPiattoNotice = true;
+              maybeSayApericenaNotices(vr, session);
+              sayIt(vr, "Lo segno nelle note e procedo con la prenotazione.");
+            } else {
+              maybeSayApericenaNotices(vr, session);
             }
-            maybeSayApericenaNotices(vr, session);
-          } else if (normalized.includes("apericena")) {
+          } else if (wantsPiatto) {
+            const option = getPreorderOptionByKey("piatto_apericena");
+            session.preorderChoiceKey = option?.key || "piatto_apericena";
+            session.preorderLabel = option?.label || "Piatto Apericena";
+
             if (glutenIntolerance) {
-              gatherSpeech(
-                vr,
-                "L'apericena non è disponibile per celiaci o intolleranti al glutine. Puoi scegliere un'alternativa."
-              );
-              break;
+              session.glutenPiattoNotice = true;
+              maybeSayApericenaNotices(vr, session);
+              sayIt(vr, "Lo segno nelle note e procedo con la prenotazione.");
             }
+          } else if (
+            wantsAllaCarta ||
+            (session.preorderFridayPromoBlocked &&
+              normalized.includes("apericena") &&
+              !normalized.includes("piatto"))
+          ) {
             const option = getPreorderOptionByKey("apericena");
             session.preorderChoiceKey = option?.key || "apericena";
-            session.preorderLabel = option?.label || "Apericena";
+            session.preorderLabel = option?.label || "Apericena alla carta";
           } else {
-            const option = PREORDER_OPTIONS.find(
-              (o) => normalized.includes(o.label.toLowerCase()) || normalized.includes(o.key.replace(/_/g, " "))
-            );
-            if (option) {
-              session.preorderChoiceKey = option.key;
-              session.preorderLabel = option.label;
-              let shouldSayNotice = false;
-              if ((option.key === "piatto_apericena" || option.key === "piatto_apericena_promo") && glutenIntolerance) {
-                session.glutenPiattoNotice = true;
-                shouldSayNotice = true;
-              }
-              if (option.key === "piatto_apericena_promo") {
-                session.promoRegistrationNotice = true;
-                shouldSayNotice = true;
-              }
-              if (shouldSayNotice) {
-                maybeSayApericenaNotices(vr, session);
-              }
-            } else {
+            if (session.preorderFridayPromoBlocked) {
               gatherSpeech(
                 vr,
-                "Non ho capito il preordine. Puoi dire: cena, apericena, dopocena, piatto apericena, oppure piatto apericena promo. Se non vuoi, dì nessuno."
+                "Dimmi solo: apericena alla carta, oppure piatto apericena a 25 euro, coperto e drink incluso."
               );
               break;
             }
+            gatherSpeech(
+              vr,
+              "Non ho capito. Puoi dire: apericena alla carta, piatto apericena, oppure piatto apericena promo, cioè Brilli Tasting."
+            );
+            break;
           }
         }
+
+        // Selection done: reset menu for future back/reprompt
+        session.preorderMenu = "level1";
+        session.preorderFridayPromoBlocked = false;
+
         const availability = await reserveTableForSession(session, { commit: false });
         if (availability.status === "closed") {
           session.step = 2;
@@ -6329,6 +6419,7 @@ async function handleVoiceRequest(req, res) {
         gatherSpeech(vr, "Perfetto. Mi lasci un numero di telefono? Se è italiano, aggiungo io il +39.", { input: "speech dtmf" });
         break;
       }
+
 
       case 7: {
         if (emptySpeech) {
